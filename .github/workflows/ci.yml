@@ -58,7 +58,13 @@ jobs:
 
       - name: Install
         working-directory: frontend
-        run: npm ci
+        # Using `npm install` (not `npm ci`) because optional WASM deps
+        # (@emnapi/*) are platform-conditional — a lock generated on macOS
+        # lacks Linux-only opt deps, and vice versa. `npm install` is
+        # forgiving and reconciles; `npm ci` errors out. The release
+        # workflow uses `wails build` which internally also calls
+        # `npm install`, so behavior stays consistent.
+        run: npm install --no-audit --no-fund
 
       # tsc + vite build catches type errors AND ensures the iter 910+
       # bundle splitting still keeps chunks under the size warning cap.
@@ -96,7 +102,7 @@ jobs:
       - name: Build frontend
         working-directory: frontend
         run: |
-          npm ci
+          npm install --no-audit --no-fund
           npm run build
 
       - name: go vet
