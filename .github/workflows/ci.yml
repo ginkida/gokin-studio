@@ -69,6 +69,12 @@ jobs:
       - name: Install Wails CLI + generate bindings
         run: |
           go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+          # main.go has //go:embed all:frontend/dist — wails generate
+          # parses the binary spec which fails if the dir is empty. Plant
+          # a stub so the embed resolves; the real `npm run build` later
+          # overwrites it with the production bundle.
+          mkdir -p frontend/dist
+          touch frontend/dist/index.html
           wails generate module
 
       - name: Install frontend deps
@@ -118,6 +124,12 @@ jobs:
       - name: Install Wails CLI + generate bindings
         run: |
           go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+          # main.go has //go:embed all:frontend/dist — wails generate
+          # parses the binary spec which fails if the dir is empty. Plant
+          # a stub so the embed resolves; the real `npm run build` later
+          # overwrites it with the production bundle.
+          mkdir -p frontend/dist
+          touch frontend/dist/index.html
           wails generate module
 
       # main.go has //go:embed all:frontend/dist; go vet checks it. Build
