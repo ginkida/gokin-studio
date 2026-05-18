@@ -49,6 +49,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
@@ -56,7 +62,16 @@ jobs:
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
-      - name: Install
+      # `wails generate module` produces frontend/wailsjs/ — JS+TS bindings
+      # for all `Studio` Wails-exposed methods. The folder is gitignored
+      # because it's purely generated, so CI must produce it before TypeScript
+      # can resolve `../wailsjs/go/studio/Studio` imports from App.tsx.
+      - name: Install Wails CLI + generate bindings
+        run: |
+          go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+          wails generate module
+
+      - name: Install frontend deps
         working-directory: frontend
         # Using `npm install` (not `npm ci`) because optional WASM deps
         # (@emnapi/*) are platform-conditional — a lock generated on macOS
@@ -96,6 +111,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev pkg-config
+
+      # Generate Wails JS/TS bindings (used by App.tsx, gitignored, so CI
+      # produces them fresh). Required before npm build because TypeScript
+      # imports `../wailsjs/go/studio/Studio`.
+      - name: Install Wails CLI + generate bindings
+        run: |
+          go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+          wails generate module
 
       # main.go has //go:embed all:frontend/dist; go vet checks it. Build
       # frontend first so the embed target exists.
