@@ -1,0 +1,287 @@
+package chat
+
+import (
+	cryptorand "crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"google.golang.org/genai"
+)
+
+// SessionState represents the serializable state of a session.
+type SessionState struct {
+	ID                string                     `json:"id"`
+	StartTime         time.Time                  `json:"start_time"`
+	LastActive        time.Time                  `json:"last_active"`
+	WorkDir           string                     `json:"work_dir,omitempty"`
+	History           []SerializedContent        `json:"history"`
+	TokenCounts       []int                      `json:"token_counts,omitempty"`
+	TotalTokens       int                        `json:"total_tokens"`
+	Version           int64                      `json:"version"`
+	Summary           string                     `json:"summary,omitempty"`
+	Scratchpad        string                     `json:"scratchpad,omitempty"`
+	SystemInstruction string                     `json:"system_instruction,omitempty"`
+	Branches          map[string]*SessionState   `json:"branches,omitempty"`
+	Checkpoints       map[string]int             `json:"checkpoints,omitempty"`
+	ToolCheckpoints   []SerializedToolCheckpoint `json:"tool_checkpoints,omitempty"`
+}
+
+// SerializedToolCheckpoint is the persisted form of a tool checkpoint entry.
+type SerializedToolCheckpoint struct {
+	CallID    string         `json:"call_id"`
+	ToolName  string         `json:"tool_name"`
+	Args      map[string]any `json:"args,omitempty"`
+	Result    string         `json:"result,omitempty"` // Tool result content for replay
+	Signature string         `json:"signature"`
+	Timestamp time.Time      `json:"timestamp"`
+}
+
+// SerializedContent represents a serializable conversation content.
+type SerializedContent struct {
+	Role  string           `json:"role"`
+	Parts []SerializedPart `json:"parts"`
+}
+
+// SerializedPart represents a serializable content part.
+type SerializedPart struct {
+	Type             string          `json:"type"` // "text", "function_call", "function_response"
+	Text             string          `json:"text,omitempty"`
+	FunctionCall     *SerializedFunc `json:"function_call,omitempty"`
+	FunctionResp     *SerializedFunc `json:"function_response,omitempty"`
+	Thought          bool            `json:"thought,omitempty"`
+	ThoughtSignature []byte          `json:"thought_signature,omitempty"`
+}
+
+// SerializedFunc represents a serializable function call or response.
+type SerializedFunc struct {
+	ID       string         `json:"id,omitempty"`
+	Name     string         `json:"name"`
+	Args     map[string]any `json:"args,omitempty"`
+	Response map[string]any `json:"response,omitempty"`
+}
+
+// SessionInfo provides summary info about a saved session.
+type SessionInfo struct {
+	ID           string    `json:"id"`
+	StartTime    time.Time `json:"start_time"`
+	LastActive   time.Time `json:"last_active"`
+	Summary      string    `json:"summary"`
+	MessageCount int       `json:"message_count"`
+	WorkDir      string    `json:"work_dir,omitempty"`
+}
+
+// SerializeContent converts a genai.Content to SerializedContent.
+func SerializeContent(content *genai.Content) SerializedContent {
+	parts := make([]SerializedPart, len(content.Parts))
+	for i, part := range content.Parts {
+		parts[i] = serializePart(part)
+	}
+
+	return SerializedContent{
+		Role:  string(content.Role),
+		Parts: parts,
+	}
+}
+
+// serializePart converts a genai.Part to SerializedPart.
+func serializePart(part *genai.Part) SerializedPart {
+	sp := SerializedPart{
+		Thought:          part.Thought,
+		ThoughtSignature: part.ThoughtSignature,
+	}
+
+	if part.FunctionCall != nil {
+		sp.Type = "function_call"
+		sp.FunctionCall = &SerializedFunc{
+			ID:   part.FunctionCall.ID,
+			Name: part.FunctionCall.Name,
+			Args: part.FunctionCall.Args,
+		}
+		return sp
+	}
+
+	if part.FunctionResponse != nil {
+		sp.Type = "function_response"
+		sp.FunctionResp = &SerializedFunc{
+			ID:       part.FunctionResponse.ID,
+			Name:     part.FunctionResponse.Name,
+			Response: part.FunctionResponse.Response,
+		}
+		return sp
+	}
+
+	// Default to text (even if empty, use space to avoid API errors)
+	sp.Type = "text"
+	if part.Text != "" {
+		sp.Text = part.Text
+	} else {
+		sp.Text = " "
+	}
+	return sp
+}
+
+// DeserializeContent converts a SerializedContent back to genai.Content.
+func DeserializeContent(sc SerializedContent) (*genai.Content, error) {
+	parts := make([]*genai.Part, len(sc.Parts))
+	for i, sp := range sc.Parts {
+		part, err := deserializePart(sp)
+		if err != nil {
+			return nil, err
+		}
+		parts[i] = part
+	}
+
+	return &genai.Content{
+		Role:  sc.Role,
+		Parts: parts,
+	}, nil
+}
+
+// deserializePart converts a SerializedPart back to genai.Part.
+func deserializePart(sp SerializedPart) (*genai.Part, error) {
+	var part *genai.Part
+
+	switch sp.Type {
+	case "text":
+		text := sp.Text
+		if text == "" {
+			text = " " // Avoid empty text parts
+		}
+		part = genai.NewPartFromText(text)
+	case "function_call":
+		if sp.FunctionCall == nil {
+			part = genai.NewPartFromText(" ")
+		} else {
+			part = &genai.Part{
+				FunctionCall: &genai.FunctionCall{
+					ID:   sp.FunctionCall.ID,
+					Name: sp.FunctionCall.Name,
+					Args: sp.FunctionCall.Args,
+				},
+			}
+		}
+	case "function_response":
+		if sp.FunctionResp == nil {
+			part = genai.NewPartFromText(" ")
+		} else {
+			part = genai.NewPartFromFunctionResponse(sp.FunctionResp.Name, sp.FunctionResp.Response)
+			part.FunctionResponse.ID = sp.FunctionResp.ID
+		}
+	default:
+		text := sp.Text
+		if text == "" {
+			text = " " // Avoid empty text parts
+		}
+		part = genai.NewPartFromText(text)
+	}
+
+	// Restore Thought and ThoughtSignature for Gemini 3 compatibility
+	part.Thought = sp.Thought
+	part.ThoughtSignature = sp.ThoughtSignature
+
+	return part, nil
+}
+
+// MarshalJSON implements json.Marshaler for SessionState.
+func (s *SessionState) MarshalJSON() ([]byte, error) {
+	type Alias SessionState
+	return json.Marshal(&struct {
+		*Alias
+	}{
+		Alias: (*Alias)(s),
+	})
+}
+
+// UnmarshalJSON implements json.Unmarshaler for SessionState.
+func (s *SessionState) UnmarshalJSON(data []byte) error {
+	type Alias SessionState
+	aux := &struct {
+		*Alias
+	}{
+		Alias: (*Alias)(s),
+	}
+	return json.Unmarshal(data, aux)
+}
+
+// fixEmptyToolIDs assigns matching IDs to FunctionCall/FunctionResponse pairs
+// that were serialized without IDs (legacy sessions).
+// It pairs them positionally: assistant Content[i] with FunctionCall parts
+// matches user Content[i+1] with FunctionResponse parts.
+func fixEmptyToolIDs(history []*genai.Content) {
+	for i := 0; i < len(history)-1; i++ {
+		cur := history[i]
+		next := history[i+1]
+
+		if cur.Role != genai.RoleModel || next.Role != genai.RoleUser {
+			continue
+		}
+
+		// Collect FunctionCall parts with empty IDs
+		var calls []*genai.FunctionCall
+		for _, p := range cur.Parts {
+			if p.FunctionCall != nil && p.FunctionCall.ID == "" {
+				calls = append(calls, p.FunctionCall)
+			}
+		}
+		if len(calls) == 0 {
+			continue
+		}
+
+		// Collect FunctionResponse parts with empty IDs
+		var responses []*genai.FunctionResponse
+		for _, p := range next.Parts {
+			if p.FunctionResponse != nil && p.FunctionResponse.ID == "" {
+				responses = append(responses, p.FunctionResponse)
+			}
+		}
+
+		// Assign matching IDs positionally
+		for j, fc := range calls {
+			id := generateToolID()
+			fc.ID = id
+			if j < len(responses) {
+				responses[j].ID = id
+			}
+		}
+	}
+}
+
+// generateToolID creates a unique ID for tool calls.
+func generateToolID() string {
+	b := make([]byte, 12)
+	if _, err := cryptorand.Read(b); err != nil {
+		return fmt.Sprintf("toolu_%d", time.Now().UnixNano())
+	}
+	return "toolu_" + hex.EncodeToString(b)
+}
+
+// GenerateSummary creates a brief summary of the session based on messages.
+func (s *SessionState) GenerateSummary() string {
+	if len(s.History) == 0 {
+		return ""
+	}
+
+	// Find first user message after system prompt
+	for i, content := range s.History {
+		if i < 2 { // Skip system prompt and initial response
+			continue
+		}
+		if content.Role == "user" && len(content.Parts) > 0 {
+			text := ""
+			for _, part := range content.Parts {
+				if part.Type == "text" && part.Text != "" {
+					text = part.Text
+					break
+				}
+			}
+			if len(text) > 100 {
+				return text[:97] + "..."
+			}
+			return text
+		}
+	}
+
+	return ""
+}

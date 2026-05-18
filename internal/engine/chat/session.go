@@ -1,0 +1,933 @@
+package chat
+
+import (
+	cryptorand "crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/ginkida/gokin-studio/internal/engine/security"
+
+	"google.golang.org/genai"
+)
+
+const (
+	// MaxMessages is the maximum number of messages to keep in history.
+	MaxMessages = 100
+)
+
+// ChangeEvent represents a session history change event.
+type ChangeEvent struct {
+	OldCount int
+	NewCount int
+	Version  int64
+}
+
+// ChangeHandler is called when session history changes.
+type ChangeHandler func(ChangeEvent)
+
+// Session represents a chat session.
+type Session struct {
+	ID                string
+	StartTime         time.Time
+	WorkDir           string
+	History           []*genai.Content
+	Branches          map[string]*Session // named branches (forks)
+	Checkpoints       map[string]int      // named checkpoints (name -> history index)
+	SystemInstruction string              // System prompt, passed via API parameter (not in history)
+	tokenCounts       []int               // tokens per message
+	totalTokens       int                 // cached total
+	version           int64               // version for optimistic concurrency control
+	onChange          ChangeHandler
+	scratchpad        string
+	toolCheckpoints   []SerializedToolCheckpoint // persisted tool checkpoint journal
+	mu                sync.RWMutex
+}
+
+// NewSession creates a new chat session.
+func NewSession() *Session {
+	return &Session{
+		ID:        generateSessionID(),
+		StartTime: time.Now(),
+		History:   make([]*genai.Content, 0),
+	}
+}
+
+// SetChangeHandler sets the callback for history changes.
+func (s *Session) SetChangeHandler(handler ChangeHandler) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onChange = handler
+}
+
+// notifyChange notifies the handler of history changes.
+// Caller must hold s.mu.Lock(). This method releases the lock before calling
+// the handler and does NOT re-acquire it. After calling notifyChange, the
+// caller must NOT use locked state (use defer-friendly pattern).
+func (s *Session) notifyChange(oldCount int) {
+	// Capture event data and handler BEFORE unlocking
+	handler := s.onChange
+	event := ChangeEvent{
+		OldCount: oldCount,
+		NewCount: len(s.History),
+		Version:  s.version,
+	}
+
+	// Always release the lock — whether or not handler is set
+	s.mu.Unlock()
+
+	if handler == nil {
+		return
+	}
+
+	// Protect against panics in the handler
+	defer func() {
+		if r := recover(); r != nil {
+			// Log panic but don't crash
+		}
+	}()
+
+	// Call handler outside lock (prevent deadlock if handler tries to access session)
+	handler(event)
+}
+
+// AddUserMessage adds a user message to the history.
+func (s *Session) AddUserMessage(message string) {
+	s.mu.Lock()
+
+	oldCount := len(s.History)
+	s.History = append(s.History, genai.NewContentFromText(message, genai.RoleUser))
+	s.version++
+
+	// Auto-trim if history exceeds max
+	s.trimHistoryLocked()
+
+	s.notifyChange(oldCount)
+}
+
+// AddModelMessage adds a model message to the history.
+func (s *Session) AddModelMessage(message string) {
+	s.mu.Lock()
+
+	oldCount := len(s.History)
+	s.History = append(s.History, genai.NewContentFromText(message, genai.RoleModel))
+	s.version++
+
+	// Auto-trim if history exceeds max
+	s.trimHistoryLocked()
+
+	s.notifyChange(oldCount)
+}
+
+// AddContent adds raw content to the history.
+func (s *Session) AddContent(content *genai.Content) {
+	s.mu.Lock()
+
+	oldCount := len(s.History)
+	s.History = append(s.History, content)
+	s.version++
+
+	// Auto-trim if history exceeds max
+	s.trimHistoryLocked()
+
+	s.notifyChange(oldCount)
+}
+
+// SetHistory replaces the entire history and applies sliding window.
+func (s *Session) SetHistory(history []*genai.Content) {
+	s.mu.Lock()
+
+	oldCount := len(s.History)
+
+	// Apply sliding window if history exceeds max.
+	// System instruction is now passed via API parameter, not stored in history.
+	if len(history) > MaxMessages {
+		boundary := len(history) - MaxMessages
+		boundary = adjustBoundaryForToolPairs(history, boundary)
+		history = history[boundary:]
+	}
+
+	s.History = history
+	s.tokenCounts = make([]int, 0)
+	s.totalTokens = 0
+	s.version++
+	s.notifyChange(oldCount)
+}
+
+// SetHistoryIfVersion atomically sets history only if the version matches.
+// Returns true if the update was applied, false if version mismatch.
+func (s *Session) SetHistoryIfVersion(history []*genai.Content, expectedVersion int64) bool {
+	s.mu.Lock()
+
+	if s.version != expectedVersion {
+		s.mu.Unlock()
+		return false
+	}
+
+	oldCount := len(s.History)
+
+	// Apply sliding window if history exceeds max.
+	// System instruction is now passed via API parameter, not stored in history.
+	if len(history) > MaxMessages {
+		boundary := len(history) - MaxMessages
+		boundary = adjustBoundaryForToolPairs(history, boundary)
+		history = history[boundary:]
+	}
+
+	s.History = history
+	s.tokenCounts = make([]int, 0)
+	s.totalTokens = 0
+	s.version++
+	s.notifyChange(oldCount)
+	return true
+}
+
+// GetVersion returns the current version of the session history.
+func (s *Session) GetVersion() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.version
+}
+
+// GetHistoryWithVersion returns a copy of the history along with its version.
+func (s *Session) GetHistoryWithVersion() ([]*genai.Content, int64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	history := make([]*genai.Content, len(s.History))
+	copy(history, s.History)
+	return history, s.version
+}
+
+// GetHistory returns a copy of the history.
+func (s *Session) GetHistory() []*genai.Content {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	history := make([]*genai.Content, len(s.History))
+	copy(history, s.History)
+	return history
+}
+
+// Clear clears the session history.
+func (s *Session) Clear() {
+	s.mu.Lock()
+
+	oldCount := len(s.History)
+	s.History = make([]*genai.Content, 0)
+	s.tokenCounts = make([]int, 0)
+	s.totalTokens = 0
+	s.version++
+
+	s.notifyChange(oldCount) // unlocks mu
+}
+
+// MessageCount returns the number of messages in the session.
+func (s *Session) MessageCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return len(s.History)
+}
+
+// trimHistoryLocked trims history to max messages.
+// System instruction is now passed via API parameter, not stored in history.
+// Simple sliding window: keep the last MaxMessages messages.
+// Caller MUST hold s.mu.Lock() before calling.
+func (s *Session) trimHistoryLocked() {
+	if len(s.History) <= MaxMessages {
+		return
+	}
+
+	boundary := len(s.History) - MaxMessages
+	boundary = adjustBoundaryForToolPairs(s.History, boundary)
+	s.History = s.History[boundary:]
+
+	// Sync tokenCounts with History to avoid desynchronization
+	if len(s.tokenCounts) > boundary {
+		s.tokenCounts = s.tokenCounts[boundary:]
+
+		// Recalculate totalTokens from remaining tokenCounts
+		s.totalTokens = 0
+		for _, count := range s.tokenCounts {
+			s.totalTokens += count
+		}
+	} else {
+		// tokenCounts is shorter than boundary — reset entirely
+		s.tokenCounts = nil
+		s.totalTokens = 0
+	}
+}
+
+// TrimHistory manually triggers history trimming to max messages.
+func (s *Session) TrimHistory() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.trimHistoryLocked()
+}
+
+// generateSessionID generates a unique session ID.
+func generateSessionID() string {
+	b := make([]byte, 3)
+	_, _ = cryptorand.Read(b)
+	return time.Now().Format("20060102-150405") + "-" + hex.EncodeToString(b)
+}
+
+// AddContentWithTokens adds content with its token count.
+func (s *Session) AddContentWithTokens(content *genai.Content, tokens int) {
+	s.mu.Lock()
+
+	oldCount := len(s.History)
+	s.History = append(s.History, content)
+	s.tokenCounts = append(s.tokenCounts, tokens)
+	s.totalTokens += tokens
+	s.version++
+	s.notifyChange(oldCount) // unlocks s.mu
+}
+
+// GetTokenCount returns the cached total token count.
+func (s *Session) GetTokenCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.totalTokens
+}
+
+// SetTotalTokens sets the total token count (from external counting).
+func (s *Session) SetTotalTokens(tokens int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.totalTokens = tokens
+}
+
+// ReplaceWithSummary replaces messages up to index with a summary.
+func (s *Session) ReplaceWithSummary(upToIndex int, summary *genai.Content, summaryTokens int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if upToIndex > len(s.History) {
+		upToIndex = len(s.History)
+	}
+
+	// Adjust boundary to avoid splitting tool pairs
+	upToIndex = adjustBoundaryForToolPairs(s.History, upToIndex)
+
+	// Keep messages after upToIndex
+	remaining := s.History[upToIndex:]
+
+	// Safely handle tokenCounts which may be shorter than History
+	var remainingTokens []int
+	if upToIndex <= len(s.tokenCounts) {
+		remainingTokens = s.tokenCounts[upToIndex:]
+	}
+
+	// Build new history with summary
+	s.History = make([]*genai.Content, 0, 1+len(remaining))
+	s.History = append(s.History, summary)
+	s.History = append(s.History, remaining...)
+
+	// Rebuild token counts
+	s.tokenCounts = make([]int, 0, 1+len(remainingTokens))
+	s.tokenCounts = append(s.tokenCounts, summaryTokens)
+	s.tokenCounts = append(s.tokenCounts, remainingTokens...)
+
+	// Recalculate total
+	s.totalTokens = summaryTokens
+	for _, t := range remainingTokens {
+		s.totalTokens += t
+	}
+	s.version++
+}
+
+// GetTokenCounts returns token counts per message.
+func (s *Session) GetTokenCounts() []int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	counts := make([]int, len(s.tokenCounts))
+	copy(counts, s.tokenCounts)
+	return counts
+}
+
+// SetWorkDir sets the working directory for this session.
+func (s *Session) SetWorkDir(dir string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.WorkDir = dir
+}
+
+// GetState returns the current state of the session for serialization.
+func (s *Session) GetState() *SessionState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	history := make([]SerializedContent, len(s.History))
+	for i, content := range s.History {
+		history[i] = SerializeContent(content)
+	}
+
+	state := &SessionState{
+		ID:                s.ID,
+		StartTime:         s.StartTime,
+		LastActive:        time.Now(),
+		WorkDir:           s.WorkDir,
+		History:           history,
+		TokenCounts:       make([]int, len(s.tokenCounts)),
+		TotalTokens:       s.totalTokens,
+		Version:           s.version,
+		Scratchpad:        s.scratchpad,
+		SystemInstruction: s.SystemInstruction,
+	}
+	copy(state.TokenCounts, s.tokenCounts)
+
+	// Persist checkpoints
+	if len(s.Checkpoints) > 0 {
+		state.Checkpoints = make(map[string]int, len(s.Checkpoints))
+		for k, v := range s.Checkpoints {
+			state.Checkpoints[k] = v
+		}
+	}
+
+	// Persist branches (recursive — each branch is a Session)
+	if len(s.Branches) > 0 {
+		state.Branches = make(map[string]*SessionState, len(s.Branches))
+		for name, branch := range s.Branches {
+			state.Branches[name] = branch.GetState()
+		}
+	}
+
+	// Persist tool checkpoints
+	if len(s.toolCheckpoints) > 0 {
+		state.ToolCheckpoints = make([]SerializedToolCheckpoint, len(s.toolCheckpoints))
+		copy(state.ToolCheckpoints, s.toolCheckpoints)
+	}
+
+	// Generate summary
+	state.Summary = state.GenerateSummary()
+
+	return state
+}
+
+// RestoreFromState restores the session from a saved state.
+func (s *Session) RestoreFromState(state *SessionState) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	history := make([]*genai.Content, len(state.History))
+	for i, sc := range state.History {
+		content, err := DeserializeContent(sc)
+		if err != nil {
+			return err
+		}
+		history[i] = content
+	}
+
+	// Fix legacy sessions that have empty tool call IDs
+	fixEmptyToolIDs(history)
+
+	s.ID = state.ID
+	s.StartTime = state.StartTime
+	s.WorkDir = state.WorkDir
+	s.History = history
+	s.tokenCounts = make([]int, len(state.TokenCounts))
+	copy(s.tokenCounts, state.TokenCounts)
+	s.totalTokens = state.TotalTokens
+	s.version = state.Version
+	s.scratchpad = state.Scratchpad
+	s.SystemInstruction = state.SystemInstruction
+
+	// Restore checkpoints
+	if len(state.Checkpoints) > 0 {
+		s.Checkpoints = make(map[string]int, len(state.Checkpoints))
+		for k, v := range state.Checkpoints {
+			s.Checkpoints[k] = v
+		}
+	}
+
+	// Restore branches (recursive)
+	if len(state.Branches) > 0 {
+		s.Branches = make(map[string]*Session, len(state.Branches))
+		for name, branchState := range state.Branches {
+			branch := NewSession()
+			if err := branch.RestoreFromState(branchState); err != nil {
+				return fmt.Errorf("failed to restore branch %q: %w", name, err)
+			}
+			s.Branches[name] = branch
+		}
+	}
+
+	// Restore tool checkpoints
+	if len(state.ToolCheckpoints) > 0 {
+		s.toolCheckpoints = make([]SerializedToolCheckpoint, len(state.ToolCheckpoints))
+		copy(s.toolCheckpoints, state.ToolCheckpoints)
+	}
+
+	return nil
+}
+
+// GetScratchpad returns the current scratchpad content.
+func (s *Session) GetScratchpad() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.scratchpad
+}
+
+// SetScratchpad sets the scratchpad content.
+func (s *Session) SetScratchpad(content string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.scratchpad = content
+}
+
+// GetToolCheckpoints returns persisted tool checkpoint entries.
+func (s *Session) GetToolCheckpoints() []SerializedToolCheckpoint {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]SerializedToolCheckpoint, len(s.toolCheckpoints))
+	copy(out, s.toolCheckpoints)
+	return out
+}
+
+// SetToolCheckpoints sets the persisted tool checkpoint entries.
+func (s *Session) SetToolCheckpoints(checkpoints []SerializedToolCheckpoint) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.toolCheckpoints = make([]SerializedToolCheckpoint, len(checkpoints))
+	copy(s.toolCheckpoints, checkpoints)
+}
+
+// --- Session Branching (Forking) ---
+
+// Fork creates a branch by copying the current history into a new Session.
+// The branch is stored in the Branches map under the given name.
+func (s *Session) Fork(name string) *Session {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.Branches == nil {
+		s.Branches = make(map[string]*Session)
+	}
+
+	// Copy current history into a new session
+	historyCopy := make([]*genai.Content, len(s.History))
+	copy(historyCopy, s.History)
+
+	tokenCountsCopy := make([]int, len(s.tokenCounts))
+	copy(tokenCountsCopy, s.tokenCounts)
+
+	branch := &Session{
+		ID:                generateSessionID() + "-" + name,
+		StartTime:         time.Now(),
+		WorkDir:           s.WorkDir,
+		History:           historyCopy,
+		tokenCounts:       tokenCountsCopy,
+		totalTokens:       s.totalTokens,
+		scratchpad:        s.scratchpad,
+		SystemInstruction: s.SystemInstruction,
+	}
+
+	s.Branches[name] = branch
+	return branch
+}
+
+// GetBranch retrieves a branch by name.
+func (s *Session) GetBranch(name string) (*Session, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.Branches == nil {
+		return nil, false
+	}
+	branch, ok := s.Branches[name]
+	return branch, ok
+}
+
+// ListBranches returns all branch names.
+func (s *Session) ListBranches() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.Branches == nil {
+		return nil
+	}
+	names := make([]string, 0, len(s.Branches))
+	for name := range s.Branches {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// --- Named Checkpoints ---
+
+// SaveCheckpoint saves the current history length as a named checkpoint.
+func (s *Session) SaveCheckpoint(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.Checkpoints == nil {
+		s.Checkpoints = make(map[string]int)
+	}
+	s.Checkpoints[name] = len(s.History)
+}
+
+// RestoreCheckpoint truncates the history to the saved checkpoint index.
+// Returns true if the checkpoint was found and restored, false otherwise.
+func (s *Session) RestoreCheckpoint(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.Checkpoints == nil {
+		return false
+	}
+	idx, ok := s.Checkpoints[name]
+	if !ok {
+		return false
+	}
+
+	// Truncate history to checkpoint index, then remove any orphaned tool responses
+	if idx < len(s.History) {
+		s.History = s.History[:idx]
+		s.History = removeOrphanedToolParts(s.History)
+	}
+
+	// Truncate token counts to match actual history length after orphan removal
+	newLen := len(s.History)
+	if newLen < len(s.tokenCounts) {
+		s.tokenCounts = s.tokenCounts[:newLen]
+		// Recalculate total tokens
+		s.totalTokens = 0
+		for _, count := range s.tokenCounts {
+			s.totalTokens += count
+		}
+	}
+
+	// Remove any checkpoints that referenced indices beyond the new length
+	for cpName, cpIdx := range s.Checkpoints {
+		if cpIdx > idx {
+			delete(s.Checkpoints, cpName)
+		}
+	}
+
+	s.version++
+	return true
+}
+
+// ListCheckpoints returns checkpoint names sorted by their history index.
+func (s *Session) ListCheckpoints() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.Checkpoints == nil {
+		return nil
+	}
+
+	type cpEntry struct {
+		name string
+		idx  int
+	}
+	entries := make([]cpEntry, 0, len(s.Checkpoints))
+	for name, idx := range s.Checkpoints {
+		entries = append(entries, cpEntry{name: name, idx: idx})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].idx < entries[j].idx
+	})
+
+	names := make([]string, len(entries))
+	for i, e := range entries {
+		names[i] = e.name
+	}
+	return names
+}
+
+// --- Tool Pair Safety ---
+
+// adjustBoundaryForToolPairs shifts a trim boundary so that FunctionCall/FunctionResponse
+// pairs are not split. Scans ±10 messages around boundary.
+// This is a local copy of context.AdjustBoundaryForToolPairs to avoid an import cycle
+// (chat cannot import internal/context).
+func adjustBoundaryForToolPairs(history []*genai.Content, boundary int) int {
+	if boundary <= 0 || boundary >= len(history) {
+		return boundary
+	}
+
+	adjusted := boundary
+
+	for iter := 0; iter < 3; iter++ {
+		prev := adjusted
+
+		rightCallIDs, rightResponseIDs := collectToolIDs(history, adjusted)
+
+		// Case 1: FunctionCall left of boundary with FunctionResponse on right — move left
+		for i := adjusted - 1; i >= 0 && i >= adjusted-10; i-- {
+			if history[i] == nil {
+				continue
+			}
+			for _, part := range history[i].Parts {
+				if part != nil && part.FunctionCall != nil && part.FunctionCall.ID != "" {
+					if rightResponseIDs[part.FunctionCall.ID] {
+						if i < adjusted {
+							adjusted = i
+						}
+					}
+				}
+			}
+		}
+
+		// Case 2: orphaned FunctionResponse at/after boundary — move right past it
+		if adjusted != prev {
+			rightCallIDs, _ = collectToolIDs(history, adjusted)
+		}
+		scanStart := adjusted
+		for i := scanStart; i < len(history) && i < scanStart+10; i++ {
+			if history[i] == nil {
+				continue
+			}
+			hasOrphan := false
+			for _, part := range history[i].Parts {
+				if part != nil && part.FunctionResponse != nil && part.FunctionResponse.ID != "" {
+					if !rightCallIDs[part.FunctionResponse.ID] {
+						hasOrphan = true
+					}
+				}
+			}
+			if hasOrphan {
+				adjusted = i + 1
+			} else {
+				break
+			}
+		}
+
+		if adjusted == prev {
+			break
+		}
+	}
+
+	if adjusted < 0 {
+		adjusted = 0
+	}
+	if adjusted > len(history) {
+		adjusted = len(history)
+	}
+	return adjusted
+}
+
+// collectToolIDs collects FunctionCall IDs and FunctionResponse IDs from history[boundary:].
+func collectToolIDs(history []*genai.Content, boundary int) (callIDs, responseIDs map[string]bool) {
+	callIDs = make(map[string]bool)
+	responseIDs = make(map[string]bool)
+	for i := boundary; i < len(history); i++ {
+		if history[i] == nil {
+			continue
+		}
+		for _, part := range history[i].Parts {
+			if part == nil {
+				continue
+			}
+			if part.FunctionCall != nil && part.FunctionCall.ID != "" {
+				callIDs[part.FunctionCall.ID] = true
+			}
+			if part.FunctionResponse != nil && part.FunctionResponse.ID != "" {
+				responseIDs[part.FunctionResponse.ID] = true
+			}
+		}
+	}
+	return
+}
+
+// removeOrphanedToolParts removes trailing orphaned FunctionResponse messages
+// that have no matching FunctionCall in history. Used after right-truncation (:idx).
+func removeOrphanedToolParts(history []*genai.Content) []*genai.Content {
+	// Collect all FunctionCall IDs in the history
+	callIDs := make(map[string]bool)
+	for _, msg := range history {
+		if msg == nil {
+			continue
+		}
+		for _, part := range msg.Parts {
+			if part != nil && part.FunctionCall != nil && part.FunctionCall.ID != "" {
+				callIDs[part.FunctionCall.ID] = true
+			}
+		}
+	}
+
+	// Remove trailing messages that only contain orphaned FunctionResponses
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i] == nil {
+			history = history[:i]
+			continue
+		}
+		allOrphaned := true
+		hasFuncResp := false
+		for _, part := range history[i].Parts {
+			if part == nil {
+				continue
+			}
+			if part.FunctionResponse != nil && part.FunctionResponse.ID != "" {
+				hasFuncResp = true
+				if callIDs[part.FunctionResponse.ID] {
+					allOrphaned = false
+				}
+			} else if part.Text != "" || part.FunctionCall != nil {
+				allOrphaned = false
+			}
+		}
+		if hasFuncResp && allOrphaned {
+			history = history[:i]
+		} else {
+			break
+		}
+	}
+	return history
+}
+
+// --- Sensitive Data Redaction ---
+
+var sessionRedactor = security.NewSecretRedactor()
+
+// redactSensitiveData scans text and replaces sensitive patterns with [REDACTED].
+func redactSensitiveData(text string) string {
+	return sessionRedactor.Redact(text)
+}
+
+// --- Export ---
+
+// ExportMarkdown exports the conversation as markdown.
+// Each message is formatted with a ## User or ## Assistant header.
+// Tool calls are formatted as code blocks.
+func (s *Session) ExportMarkdown() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("# Session %s\n\n", s.ID))
+	sb.WriteString(fmt.Sprintf("**Started:** %s\n\n", s.StartTime.Format("2006-01-02 15:04:05")))
+	if s.WorkDir != "" {
+		sb.WriteString(fmt.Sprintf("**Working Directory:** %s\n\n", s.WorkDir))
+	}
+	sb.WriteString("---\n\n")
+
+	for _, content := range s.History {
+		role := "Assistant"
+		if content.Role == string(genai.RoleUser) {
+			role = "User"
+		}
+
+		sb.WriteString(fmt.Sprintf("## %s\n\n", role))
+
+		for _, part := range content.Parts {
+			if part.FunctionCall != nil {
+				sb.WriteString(fmt.Sprintf("**Tool Call:** `%s`\n\n", part.FunctionCall.Name))
+				if part.FunctionCall.Args != nil {
+					argsJSON, err := json.MarshalIndent(part.FunctionCall.Args, "", "  ")
+					if err == nil {
+						redacted := redactSensitiveData(string(argsJSON))
+						sb.WriteString("```json\n")
+						sb.WriteString(redacted)
+						sb.WriteString("\n```\n\n")
+					}
+				}
+			} else if part.FunctionResponse != nil {
+				sb.WriteString(fmt.Sprintf("**Tool Response:** `%s`\n\n", part.FunctionResponse.Name))
+				if part.FunctionResponse.Response != nil {
+					respJSON, err := json.MarshalIndent(part.FunctionResponse.Response, "", "  ")
+					if err == nil {
+						redacted := redactSensitiveData(string(respJSON))
+						sb.WriteString("```json\n")
+						sb.WriteString(redacted)
+						sb.WriteString("\n```\n\n")
+					}
+				}
+			} else if part.Text != "" {
+				redacted := redactSensitiveData(part.Text)
+				sb.WriteString(redacted)
+				sb.WriteString("\n\n")
+			}
+		}
+	}
+
+	return sb.String()
+}
+
+// ExportJSON exports the session as JSON with history, metadata, and timestamps.
+// Sensitive data is redacted before export.
+func (s *Session) ExportJSON() ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Serialize history
+	history := make([]SerializedContent, len(s.History))
+	for i, content := range s.History {
+		history[i] = SerializeContent(content)
+	}
+
+	// Redact sensitive data in serialized history
+	for i := range history {
+		for j := range history[i].Parts {
+			history[i].Parts[j].Text = redactSensitiveData(history[i].Parts[j].Text)
+			if history[i].Parts[j].FunctionCall != nil {
+				redactMapValues(history[i].Parts[j].FunctionCall.Args)
+			}
+			if history[i].Parts[j].FunctionResp != nil {
+				redactMapValues(history[i].Parts[j].FunctionResp.Response)
+			}
+		}
+	}
+
+	export := struct {
+		ID          string              `json:"id"`
+		StartTime   time.Time           `json:"start_time"`
+		ExportedAt  time.Time           `json:"exported_at"`
+		WorkDir     string              `json:"work_dir,omitempty"`
+		History     []SerializedContent `json:"history"`
+		TotalTokens int                 `json:"total_tokens"`
+		Version     int64               `json:"version"`
+		Scratchpad  string              `json:"scratchpad,omitempty"`
+	}{
+		ID:          s.ID,
+		StartTime:   s.StartTime,
+		ExportedAt:  time.Now(),
+		WorkDir:     s.WorkDir,
+		History:     history,
+		TotalTokens: s.totalTokens,
+		Version:     s.version,
+		Scratchpad:  redactSensitiveData(s.scratchpad),
+	}
+
+	return json.MarshalIndent(export, "", "  ")
+}
+
+// redactMapValues recursively redacts sensitive data in map string values.
+func redactMapValues(m map[string]any) {
+	if m == nil {
+		return
+	}
+	for k, v := range m {
+		switch val := v.(type) {
+		case string:
+			m[k] = sessionRedactor.Redact(val)
+		case map[string]any:
+			redactMapValues(val)
+		case []any:
+			redactSliceValues(val)
+		}
+	}
+}
+
+// redactSliceValues recursively redacts sensitive data in slice values.
+func redactSliceValues(s []any) {
+	for i, v := range s {
+		switch val := v.(type) {
+		case string:
+			s[i] = sessionRedactor.Redact(val)
+		case map[string]any:
+			redactMapValues(val)
+		case []any:
+			redactSliceValues(val)
+		}
+	}
+}

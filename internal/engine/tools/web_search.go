@@ -1,0 +1,432 @@
+package tools
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/ginkida/gokin-studio/internal/engine/logging"
+	"github.com/ginkida/gokin-studio/internal/engine/security"
+
+	"golang.org/x/net/html"
+	"google.golang.org/genai"
+)
+
+// SearchProvider defines the search backend to use.
+type SearchProvider string
+
+const (
+	SearchProviderSerpAPI    SearchProvider = "serpapi"
+	SearchProviderGoogle     SearchProvider = "google"
+	SearchProviderDuckDuckGo SearchProvider = "duckduckgo"
+)
+
+// WebSearchTool performs web searches using external APIs.
+type WebSearchTool struct {
+	client     *http.Client
+	provider   SearchProvider
+	apiKey     string
+	googleCX   string // Google Custom Search Engine ID
+	maxResults int
+}
+
+// NewWebSearchTool creates a new web search tool.
+func NewWebSearchTool() *WebSearchTool {
+	// Create secure HTTP client with TLS 1.2+ enforcement
+	secureClient, err := security.CreateDefaultHTTPClient()
+	if err != nil {
+		secureClient = &http.Client{Timeout: 30 * time.Second}
+		logging.Warn("failed to create secure HTTP client, using default", "error", err)
+	}
+
+	return &WebSearchTool{
+		client:     secureClient,
+		provider:   SearchProviderSerpAPI,
+		maxResults: 10,
+	}
+}
+
+// SetAPIKey sets the API key for the search provider.
+func (t *WebSearchTool) SetAPIKey(key string) {
+	t.apiKey = key
+}
+
+// SetProvider sets the search provider.
+func (t *WebSearchTool) SetProvider(provider SearchProvider) {
+	t.provider = provider
+}
+
+// SetGoogleCX sets the Google Custom Search Engine ID.
+func (t *WebSearchTool) SetGoogleCX(cx string) {
+	t.googleCX = cx
+}
+
+func (t *WebSearchTool) Name() string {
+	return "web_search"
+}
+
+func (t *WebSearchTool) Description() string {
+	return "Searches the web and returns relevant results. Useful for finding current information, documentation, or research."
+}
+
+func (t *WebSearchTool) Declaration() *genai.FunctionDeclaration {
+	return &genai.FunctionDeclaration{
+		Name:        t.Name(),
+		Description: t.Description(),
+		Parameters: &genai.Schema{
+			Type: genai.TypeObject,
+			Properties: map[string]*genai.Schema{
+				"query": {
+					Type:        genai.TypeString,
+					Description: "The search query",
+				},
+				"num_results": {
+					Type:        genai.TypeInteger,
+					Description: "Number of results to return (default 5, max 10)",
+				},
+			},
+			Required: []string{"query"},
+		},
+	}
+}
+
+func (t *WebSearchTool) Validate(args map[string]any) error {
+	query, ok := GetString(args, "query")
+	if !ok || query == "" {
+		return NewValidationError("query", "is required")
+	}
+
+	// DuckDuckGo doesn't require an API key; when no key is configured
+	// Execute() auto-falls back to DuckDuckGo, so validation passes.
+	if t.apiKey == "" && t.provider == SearchProviderGoogle {
+		return NewValidationError("api_key", "Google Custom Search API key not configured")
+	}
+
+	return nil
+}
+
+func (t *WebSearchTool) Execute(ctx context.Context, args map[string]any) (ToolResult, error) {
+	query, _ := GetString(args, "query")
+	numResults := GetIntDefault(args, "num_results", 5)
+
+	if numResults > t.maxResults {
+		numResults = t.maxResults
+	}
+	if numResults < 1 {
+		numResults = 5
+	}
+
+	var results []SearchResult
+	var err error
+
+	switch t.provider {
+	case SearchProviderGoogle:
+		results, err = t.searchGoogle(ctx, query, numResults)
+	case SearchProviderDuckDuckGo:
+		results, err = t.searchDuckDuckGo(ctx, query, numResults)
+	default:
+		if t.apiKey == "" {
+			// Auto-fallback to DuckDuckGo when no API key is configured
+			results, err = t.searchDuckDuckGo(ctx, query, numResults)
+		} else {
+			results, err = t.searchSerpAPI(ctx, query, numResults)
+		}
+	}
+
+	if err != nil {
+		return NewErrorResult(fmt.Sprintf("search failed: %s", err)), nil
+	}
+
+	if len(results) == 0 {
+		return NewSuccessResult("No results found for the query."), nil
+	}
+
+	// Format results
+	var output strings.Builder
+	output.WriteString(fmt.Sprintf("Search results for: %s\n\n", query))
+
+	for i, r := range results {
+		output.WriteString(fmt.Sprintf("%d. **%s**\n", i+1, r.Title))
+		output.WriteString(fmt.Sprintf("   %s\n", r.URL))
+		if r.Snippet != "" {
+			output.WriteString(fmt.Sprintf("   %s\n", r.Snippet))
+		}
+		output.WriteString("\n")
+	}
+
+	// Convert to JSON for structured data
+	resultsJSON, err := json.Marshal(results)
+	if err != nil {
+		resultsJSON = []byte("[]")
+	}
+
+	return NewSuccessResultWithData(output.String(), map[string]any{
+		"query":   query,
+		"count":   len(results),
+		"results": string(resultsJSON),
+	}), nil
+}
+
+// SearchResult represents a single search result.
+type SearchResult struct {
+	Title   string `json:"title"`
+	URL     string `json:"url"`
+	Snippet string `json:"snippet"`
+}
+
+// searchSerpAPI performs a search using SerpAPI.
+// Note: SerpAPI requires the API key in query parameters per their API spec.
+// We minimize exposure by not logging the full URL and using HTTPS.
+func (t *WebSearchTool) searchSerpAPI(ctx context.Context, query string, numResults int) ([]SearchResult, error) {
+	baseURL := "https://serpapi.com/search"
+
+	params := url.Values{}
+	params.Set("q", query)
+	params.Set("engine", "google")
+	params.Set("num", fmt.Sprintf("%d", numResults))
+
+	// Build URL without API key first (for any potential logging)
+	reqURL := fmt.Sprintf("%s?%s", baseURL, params.Encode())
+
+	// Add API key separately to minimize exposure in potential error messages
+	params.Set("api_key", t.apiKey)
+	fullURL := fmt.Sprintf("%s?%s", baseURL, params.Encode())
+
+	req, err := http.NewRequestWithContext(ctx, "GET", fullURL, nil)
+	if err != nil {
+		// Return error without exposing the full URL with API key
+		return nil, fmt.Errorf("failed to create request for %s", reqURL)
+	}
+
+	resp, err := t.client.Do(req)
+	if err != nil {
+		// Return error without exposing the full URL with API key
+		return nil, fmt.Errorf("request to %s failed: %w", reqURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+	}
+
+	var data struct {
+		OrganicResults []struct {
+			Title   string `json:"title"`
+			Link    string `json:"link"`
+			Snippet string `json:"snippet"`
+		} `json:"organic_results"`
+		Error string `json:"error"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if data.Error != "" {
+		return nil, fmt.Errorf("API error: %s", data.Error)
+	}
+
+	results := make([]SearchResult, 0, len(data.OrganicResults))
+	for _, r := range data.OrganicResults {
+		results = append(results, SearchResult{
+			Title:   r.Title,
+			URL:     r.Link,
+			Snippet: r.Snippet,
+		})
+	}
+
+	return results, nil
+}
+
+// searchGoogle performs a search using Google Custom Search API.
+// Note: Google Custom Search API requires the API key in query parameters per their spec.
+// We minimize exposure by not logging the full URL and using HTTPS.
+func (t *WebSearchTool) searchGoogle(ctx context.Context, query string, numResults int) ([]SearchResult, error) {
+	if t.googleCX == "" {
+		return nil, fmt.Errorf("Google Custom Search Engine ID (cx) not configured")
+	}
+
+	baseURL := "https://www.googleapis.com/customsearch/v1"
+
+	params := url.Values{}
+	params.Set("q", query)
+	params.Set("cx", t.googleCX)
+	params.Set("num", fmt.Sprintf("%d", numResults))
+
+	// Build URL without API key first (for any potential logging)
+	reqURL := fmt.Sprintf("%s?%s", baseURL, params.Encode())
+
+	// Add API key separately to minimize exposure in potential error messages
+	params.Set("key", t.apiKey)
+	fullURL := fmt.Sprintf("%s?%s", baseURL, params.Encode())
+
+	req, err := http.NewRequestWithContext(ctx, "GET", fullURL, nil)
+	if err != nil {
+		// Return error without exposing the full URL with API key
+		return nil, fmt.Errorf("failed to create request for %s", reqURL)
+	}
+
+	resp, err := t.client.Do(req)
+	if err != nil {
+		// Return error without exposing the full URL with API key
+		return nil, fmt.Errorf("request to %s failed: %w", reqURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+	}
+
+	var data struct {
+		Items []struct {
+			Title   string `json:"title"`
+			Link    string `json:"link"`
+			Snippet string `json:"snippet"`
+		} `json:"items"`
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if data.Error.Message != "" {
+		return nil, fmt.Errorf("API error: %s", data.Error.Message)
+	}
+
+	results := make([]SearchResult, 0, len(data.Items))
+	for _, r := range data.Items {
+		results = append(results, SearchResult{
+			Title:   r.Title,
+			URL:     r.Link,
+			Snippet: r.Snippet,
+		})
+	}
+
+	return results, nil
+}
+
+// searchDuckDuckGo performs a search using DuckDuckGo Lite (no API key required).
+func (t *WebSearchTool) searchDuckDuckGo(ctx context.Context, query string, numResults int) ([]SearchResult, error) {
+	data := url.Values{}
+	data.Set("q", query)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://lite.duckduckgo.com/lite/", strings.NewReader(data.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", "Gokin/1.0")
+
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("DuckDuckGo request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("DuckDuckGo returned status %d", resp.StatusCode)
+	}
+
+	// Limit response to 2MB to guard against unexpected large payloads.
+	return parseDuckDuckGoLite(io.LimitReader(resp.Body, 2<<20), numResults)
+}
+
+// parseDuckDuckGoLite extracts search results from DuckDuckGo Lite HTML.
+//
+// The lite page renders results as a flat sequence of <tr> rows inside a
+// single <table>.  Each organic result occupies 4 consecutive rows:
+//
+//  1. link row   – contains an <a class="result-link"> with href and title text
+//  2. snippet row – contains a <td class="result-snippet"> with the description
+//  3. URL row    – display URL (we already have the real one from step 1)
+//  4. spacer row – empty separator
+//
+// We walk the HTML token stream looking for these class markers, which are
+// stable across DuckDuckGo Lite revisions.
+func parseDuckDuckGoLite(r io.Reader, maxResults int) ([]SearchResult, error) {
+	doc, err := html.Parse(r)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse HTML: %w", err)
+	}
+
+	var results []SearchResult
+
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if len(results) >= maxResults {
+			return
+		}
+
+		if n.Type == html.ElementNode && n.Data == "a" && htmlHasClass(n, "result-link") {
+			href := htmlGetAttr(n, "href")
+			title := htmlTextContent(n)
+			if href != "" && title != "" {
+				results = append(results, SearchResult{
+					Title: strings.TrimSpace(title),
+					URL:   href,
+				})
+			}
+		}
+
+		if n.Type == html.ElementNode && n.Data == "td" && htmlHasClass(n, "result-snippet") {
+			snippet := strings.TrimSpace(htmlTextContent(n))
+			if snippet != "" && len(results) > 0 && results[len(results)-1].Snippet == "" {
+				results[len(results)-1].Snippet = snippet
+			}
+		}
+
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(doc)
+
+	return results, nil
+}
+
+func htmlHasClass(n *html.Node, class string) bool {
+	for _, a := range n.Attr {
+		if a.Key == "class" {
+			for _, c := range strings.Fields(a.Val) {
+				if c == class {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func htmlGetAttr(n *html.Node, key string) string {
+	for _, a := range n.Attr {
+		if a.Key == key {
+			return a.Val
+		}
+	}
+	return ""
+}
+
+func htmlTextContent(n *html.Node) string {
+	var sb strings.Builder
+	var collect func(*html.Node)
+	collect = func(n *html.Node) {
+		if n.Type == html.TextNode {
+			sb.WriteString(n.Data)
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			collect(c)
+		}
+	}
+	collect(n)
+	return sb.String()
+}

@@ -1,0 +1,289 @@
+package client
+
+import (
+	"context"
+	"fmt"
+	"sync"
+
+	"github.com/ginkida/gokin-studio/internal/engine/logging"
+
+	"google.golang.org/genai"
+)
+
+// FallbackClient wraps multiple Client instances and tries each in order
+// on failure, providing automatic failover between providers.
+type FallbackClient struct {
+	clients   []Client
+	providers []string
+	current   int
+	mu        sync.RWMutex
+}
+
+// NewFallbackClient creates a new FallbackClient with the given clients.
+// At least one client must be provided.
+func NewFallbackClient(clients []Client, providers []string) (*FallbackClient, error) {
+	if len(clients) == 0 {
+		return nil, fmt.Errorf("fallback client requires at least one client")
+	}
+	if len(providers) != len(clients) {
+		providers = make([]string, len(clients))
+	}
+	return &FallbackClient{
+		clients:   clients,
+		providers: providers,
+		current:   0,
+	}, nil
+}
+
+func (fc *FallbackClient) providerAt(index int) string {
+	if index < 0 || index >= len(fc.providers) {
+		return ""
+	}
+	return fc.providers[index]
+}
+
+// getCurrent returns the current active client index.
+func (fc *FallbackClient) getCurrent() int {
+	fc.mu.RLock()
+	defer fc.mu.RUnlock()
+	return fc.current
+}
+
+// advance moves to the next client in the chain. Returns false if no more clients.
+func (fc *FallbackClient) advance() bool {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if fc.current+1 < len(fc.clients) {
+		fc.current++
+		logging.Warn("falling back to next client",
+			"index", fc.current,
+			"model", fc.clients[fc.current].GetModel())
+		return true
+	}
+	return false
+}
+
+// resetCurrent resets back to the first client.
+func (fc *FallbackClient) resetCurrent() {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	fc.current = 0
+}
+
+// ResetFallbackPosition resets the fallback chain to start from the first provider.
+// This allows retrying the full chain after a delay (e.g., after stream-level retries exhaust).
+func (fc *FallbackClient) ResetFallbackPosition() {
+	fc.resetCurrent()
+}
+
+// SendMessage sends a message, trying fallback clients on error.
+func (fc *FallbackClient) SendMessage(ctx context.Context, message string) (*StreamingResponse, error) {
+	startIdx := fc.getCurrent()
+	for i := startIdx; i < len(fc.clients); i++ {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		resp, err := fc.clients[i].SendMessage(ctx, message)
+		if err == nil {
+			fc.mu.Lock()
+			fc.current = i
+			fc.mu.Unlock()
+			recordProviderSuccess(fc.providerAt(i))
+			return resp, nil
+		}
+		recordProviderFailure(fc.providerAt(i), IsRetryableError(err))
+
+		logging.Warn("client failed in SendMessage",
+			"index", i,
+			"model", fc.clients[i].GetModel(),
+			"error", err.Error())
+
+		// If context is cancelled, don't try next client
+		if ctx.Err() != nil {
+			return nil, err
+		}
+
+		// If this is the last client, return the error
+		if i+1 >= len(fc.clients) {
+			return nil, fmt.Errorf("all fallback clients failed, last error: %w", err)
+		}
+	}
+	return nil, fmt.Errorf("all fallback clients exhausted")
+}
+
+// SendMessageWithHistory sends a message with history, trying fallback clients on error.
+func (fc *FallbackClient) SendMessageWithHistory(ctx context.Context, history []*genai.Content, message string) (*StreamingResponse, error) {
+	startIdx := fc.getCurrent()
+	for i := startIdx; i < len(fc.clients); i++ {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		resp, err := fc.clients[i].SendMessageWithHistory(ctx, history, message)
+		if err == nil {
+			fc.mu.Lock()
+			fc.current = i
+			fc.mu.Unlock()
+			recordProviderSuccess(fc.providerAt(i))
+			return resp, nil
+		}
+		recordProviderFailure(fc.providerAt(i), IsRetryableError(err))
+
+		logging.Warn("client failed in SendMessageWithHistory",
+			"index", i,
+			"model", fc.clients[i].GetModel(),
+			"error", err.Error())
+
+		if ctx.Err() != nil {
+			return nil, err
+		}
+
+		if i+1 >= len(fc.clients) {
+			return nil, fmt.Errorf("all fallback clients failed, last error: %w", err)
+		}
+	}
+	return nil, fmt.Errorf("all fallback clients exhausted")
+}
+
+// SendFunctionResponse sends function results, trying fallback clients on error.
+func (fc *FallbackClient) SendFunctionResponse(ctx context.Context, history []*genai.Content, results []*genai.FunctionResponse) (*StreamingResponse, error) {
+	startIdx := fc.getCurrent()
+	for i := startIdx; i < len(fc.clients); i++ {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		resp, err := fc.clients[i].SendFunctionResponse(ctx, history, results)
+		if err == nil {
+			fc.mu.Lock()
+			fc.current = i
+			fc.mu.Unlock()
+			recordProviderSuccess(fc.providerAt(i))
+			return resp, nil
+		}
+		recordProviderFailure(fc.providerAt(i), IsRetryableError(err))
+
+		logging.Warn("client failed in SendFunctionResponse",
+			"index", i,
+			"model", fc.clients[i].GetModel(),
+			"error", err.Error())
+
+		if ctx.Err() != nil {
+			return nil, err
+		}
+
+		if i+1 >= len(fc.clients) {
+			return nil, fmt.Errorf("all fallback clients failed, last error: %w", err)
+		}
+	}
+	return nil, fmt.Errorf("all fallback clients exhausted")
+}
+
+// SetSystemInstruction sets the system-level instruction on ALL clients in the fallback chain.
+func (fc *FallbackClient) SetSystemInstruction(instruction string) {
+	fc.mu.RLock()
+	defer fc.mu.RUnlock()
+	for _, c := range fc.clients {
+		c.SetSystemInstruction(instruction)
+	}
+}
+
+// SetThinkingBudget sets thinking budget on ALL clients in the fallback chain.
+func (fc *FallbackClient) SetThinkingBudget(budget int32) {
+	fc.mu.RLock()
+	defer fc.mu.RUnlock()
+	for _, c := range fc.clients {
+		c.SetThinkingBudget(budget)
+	}
+}
+
+// SetTools sets tools on ALL clients in the fallback chain.
+// Each client gets its own copy of the slice to prevent cross-client mutation.
+func (fc *FallbackClient) SetTools(tools []*genai.Tool) {
+	fc.mu.RLock()
+	defer fc.mu.RUnlock()
+	for _, c := range fc.clients {
+		clone := make([]*genai.Tool, len(tools))
+		copy(clone, tools)
+		c.SetTools(clone)
+	}
+}
+
+// SetRateLimiter sets the rate limiter on ALL clients in the fallback chain.
+func (fc *FallbackClient) SetRateLimiter(limiter interface{}) {
+	fc.mu.RLock()
+	defer fc.mu.RUnlock()
+	for _, c := range fc.clients {
+		c.SetRateLimiter(limiter)
+	}
+}
+
+// CountTokens counts tokens using the current active client.
+func (fc *FallbackClient) CountTokens(ctx context.Context, contents []*genai.Content) (*genai.CountTokensResponse, error) {
+	idx := fc.getCurrent()
+	return fc.clients[idx].CountTokens(ctx, contents)
+}
+
+// GetModel returns the current active client's model name.
+func (fc *FallbackClient) GetModel() string {
+	idx := fc.getCurrent()
+	return fc.clients[idx].GetModel()
+}
+
+// SetModel changes the model on the current active client.
+func (fc *FallbackClient) SetModel(modelName string) {
+	idx := fc.getCurrent()
+	fc.clients[idx].SetModel(modelName)
+}
+
+// WithModel returns a new FallbackClient with all clients configured for the specified model.
+// Preserves the fallback chain so failover continues to work.
+func (fc *FallbackClient) WithModel(modelName string) Client {
+	fc.mu.RLock()
+	defer fc.mu.RUnlock()
+	newClients := make([]Client, len(fc.clients))
+	for i, c := range fc.clients {
+		newClients[i] = c.WithModel(modelName)
+	}
+	newProviders := make([]string, len(fc.providers))
+	copy(newProviders, fc.providers)
+	fb, err := NewFallbackClient(newClients, newProviders)
+	if err != nil {
+		logging.Debug("FallbackClient.WithModel: NewFallbackClient failed", "error", err)
+		return fc.clients[fc.current].WithModel(modelName)
+	}
+	return fb
+}
+
+// GetRawClient returns the current active client's raw client.
+func (fc *FallbackClient) GetRawClient() interface{} {
+	idx := fc.getCurrent()
+	return fc.clients[idx].GetRawClient()
+}
+
+// Close closes ALL clients in the fallback chain.
+func (fc *FallbackClient) Close() error {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+
+	var lastErr error
+	for _, c := range fc.clients {
+		if err := c.Close(); err != nil {
+			lastErr = err
+		}
+	}
+	return lastErr
+}
+
+// SetStatusCallback sets status callbacks on all clients that support it.
+func (fc *FallbackClient) SetStatusCallback(cb StatusCallback) {
+	if cb == nil {
+		return
+	}
+
+	fc.mu.RLock()
+	defer fc.mu.RUnlock()
+	for _, c := range fc.clients {
+		if setter, ok := c.(interface{ SetStatusCallback(StatusCallback) }); ok {
+			setter.SetStatusCallback(cb)
+		}
+	}
+}

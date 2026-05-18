@@ -1,0 +1,1969 @@
+package client
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	cryptorand "crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/ginkida/gokin-studio/internal/engine/logging"
+	"github.com/ginkida/gokin-studio/internal/engine/security"
+
+	"google.golang.org/genai"
+)
+
+// HTTPError represents an HTTP error with status code.
+type HTTPError struct {
+	StatusCode int
+	Message    string
+	RetryAfter time.Duration // Parsed Retry-After header, 0 if absent
+	Err        error
+}
+
+func (e *HTTPError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return fmt.Sprintf("HTTP error: %d", e.StatusCode)
+}
+
+func (e *HTTPError) Unwrap() error {
+	return e.Err
+}
+
+// AnthropicConfig holds configuration for Anthropic-compatible API (GLM-4.7).
+type AnthropicConfig struct {
+	APIKey        string
+	BaseURL       string // Default: "https://api.anthropic.com" for Anthropic, custom for GLM-4.7
+	Provider      string // For telemetry/logging (anthropic, glm, deepseek, minimax, kimi)
+	Model         string
+	MaxTokens     int32
+	Temperature   float32
+	StreamEnabled bool
+	// Retry configuration
+	MaxRetries        int           // Maximum number of retry attempts
+	RetryDelay        time.Duration // Initial delay between retries
+	HTTPTimeout       time.Duration // HTTP request timeout
+	StreamIdleTimeout time.Duration // Max pause between SSE chunks (default: 30s)
+	// Extended Thinking
+	EnableThinking bool  // Enable extended thinking mode
+	ThinkingBudget int32 // Max tokens for thinking (0 = disabled)
+}
+
+// AnthropicClient implements Client interface for Anthropic-compatible APIs (including GLM-4.7).
+type AnthropicClient struct {
+	config            AnthropicConfig
+	httpClient        *http.Client
+	tools             []*genai.Tool
+	rateLimiter       RateLimiter
+	statusCallback    StatusCallback
+	systemInstruction string
+	mu                sync.RWMutex
+}
+
+// NewAnthropicClient creates a new Anthropic-compatible client.
+func NewAnthropicClient(config AnthropicConfig) (*AnthropicClient, error) {
+	// Validate required fields
+	if config.APIKey == "" {
+		return nil, fmt.Errorf("API key is required")
+	}
+
+	// Validate BaseURL if provided
+	if config.BaseURL != "" {
+		if !strings.HasPrefix(config.BaseURL, "http://") && !strings.HasPrefix(config.BaseURL, "https://") {
+			return nil, fmt.Errorf("invalid BaseURL: must start with http:// or https://")
+		}
+	}
+
+	// Validate model name
+	if config.Model == "" {
+		return nil, fmt.Errorf("model name is required")
+	}
+
+	// Set defaults
+	if config.BaseURL == "" {
+		config.BaseURL = DefaultAnthropicBaseURL
+	}
+	if config.Provider == "" {
+		config.Provider = "anthropic-compatible"
+	}
+	if config.MaxTokens == 0 {
+		config.MaxTokens = 8192
+	}
+	if config.MaxTokens < 1 {
+		return nil, fmt.Errorf("MaxTokens must be positive, got: %d", config.MaxTokens)
+	}
+	if config.MaxRetries < 0 {
+		return nil, fmt.Errorf("MaxRetries cannot be negative, got: %d", config.MaxRetries)
+	}
+	if config.RetryDelay == 0 {
+		config.RetryDelay = 1 * time.Second // Default 1 second delay
+	}
+	if config.HTTPTimeout == 0 {
+		config.HTTPTimeout = 120 * time.Second // Default 2 minute timeout
+	}
+	if config.HTTPTimeout < time.Second {
+		return nil, fmt.Errorf("HTTPTimeout too short: %v (minimum: 1s)", config.HTTPTimeout)
+	}
+	if config.StreamIdleTimeout == 0 {
+		config.StreamIdleTimeout = 30 * time.Second // Default 30s between SSE chunks
+	}
+
+	// Create secure HTTP client with TLS 1.2+ enforcement
+	tlsConfig := security.DefaultTLSConfig()
+	httpClient, err := security.CreateSecureHTTPClient(tlsConfig, config.HTTPTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create secure HTTP client: %w", err)
+	}
+
+	return &AnthropicClient{
+		config:     config,
+		httpClient: httpClient,
+		tools:      make([]*genai.Tool, 0),
+	}, nil
+}
+
+// SendMessage sends a message and returns a streaming response.
+func (c *AnthropicClient) SendMessage(ctx context.Context, message string) (*StreamingResponse, error) {
+	return c.SendMessageWithHistory(ctx, nil, message)
+}
+
+// SendMessageWithHistory sends a message with conversation history.
+func (c *AnthropicClient) SendMessageWithHistory(ctx context.Context, history []*genai.Content, message string) (*StreamingResponse, error) {
+	// Debug: log incoming history
+	var historyRoles []string
+	for i, h := range history {
+		historyRoles = append(historyRoles, fmt.Sprintf("[%d]%s", i, h.Role))
+	}
+	logging.Debug("SendMessageWithHistory called",
+		"history_len", len(history),
+		"history_roles", strings.Join(historyRoles, ","),
+		"message_len", len(message))
+
+	// Snapshot mutable fields under read lock
+	c.mu.RLock()
+	sysInstruction := c.systemInstruction
+	enableThinking := c.config.EnableThinking
+	thinkingBudget := c.config.ThinkingBudget
+	model := c.config.Model
+	maxTokens := c.config.MaxTokens
+	temperature := c.config.Temperature
+	tools := c.tools
+	c.mu.RUnlock()
+
+	var messages []map[string]interface{}
+	var systemPrompt string
+	if sysInstruction != "" {
+		// Use explicit system instruction — skip heuristic extraction from history
+		systemPrompt = sysInstruction
+		messages = c.convertHistoryToMessages(history, message)
+	} else {
+		// Legacy fallback: extract system prompt from first user message
+		messages, systemPrompt = c.convertHistoryToMessagesWithSystem(history, message)
+	}
+
+	// Build request
+	requestBody := map[string]interface{}{
+		"model":      model,
+		"max_tokens": maxTokens,
+		"messages":   messages,
+		"stream":     true,
+	}
+
+	// Add system prompt as separate parameter (required by Anthropic/DeepSeek)
+	if systemPrompt != "" {
+		requestBody["system"] = systemPrompt
+	}
+
+	// Extended Thinking support
+	if enableThinking && thinkingBudget > 0 {
+		requestBody["thinking"] = map[string]interface{}{
+			"type":          "enabled",
+			"budget_tokens": thinkingBudget,
+		}
+		// Extended thinking requires temperature=1 (Anthropic requirement)
+		requestBody["temperature"] = 1.0
+	} else if temperature > 0 {
+		requestBody["temperature"] = temperature
+	}
+
+	if len(tools) > 0 {
+		// Convert tools to Anthropic format (uses snapshot)
+		anthropicTools := c.convertToolsToAnthropicFrom(tools)
+		if len(anthropicTools) > 0 {
+			requestBody["tools"] = anthropicTools
+		}
+	}
+
+	c.applyCacheControl(requestBody)
+	return c.streamRequest(ctx, requestBody)
+}
+
+// SendFunctionResponse sends function call results back to the model.
+func (c *AnthropicClient) SendFunctionResponse(ctx context.Context, history []*genai.Content, results []*genai.FunctionResponse) (*StreamingResponse, error) {
+	// Snapshot mutable fields under read lock
+	c.mu.RLock()
+	sysInstruction := c.systemInstruction
+	enableThinking := c.config.EnableThinking
+	thinkingBudget := c.config.ThinkingBudget
+	model := c.config.Model
+	maxTokens := c.config.MaxTokens
+	temperature := c.config.Temperature
+	tools := c.tools
+	c.mu.RUnlock()
+
+	var messages []map[string]interface{}
+	var systemPrompt string
+	if sysInstruction != "" {
+		systemPrompt = sysInstruction
+		messages = c.convertHistoryWithResults(history, results)
+	} else {
+		messages, systemPrompt = c.convertHistoryWithResultsAndSystem(history, results)
+	}
+
+	requestBody := map[string]interface{}{
+		"model":      model,
+		"max_tokens": maxTokens,
+		"messages":   messages,
+		"stream":     true,
+	}
+
+	// Add system prompt as separate parameter (required by Anthropic/DeepSeek)
+	if systemPrompt != "" {
+		requestBody["system"] = systemPrompt
+	}
+
+	// Extended Thinking support
+	if enableThinking && thinkingBudget > 0 {
+		requestBody["thinking"] = map[string]interface{}{
+			"type":          "enabled",
+			"budget_tokens": thinkingBudget,
+		}
+		requestBody["temperature"] = 1.0
+	} else if temperature > 0 {
+		requestBody["temperature"] = temperature
+	}
+
+	if len(tools) > 0 {
+		requestBody["tools"] = c.convertToolsToAnthropicFrom(tools)
+	}
+
+	c.applyCacheControl(requestBody)
+	return c.streamRequest(ctx, requestBody)
+}
+
+// SetSystemInstruction sets the system-level instruction for the model.
+func (c *AnthropicClient) SetSystemInstruction(instruction string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.systemInstruction = instruction
+}
+
+// supportsPromptCaching returns true if the provider supports Anthropic prompt caching.
+// Currently Anthropic (native) and MiniMax support cache_control; GLM and DeepSeek do not.
+func (c *AnthropicClient) supportsPromptCaching() bool {
+	base := c.config.BaseURL
+	if base == DefaultAnthropicBaseURL || base == "" {
+		return true
+	}
+	// MiniMax and Kimi support Anthropic-compatible prompt caching
+	return strings.Contains(base, "minimax") || strings.Contains(base, "moonshot") || strings.Contains(base, "kimi.com")
+}
+
+// applyCacheControl injects cache_control markers into the request body
+// for providers that support Anthropic prompt caching.
+// System instruction is converted to array-of-blocks format with cache_control,
+// and the last tool gets a cache_control marker.
+func (c *AnthropicClient) applyCacheControl(requestBody map[string]interface{}) {
+	if !c.supportsPromptCaching() {
+		return
+	}
+	// System: string → array-of-blocks with cache_control
+	if sys, ok := requestBody["system"].(string); ok && sys != "" {
+		requestBody["system"] = []map[string]interface{}{
+			{
+				"type":          "text",
+				"text":          sys,
+				"cache_control": map[string]string{"type": "ephemeral"},
+			},
+		}
+	}
+	// Tools: cache_control on the last tool
+	if toolsRaw, ok := requestBody["tools"]; ok {
+		if tools, ok := toolsRaw.([]map[string]interface{}); ok && len(tools) > 0 {
+			tools[len(tools)-1]["cache_control"] = map[string]string{"type": "ephemeral"}
+		}
+	}
+
+	// Messages: cache_control on the second-to-last user turn for conversation prefix caching.
+	// This allows the API to cache all messages up to the penultimate user turn,
+	// so only the latest exchange (user message + model response) is uncached.
+	if msgsRaw, ok := requestBody["messages"]; ok {
+		// Handle both []map[string]interface{} (pre-marshal) and []interface{} (post-unmarshal)
+		var msgs []map[string]interface{}
+		switch typed := msgsRaw.(type) {
+		case []map[string]interface{}:
+			msgs = typed
+		case []interface{}:
+			for _, item := range typed {
+				if m, ok := item.(map[string]interface{}); ok {
+					msgs = append(msgs, m)
+				}
+			}
+		}
+		if len(msgs) >= 4 {
+			for i := len(msgs) - 3; i >= 0; i-- {
+				if role, _ := msgs[i]["role"].(string); role == "user" {
+					switch contentTyped := msgs[i]["content"].(type) {
+					case []map[string]interface{}:
+						if len(contentTyped) > 0 {
+							contentTyped[len(contentTyped)-1]["cache_control"] = map[string]string{"type": "ephemeral"}
+						}
+					case []interface{}:
+						if len(contentTyped) > 0 {
+							if block, ok := contentTyped[len(contentTyped)-1].(map[string]interface{}); ok {
+								block["cache_control"] = map[string]string{"type": "ephemeral"}
+							}
+						}
+					}
+					break
+				}
+			}
+		}
+	}
+}
+
+// SetThinkingBudget configures the thinking/reasoning budget.
+func (c *AnthropicClient) SetThinkingBudget(budget int32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.config.EnableThinking = budget > 0
+	c.config.ThinkingBudget = budget
+}
+
+// SetTools sets the tools available for function calling.
+func (c *AnthropicClient) SetTools(tools []*genai.Tool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.tools = tools
+}
+
+// SetRateLimiter sets the rate limiter for API calls.
+func (c *AnthropicClient) SetRateLimiter(limiter interface{}) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if rl, ok := limiter.(RateLimiter); ok {
+		c.rateLimiter = rl
+	}
+}
+
+// SetStatusCallback sets the callback for status updates during operations.
+func (c *AnthropicClient) SetStatusCallback(cb StatusCallback) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.statusCallback = cb
+}
+
+// CountTokens counts tokens for the given contents.
+// For native Anthropic, uses the /v1/messages/count_tokens API endpoint.
+// For compatible providers (GLM, DeepSeek, MiniMax, Kimi), falls back to estimation.
+func (c *AnthropicClient) CountTokens(ctx context.Context, contents []*genai.Content) (*genai.CountTokensResponse, error) {
+	// Only native Anthropic has the count_tokens endpoint
+	c.mu.RLock()
+	baseURL := c.config.BaseURL
+	model := c.config.Model
+	apiKey := c.config.APIKey
+	sysInstruction := c.systemInstruction
+	tools := c.tools
+	c.mu.RUnlock()
+
+	if baseURL == DefaultAnthropicBaseURL || baseURL == "" {
+		resp, err := c.countTokensNative(ctx, contents, model, apiKey, sysInstruction, tools)
+		if err != nil {
+			// Fall back to estimation if native counting fails
+			logging.Debug("native token counting failed, using estimation", "error", err)
+			return c.estimateTokens(contents, model)
+		}
+		return resp, nil
+	}
+
+	return c.estimateTokens(contents, model)
+}
+
+// countTokensNative uses Anthropic's /v1/messages/count_tokens endpoint.
+func (c *AnthropicClient) countTokensNative(ctx context.Context, contents []*genai.Content, model, apiKey, sysInstruction string, tools []*genai.Tool) (*genai.CountTokensResponse, error) {
+	messages := c.convertHistoryToMessages(contents, "")
+
+	// Remove empty trailing message if convertHistoryToMessages appended one
+	if len(messages) > 0 {
+		last := messages[len(messages)-1]
+		if content, ok := last["content"].([]map[string]interface{}); ok && len(content) == 1 {
+			if text, ok := content[0]["text"].(string); ok && text == "" {
+				messages = messages[:len(messages)-1]
+			}
+		}
+		// Also handle string content
+		if content, ok := last["content"].(string); ok && content == "" {
+			messages = messages[:len(messages)-1]
+		}
+	}
+
+	// Need at least one message for the API
+	if len(messages) == 0 {
+		return &genai.CountTokensResponse{TotalTokens: 0}, nil
+	}
+
+	requestBody := map[string]interface{}{
+		"model":    model,
+		"messages": messages,
+	}
+
+	if sysInstruction != "" {
+		requestBody["system"] = sysInstruction
+	}
+
+	if len(tools) > 0 {
+		anthropicTools := c.convertToolsToAnthropicFrom(tools)
+		if len(anthropicTools) > 0 {
+			requestBody["tools"] = anthropicTools
+		}
+	}
+
+	jsonData, err := json.Marshal(requestBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal count_tokens request: %w", err)
+	}
+
+	url := DefaultAnthropicBaseURL + "/v1/messages/count_tokens"
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create count_tokens request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("anthropic-beta", "token-counting-2024-11-01")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("count_tokens request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("count_tokens returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		InputTokens int32 `json:"input_tokens"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode count_tokens response: %w", err)
+	}
+
+	return &genai.CountTokensResponse{
+		TotalTokens: result.InputTokens,
+	}, nil
+}
+
+// estimateTokens provides a character-based token estimation for non-Anthropic providers.
+func (c *AnthropicClient) estimateTokens(contents []*genai.Content, model string) (*genai.CountTokensResponse, error) {
+	totalChars := 0
+	for _, content := range contents {
+		totalChars += 4 * 4 // role overhead (~4 tokens)
+		for _, part := range content.Parts {
+			if part.Text != "" {
+				totalChars += len(part.Text)
+			}
+			if part.FunctionCall != nil {
+				totalChars += len(part.FunctionCall.Name) + 40
+				if argsJSON, err := json.Marshal(part.FunctionCall.Args); err == nil {
+					totalChars += len(argsJSON)
+				}
+			}
+			if part.FunctionResponse != nil {
+				totalChars += len(part.FunctionResponse.Name) + 40
+				if respJSON, err := json.Marshal(part.FunctionResponse.Response); err == nil {
+					totalChars += len(respJSON)
+				}
+			}
+		}
+	}
+
+	multiplier := 4.0
+	if strings.HasPrefix(strings.ToLower(model), "glm") {
+		multiplier = 3.5
+	}
+
+	estimatedTokens := int32(float64(totalChars) / multiplier)
+	return &genai.CountTokensResponse{
+		TotalTokens: estimatedTokens,
+	}, nil
+}
+
+// GetModel returns the model name.
+func (c *AnthropicClient) GetModel() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.config.Model
+}
+
+// SetModel changes the model for this client.
+func (c *AnthropicClient) SetModel(modelName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.config.Model = modelName
+}
+
+// WithModel returns a new client configured for the specified model.
+func (c *AnthropicClient) WithModel(modelName string) Client {
+	c.mu.RLock()
+	newConfig := c.config
+	tools := c.tools
+	rl := c.rateLimiter
+	sc := c.statusCallback
+	si := c.systemInstruction
+	c.mu.RUnlock()
+
+	newConfig.Model = modelName
+	newClient, err := NewAnthropicClient(newConfig)
+	if err != nil {
+		logging.Error("failed to create client with new model", "model", modelName, "error", err)
+		return c // Return original client on error
+	}
+	newClient.SetTools(tools)
+	if rl != nil {
+		newClient.SetRateLimiter(rl)
+	}
+	if sc != nil {
+		newClient.SetStatusCallback(sc)
+	}
+	if si != "" {
+		newClient.SetSystemInstruction(si)
+	}
+	return newClient
+}
+
+// Close closes the client connection and releases resources.
+func (c *AnthropicClient) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Close idle connections to release resources
+	if c.httpClient != nil {
+		if transport, ok := c.httpClient.Transport.(*http.Transport); ok {
+			transport.CloseIdleConnections()
+		}
+	}
+	return nil
+}
+
+// GetRawClient returns the underlying HTTP client for direct API access.
+func (c *AnthropicClient) GetRawClient() interface{} {
+	return c.httpClient
+}
+
+// toolCallAccumulator tracks tool call and thinking state during streaming.
+type toolCallAccumulator struct {
+	currentToolID    string
+	currentToolName  string
+	currentToolInput strings.Builder
+	completedCalls   []*genai.FunctionCall
+	callsEmitted     bool // true once completedCalls have been sent in a chunk
+	// Thinking block tracking
+	currentBlockType         string          // "thinking", "text", or "tool_use"
+	thinkingBuilder          strings.Builder // Accumulates thinking content for the current block
+	currentThinkingSignature strings.Builder // Accumulates the thinking signature (Anthropic/Kimi)
+	// Inline <think> tag parsing for models that embed reasoning in text
+	thinkTagParser ThinkTagParser
+}
+
+// isRetryableError returns true if the error should trigger a retry.
+func (c *AnthropicClient) isRetryableError(err error, statusCode int) bool {
+	// HTTP status codes that are retryable (5xx server errors and 429 rate limit)
+	switch statusCode {
+	case 429, 500, 502, 503, 504:
+		return true
+	}
+
+	// Some providers (MiniMax) return transient 400 errors that resolve on retry.
+	// Only retry 400s with known transient patterns, not all bad requests.
+	if statusCode == 400 && err != nil {
+		errStr := strings.ToLower(err.Error())
+		if strings.Contains(errStr, "model_not_found") || strings.Contains(errStr, "model not found") {
+			logging.Warn("transient 400 model_not_found, will retry", "error", err)
+			return true
+		}
+	}
+
+	// Only retry on specific network-related errors, not all errors
+	if err != nil {
+		// Typed check: HTTP client timeout wraps context.DeadlineExceeded
+		if errors.Is(err, context.DeadlineExceeded) {
+			return true
+		}
+
+		// String fallback for untyped errors
+		errStr := err.Error()
+		if strings.Contains(errStr, "timeout") ||
+			strings.Contains(errStr, "connection refused") ||
+			strings.Contains(errStr, "no such host") ||
+			strings.Contains(errStr, "connection reset") ||
+			strings.Contains(errStr, "overloaded") ||
+			strings.Contains(errStr, "temporarily") ||
+			strings.Contains(errStr, "EOF") {
+			return true
+		}
+	}
+	return false
+}
+
+// isEOFError returns true if the error is an EOF (connection closed by server).
+func isEOFError(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	return containsLower(err.Error(), "eof")
+}
+
+// calculateBackoffWithJitter is a convenience wrapper around CalculateBackoff.
+func calculateBackoffWithJitter(baseDelay time.Duration, attempt int, maxDelay time.Duration) time.Duration {
+	return CalculateBackoff(baseDelay, attempt, maxDelay)
+}
+
+// streamRequest performs a streaming request to the Anthropic API with retry logic.
+func (c *AnthropicClient) streamRequest(ctx context.Context, requestBody map[string]interface{}) (*StreamingResponse, error) {
+	var lastErr error
+	var lastStatusCode int
+	maxDelay := 30 * time.Second // Cap maximum delay at 30 seconds
+
+	c.mu.RLock()
+	rateLimiter := c.rateLimiter
+	statusCb := c.statusCallback
+	c.mu.RUnlock()
+
+	var estimatedTokens int64 = 500
+	if rateLimiter != nil {
+		waitTime := rateLimiter.EstimateWaitTime(estimatedTokens)
+		if waitTime > 500*time.Millisecond && statusCb != nil {
+			statusCb.OnRateLimit(waitTime)
+		}
+		if err := rateLimiter.AcquireWithContext(ctx, estimatedTokens); err != nil {
+			if statusCb != nil {
+				statusCb.OnRateLimit(time.Second) 
+			}
+			return nil, fmt.Errorf("rate limit aborted: %w", err)
+		}
+	}
+
+	// Retry loop
+	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff with jitter
+			delay := calculateBackoffWithJitter(c.config.RetryDelay, attempt-1, maxDelay)
+
+			// Respect Retry-After header from server (typically on 429)
+			var httpErr *HTTPError
+			if errors.As(lastErr, &httpErr) && httpErr.RetryAfter > 0 && httpErr.RetryAfter > delay {
+				delay = httpErr.RetryAfter
+			}
+
+			logging.Debug("retrying request", "attempt", attempt, "delay", delay, "last_status", lastStatusCode)
+
+			// Notify UI about retry
+			c.mu.RLock()
+			cb := c.statusCallback
+			c.mu.RUnlock()
+			if cb != nil {
+				reason := "API error"
+				if lastErr != nil {
+					reason = lastErr.Error()
+					// Shorten common error patterns
+					if lastStatusCode == 429 || strings.Contains(reason, "429") {
+						reason = "rate limit"
+					} else if strings.Contains(reason, "connection") {
+						reason = "connection error"
+					} else if strings.Contains(reason, "timeout") || strings.Contains(reason, "deadline exceeded") {
+						reason = "timeout"
+					} else if len(reason) > 50 {
+						reason = reason[:47] + "..."
+					}
+				}
+				cb.OnRetry(attempt, c.config.MaxRetries, delay, reason)
+			}
+
+			backoffTimer := time.NewTimer(delay)
+			select {
+			case <-backoffTimer.C:
+			case <-ctx.Done():
+				backoffTimer.Stop()
+				return nil, ContextErr(ctx)
+			}
+		}
+
+		// Per-attempt timeout is handled at the Transport level:
+		// - DialContext.Timeout (30s) for TCP connect
+		// - TLSHandshakeTimeout (10s) for TLS
+		// - ResponseHeaderTimeout (HTTPTimeout) for waiting for first header
+		// Each http.Client.Do() gets fresh transport timeouts automatically.
+		// The parent ctx governs the overall lifetime including SSE streaming.
+		response, err := c.doStreamRequest(ctx, requestBody)
+		if err == nil {
+			return response, nil
+		}
+
+		// Don't retry if parent context is cancelled (user abort, agent timeout)
+		if ctx.Err() != nil {
+			return nil, err
+		}
+
+		// Store error for potential retry
+		lastErr = err
+
+		// Close idle connections on EOF or timeout to force fresh TCP connection
+		// on retry — stale/broken connections shouldn't be reused.
+		if isEOFError(err) || errors.Is(err, context.DeadlineExceeded) {
+			c.httpClient.CloseIdleConnections()
+		}
+
+		// Extract status code if available
+		var httpErr *HTTPError
+		if errors.As(err, &httpErr) {
+			lastStatusCode = httpErr.StatusCode
+		}
+
+		// Check if error is retryable
+		if !c.isRetryableError(err, lastStatusCode) {
+			return nil, err
+		}
+
+		logging.Warn("request failed, will retry", "attempt", attempt, "error", err, "status", lastStatusCode)
+	}
+
+	return nil, fmt.Errorf("max retries (%d) exceeded: %w", c.config.MaxRetries, lastErr)
+}
+
+// doStreamRequest performs a single streaming request attempt.
+// Per-attempt timeouts are enforced at the Transport level (DialContext,
+// TLSHandshakeTimeout, ResponseHeaderTimeout). The ctx governs the overall
+// lifetime of the request and SSE stream.
+func (c *AnthropicClient) doStreamRequest(ctx context.Context, requestBody map[string]interface{}) (*StreamingResponse, error) {
+	// Marshal request body
+	jsonData, err := json.Marshal(requestBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// Log request body for debugging (truncated for large messages)
+	reqStr := string(jsonData)
+	if len(reqStr) > 2000 {
+		logging.Debug("API request body (truncated)", "body", reqStr[:2000]+"...")
+	} else {
+		logging.Debug("API request body", "body", reqStr)
+	}
+
+	// Create HTTP request
+	// Handle different URL patterns for different providers
+	var url string
+	if c.config.BaseURL == DefaultAnthropicBaseURL || c.config.BaseURL == "" {
+		// Standard Anthropic API
+		url = DefaultAnthropicBaseURL + "/v1/messages"
+	} else if strings.Contains(c.config.BaseURL, "api.z.ai") {
+		// GLM-4.7 / Z.AI API - use Anthropic-compatible endpoint
+		if strings.HasSuffix(c.config.BaseURL, "/anthropic") {
+			// BaseURL is https://api.z.ai/api/anthropic - add /v1/messages for Anthropic format
+			url = c.config.BaseURL + "/v1/messages"
+		} else {
+			// Add full anthropic path
+			url = strings.TrimSuffix(c.config.BaseURL, "/") + "/anthropic/v1/messages"
+		}
+	} else if strings.Contains(c.config.BaseURL, "bigmodel.cn") {
+		// BigModel / Zhipu AI - Anthropic-compatible endpoint
+		if strings.HasSuffix(c.config.BaseURL, "/anthropic") {
+			url = c.config.BaseURL + "/v1/messages"
+		} else {
+			url = strings.TrimSuffix(c.config.BaseURL, "/") + "/v1/messages"
+		}
+	} else if strings.Contains(c.config.BaseURL, "minimax") {
+		// MiniMax API - Anthropic-compatible endpoint
+		url = strings.TrimSuffix(c.config.BaseURL, "/") + "/v1/messages"
+	} else {
+		// Other custom endpoints - assume Anthropic-compatible
+		url = strings.TrimSuffix(c.config.BaseURL, "/") + "/v1/messages"
+	}
+
+	logging.Debug("anthropic API request", "url", url, "model", c.config.Model)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Set headers. Auth format depends on the provider's Anthropic-compatible
+	// adapter: most accept x-api-key (Anthropic native, Z.AI, BigModel), some
+	// require Bearer only (Moonshot/Kimi), several accept BOTH for safety
+	// (GLM/MiniMax/DeepSeek). DeepSeek's docs explicitly use Bearer for the
+	// OpenAI endpoint and don't document the Anthropic adapter's header
+	// preference — send both to avoid 401 on either side.
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	base := c.config.BaseURL
+	isKimi := strings.Contains(base, "moonshot") || strings.Contains(base, "kimi.com")
+	if !isKimi {
+		req.Header.Set("x-api-key", c.config.APIKey)
+	}
+	if isKimi ||
+		strings.Contains(base, "api.z.ai") ||
+		strings.Contains(base, "bigmodel.cn") ||
+		strings.Contains(base, "minimax") ||
+		strings.Contains(base, "deepseek") {
+		req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
+	}
+
+	// Perform request
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		err = WrapProviderHTTPTimeout(err, c.config.Provider, c.config.HTTPTimeout)
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		retryAfter := ParseRetryAfter(resp)
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			logging.Error("failed to read error response", "error", err)
+			body = []byte("(failed to read response body)")
+		}
+		_ = resp.Body.Close()
+		logging.Warn("anthropic API error", "status", resp.StatusCode, "body", string(body))
+		return nil, &HTTPError{
+			StatusCode: resp.StatusCode,
+			RetryAfter: retryAfter,
+			Message:    fmt.Sprintf("API error (status %d): %s", resp.StatusCode, string(body)),
+		}
+	}
+
+	// Capture rate limit metadata
+	rateLimit := extractAnthropicRateLimits(resp)
+
+	// Create streaming response
+	chunks := make(chan ResponseChunk, 10)
+	done := make(chan struct{})
+
+	// Inject rate limit info in first chunk
+	if rateLimit != nil {
+		chunks <- ResponseChunk{RateLimit: rateLimit}
+	}
+
+	// Stream idle timeout (configurable, default 30s between chunks)
+	streamIdleTimeout := c.config.StreamIdleTimeout
+	// Stream idle warning - half of idle timeout
+	streamIdleWarning := streamIdleTimeout / 2
+
+	// Capture status callback for goroutine
+	c.mu.RLock()
+	statusCb := c.statusCallback
+	c.mu.RUnlock()
+
+	// Use sync.Once to prevent double-close of response body.
+	// Both the context-cancellation goroutine and the streaming goroutine
+	// may attempt to close the body.
+	var closeBody sync.Once
+	closeBodyFn := func() { _ = resp.Body.Close() }
+
+	// Monitor context cancellation to force-close response body,
+	// unblocking any blocked scanner.Scan() call.
+	go func() {
+		select {
+		case <-ctx.Done():
+			closeBody.Do(closeBodyFn)
+		case <-done:
+			// Stream finished normally, nothing to do
+		}
+	}()
+
+	// Process stream in goroutine
+	go func() {
+		defer close(chunks)
+		defer close(done)
+		defer closeBody.Do(closeBodyFn)
+
+		scanner := bufio.NewScanner(resp.Body)
+		// Large tool inputs/results can produce long SSE data lines.
+		// Default scanner token limit (64K) is too small and causes token-too-long errors.
+		scanner.Buffer(make([]byte, 64*1024), 8*1024*1024) // 8MB max line
+		accumulator := &toolCallAccumulator{
+			completedCalls: make([]*genai.FunctionCall, 0),
+		}
+
+		// Channel for scanner results - single goroutine reads all lines
+		type scanResult struct {
+			line string
+			ok   bool
+			err  error
+		}
+		scanCh := make(chan scanResult)
+		stopScan := make(chan struct{})
+
+		// Start a single scanner goroutine that reads all lines.
+		// Exits when: scanner ends, context cancelled, or stopScan closed (scanLoop exited).
+		go func() {
+			defer close(scanCh)
+			for {
+				ok := scanner.Scan()
+				select {
+				case scanCh <- scanResult{line: scanner.Text(), ok: ok, err: scanner.Err()}:
+					if !ok {
+						return
+					}
+				case <-ctx.Done():
+					return
+				case <-stopScan:
+					return
+				}
+			}
+		}()
+
+		eventCount := 0
+		contentReceived := false
+		idleTimer := time.NewTimer(streamIdleTimeout)
+		defer idleTimer.Stop()
+
+		// Warning timer for UI feedback (fires at 15s, then again at 25s)
+		warningTimer := time.NewTimer(streamIdleWarning)
+		defer warningTimer.Stop()
+		lastWarningAt := time.Duration(0)
+
+	scanLoop:
+		for {
+		waitLoop:
+			for {
+				// Wait for scan result with timeout
+				select {
+				case <-ctx.Done():
+					logging.Debug("context cancelled, stopping stream processing")
+					// Non-blocking send - channel might be full or receiver gone
+					select {
+					case chunks <- ResponseChunk{Error: ContextErr(ctx), Done: true}:
+					default:
+					}
+					return
+
+				case <-warningTimer.C:
+					// Stream idle warning - notify UI
+					lastWarningAt += streamIdleWarning
+					if statusCb != nil {
+						statusCb.OnStreamIdle(lastWarningAt)
+					}
+					// Reset for next warning (every 10 seconds after first)
+					warningTimer.Reset(10 * time.Second)
+					// Continue waiting in the same select
+					continue waitLoop
+
+				case <-idleTimer.C:
+					logging.Warn("stream idle timeout exceeded", "timeout", streamIdleTimeout, "partial", contentReceived)
+					chunks <- ResponseChunk{
+						Error: &ErrStreamIdleTimeout{Timeout: streamIdleTimeout, Partial: contentReceived},
+						Done:  true,
+					}
+					return
+
+				case result, ok := <-scanCh:
+					// Got data - notify resume if we had warned
+					if lastWarningAt > 0 && statusCb != nil {
+						statusCb.OnStreamResume()
+					}
+					lastWarningAt = 0
+
+					// Reset timers
+					if !idleTimer.Stop() {
+						select {
+						case <-idleTimer.C:
+						default:
+						}
+					}
+					idleTimer.Reset(streamIdleTimeout)
+
+					if !warningTimer.Stop() {
+						select {
+						case <-warningTimer.C:
+						default:
+						}
+					}
+					warningTimer.Reset(streamIdleWarning)
+
+					if !ok {
+						// Channel closed, scanner finished
+						break scanLoop
+					}
+					if !result.ok {
+						if result.err != nil {
+							logging.Warn("SSE scanner error", "error", result.err)
+							chunks <- ResponseChunk{Error: result.err, Done: true}
+						}
+						break scanLoop
+					}
+
+					// Process the line - break out of waitLoop to handle it
+					line := result.line
+
+					// Log raw SSE lines for debugging
+					if line != "" {
+						logging.Debug("SSE raw line", "line", line)
+					}
+
+					// SSE format: "data: {...}" or "data:{...}" (handle both)
+					var data string
+					if strings.HasPrefix(line, "data: ") {
+						data = strings.TrimPrefix(line, "data: ")
+					} else if strings.HasPrefix(line, "data:") {
+						data = strings.TrimPrefix(line, "data:")
+					} else {
+						continue waitLoop // Empty line or event: line
+					}
+
+					eventCount++
+					// Log FULL data for error events
+					if strings.Contains(data, "error") {
+						logging.Error("SSE ERROR event received", "full_data", data)
+					} else {
+						logging.Debug("SSE data event", "count", eventCount, "data_preview", truncateString(data, 200))
+					}
+
+					// Skip "[DONE]" marker
+					if data == "[DONE]" {
+						// Send any accumulated tool calls before marking done
+						if len(accumulator.completedCalls) > 0 {
+							chunks <- ResponseChunk{
+								FunctionCalls: accumulator.completedCalls,
+								Done:          true,
+							}
+						} else {
+							select {
+							case chunks <- ResponseChunk{Done: true}:
+							case <-ctx.Done():
+								return
+							}
+						}
+						return
+					}
+
+					// Parse JSON
+					var event map[string]interface{}
+					if err := json.Unmarshal([]byte(data), &event); err != nil {
+						preview := data
+						if len(preview) > 100 {
+							preview = preview[:100] + "..."
+						}
+						logging.Warn("failed to parse SSE event", "error", err, "data", preview)
+						// Notify UI about recoverable parse error
+						if statusCb != nil {
+							statusCb.OnError(fmt.Errorf("incomplete SSE data: %w", err), true)
+						}
+						continue waitLoop
+					}
+
+					// Handle Z.AI/GLM error format
+					if errObj, ok := event["error"].(map[string]interface{}); ok {
+						errCode := stringFromMap(errObj, "code")
+						errMsg := stringFromMap(errObj, "message")
+						logging.Error("Z.AI API error", "code", errCode, "message", errMsg)
+						chunks <- ResponseChunk{
+							Error: fmt.Errorf("API error (%s): %s", errCode, errMsg),
+							Done:  true,
+						}
+						return
+					}
+
+					// Process event
+					chunk := c.processStreamEvent(event, accumulator)
+					// Mark partial progress when we received meaningful model output.
+					// This prevents treating "thinking/tool_use then idle" as a cold timeout.
+					if chunk.Text != "" || chunk.Thinking != "" || len(chunk.FunctionCalls) > 0 || len(chunk.Parts) > 0 {
+						contentReceived = true
+					}
+					if chunk.Text != "" || chunk.Thinking != "" || chunk.Done || len(chunk.FunctionCalls) > 0 || len(chunk.Parts) > 0 ||
+						chunk.InputTokens > 0 || chunk.CacheCreationInputTokens > 0 || chunk.CacheReadInputTokens > 0 {
+						select {
+						case chunks <- chunk:
+						case <-ctx.Done():
+							logging.Debug("context cancelled during chunk send")
+							return
+						}
+					}
+
+					if chunk.Done {
+						return
+					}
+
+					// Continue to next iteration of scanLoop
+					break waitLoop
+				}
+			}
+		}
+		close(stopScan) // Signal scanner goroutine to exit
+	}()
+
+	return &StreamingResponse{
+		Chunks: chunks,
+		Done:   done,
+	}, nil
+}
+
+// processStreamEvent converts an Anthropic stream event to a ResponseChunk.
+func (c *AnthropicClient) processStreamEvent(event map[string]interface{}, acc *toolCallAccumulator) ResponseChunk {
+	chunk := ResponseChunk{}
+
+	eventType, ok := event["type"].(string)
+	if !ok {
+		logging.Debug("SSE event missing type", "event", event)
+		return chunk
+	}
+
+	// Debug: log all events for diagnostics
+	logging.Debug("SSE event received", "type", eventType)
+
+	switch eventType {
+	case "content_block_start":
+		// Check if this is a tool_use, thinking, or text content block
+		if contentBlock, ok := event["content_block"].(map[string]interface{}); ok {
+			blockType := stringFromMap(contentBlock, "type")
+			logging.Debug("content_block_start", "type", blockType)
+
+			// Track current block type for delta processing
+			acc.currentBlockType = blockType
+
+			if blockType == "tool_use" {
+				// Extract tool name first (needed for ID generation)
+				if name, ok := contentBlock["name"].(string); ok {
+					acc.currentToolName = name
+				}
+				// Extract tool ID - generate if missing (DeepSeek doesn't provide ID)
+				if id, ok := contentBlock["id"].(string); ok && id != "" {
+					acc.currentToolID = id
+					logging.Debug("captured tool_use ID", "id", id)
+				} else {
+					// Generate unique ID for providers that don't return one
+					acc.currentToolID = randomID()
+					logging.Debug("generated tool_use ID (provider didn't return one)", "id", acc.currentToolID, "name", acc.currentToolName)
+				}
+				acc.currentToolInput.Reset()
+			} else if blockType == "thinking" {
+				acc.thinkingBuilder.Reset()
+				logging.Debug("thinking block started")
+			}
+		}
+
+	case "error":
+		// Handle API error events
+		if errData, ok := event["error"].(map[string]interface{}); ok {
+			errType := stringFromMap(errData, "type")
+			errMsg := stringFromMap(errData, "message")
+			logging.Error("API error event", "type", errType, "message", errMsg)
+			chunk.Error = fmt.Errorf("API error: %s - %s", errType, errMsg)
+			chunk.Done = true
+		}
+
+	case "content_block_delta":
+		logging.Debug("SSE content_block_delta event", "event", event)
+		if delta, ok := event["delta"].(map[string]interface{}); ok {
+			deltaType := stringFromMap(delta, "type")
+			logging.Debug("SSE delta content", "delta", delta, "type", deltaType)
+
+			// Handle thinking delta (Anthropic native)
+			if deltaType == "thinking_delta" {
+				if thinking, ok := delta["thinking"].(string); ok && thinking != "" {
+					acc.thinkingBuilder.WriteString(thinking)
+					chunk.Thinking = thinking
+					logging.Debug("SSE thinking delta received", "thinking_length", len(thinking))
+				}
+			}
+
+			// Handle thinking signature delta (Anthropic/Kimi extended thinking).
+			// The signature lets strict validators verify the thinking block
+			// hasn't been tampered with on round-trip; Kimi requires either a
+			// signed or unsigned "thinking" block when thinking is enabled.
+			if deltaType == "signature_delta" {
+				if sig, ok := delta["signature"].(string); ok && sig != "" {
+					acc.currentThinkingSignature.WriteString(sig)
+				}
+			}
+
+			// Handle reasoning_content (DeepSeek Reasoner sends thinking via this field)
+			if reasoning, ok := delta["reasoning_content"].(string); ok && reasoning != "" {
+				acc.thinkingBuilder.WriteString(reasoning)
+				chunk.Thinking = reasoning
+			}
+
+			// Handle text delta — also parse <think> tags for models that
+			// embed reasoning in-line (MiniMax, DeepSeek R1, QwQ, etc.)
+			if deltaType == "text_delta" || (deltaType == "" && acc.currentBlockType == "text") {
+				if text, ok := delta["text"].(string); ok && text != "" {
+					thinking, regular := acc.thinkTagParser.Process(text)
+					if thinking != "" {
+						acc.thinkingBuilder.WriteString(thinking)
+						chunk.Thinking = thinking
+					}
+					if regular != "" {
+						chunk.Text = regular
+					}
+					logging.Debug("SSE text delta received", "text_length", len(text),
+						"thinking_length", len(thinking), "regular_length", len(regular))
+				}
+			}
+
+			// Handle tool input JSON delta
+			if deltaType == "input_json_delta" {
+				if partialJSON, ok := delta["partial_json"].(string); ok {
+					acc.currentToolInput.WriteString(partialJSON)
+				}
+			}
+		} else {
+			logging.Debug("SSE content_block_delta missing delta", "event", event)
+		}
+
+	case "content_block_stop":
+		// If we were accumulating a thinking block, emit a Part capturing the
+		// text + signature so the caller can echo it back in the next request
+		// (providers like Kimi reject assistant tool-call messages that lack
+		// the reasoning_content block once thinking has been enabled).
+		if acc.currentBlockType == "thinking" && acc.thinkingBuilder.Len() > 0 {
+			part := &genai.Part{
+				Text:    acc.thinkingBuilder.String(),
+				Thought: true,
+			}
+			if acc.currentThinkingSignature.Len() > 0 {
+				part.ThoughtSignature = []byte(acc.currentThinkingSignature.String())
+			}
+			chunk.Parts = append(chunk.Parts, part)
+			acc.thinkingBuilder.Reset()
+			acc.currentThinkingSignature.Reset()
+		}
+
+		// If we were accumulating a tool call, finalize it
+		if acc.currentToolID != "" && acc.currentToolName != "" {
+			inputJSON := acc.currentToolInput.String()
+			var args map[string]interface{}
+			if inputJSON != "" {
+				if err := json.Unmarshal([]byte(inputJSON), &args); err != nil {
+					logging.Error("tool args JSON unmarshal failed",
+						"error", err,
+						"tool", acc.currentToolName,
+						"json", inputJSON)
+					args = make(map[string]interface{})
+				}
+			} else {
+				logging.Warn("tool call received with empty input JSON",
+					"tool", acc.currentToolName,
+					"tool_id", acc.currentToolID)
+				args = make(map[string]interface{})
+			}
+
+			functionCall := &genai.FunctionCall{
+				ID:   acc.currentToolID,
+				Name: acc.currentToolName,
+				Args: args,
+			}
+			acc.completedCalls = append(acc.completedCalls, functionCall)
+
+			// Reset accumulator state
+			acc.currentToolID = ""
+			acc.currentToolName = ""
+			acc.currentToolInput.Reset()
+		}
+
+		// Reset block type
+		acc.currentBlockType = ""
+
+	case "message_start":
+		if msg, ok := event["message"].(map[string]interface{}); ok {
+			if usage, ok := msg["usage"].(map[string]interface{}); ok {
+				if v, ok := usage["input_tokens"].(float64); ok && v > 0 {
+					chunk.InputTokens = int(v)
+				}
+				if v, ok := usage["cache_creation_input_tokens"].(float64); ok && v > 0 {
+					chunk.CacheCreationInputTokens = int(v)
+				}
+				if v, ok := usage["cache_read_input_tokens"].(float64); ok && v > 0 {
+					chunk.CacheReadInputTokens = int(v)
+				}
+			}
+		}
+
+	case "message_delta":
+		// Message metadata (usage, stop_reason, etc.)
+		if delta, ok := event["delta"].(map[string]interface{}); ok {
+			if stopReason, ok := delta["stop_reason"].(string); ok {
+				chunk.Done = true
+				switch stopReason {
+				case "end_turn":
+					chunk.FinishReason = genai.FinishReasonStop
+				case "max_tokens":
+					chunk.FinishReason = genai.FinishReasonMaxTokens
+				case "tool_use":
+					// Include accumulated tool calls in the final chunk
+					if len(acc.completedCalls) > 0 {
+						chunk.FunctionCalls = acc.completedCalls
+						acc.callsEmitted = true
+					}
+					chunk.FinishReason = genai.FinishReasonStop
+				}
+			}
+		}
+		// Parse usage from message_delta (output tokens)
+		if usage, ok := event["usage"].(map[string]interface{}); ok {
+			if v, ok := usage["output_tokens"].(float64); ok && v > 0 {
+				chunk.OutputTokens = int(v)
+			}
+		}
+
+	case "message_stop":
+		chunk.Done = true
+		// Include any accumulated tool calls only if not already emitted
+		// by message_delta (stop_reason: "tool_use"). Emitting them twice
+		// causes duplicate tool_use blocks which MiniMax rejects with 400.
+		if len(acc.completedCalls) > 0 && !acc.callsEmitted {
+			chunk.FunctionCalls = acc.completedCalls
+		}
+	}
+
+	return chunk
+}
+
+// convertHistoryToMessagesWithSystem converts Gemini history to Anthropic messages format,
+// extracting the system prompt from the first user message if it looks like a system prompt.
+// Returns (messages, systemPrompt).
+func (c *AnthropicClient) convertHistoryToMessagesWithSystem(history []*genai.Content, newMessage string) ([]map[string]interface{}, string) {
+	messages := make([]map[string]interface{}, 0)
+	var systemPrompt string
+	skipFirst := 0
+
+	// Sanitize tool pairs before conversion — last defense against corrupted history.
+	history = sanitizeToolPairs(history)
+
+	// Check if first message is a system prompt (user message with system prompt markers)
+	// This handles both cases:
+	// - [user_system, model_ack, ...] - skip both
+	// - [user_system] only - skip just the system prompt
+	if len(history) >= 1 && history[0].Role == genai.RoleUser {
+		for _, part := range history[0].Parts {
+			if part.Text != "" {
+				text := part.Text
+				// Check if it looks like a system prompt using stricter heuristics
+				// Require multiple indicators or explicit system prompt markers
+				indicators := 0
+				if strings.Contains(text, "You are a") || strings.Contains(text, "You are an") {
+					indicators += 2 // Strong indicator
+				}
+				if strings.HasPrefix(text, "You are") {
+					indicators += 2 // Strong indicator at start
+				}
+				if strings.Contains(text, "IMPORTANT:") || strings.Contains(text, "MANDATORY:") {
+					indicators++
+				}
+				if strings.Contains(text, "available tools") || strings.Contains(text, "function calling") {
+					indicators++
+				}
+				if strings.Contains(text, "system prompt") || strings.Contains(text, "System:") {
+					indicators += 2 // Explicit marker
+				}
+				// Long message with at least one indicator
+				isSystemPrompt := (indicators >= 2) || (len(text) > 1000 && indicators >= 1)
+
+				if isSystemPrompt {
+					systemPrompt = text
+					skipFirst = 1 // Skip system prompt
+					logging.Debug("extracted system prompt from history", "length", len(systemPrompt), "indicators", indicators)
+
+					// Also skip model acknowledgment if present
+					if len(history) >= 2 && history[1].Role == genai.RoleModel {
+						// Check if it's just an acknowledgment (short response)
+						for _, p := range history[1].Parts {
+							if p.Text != "" && len(p.Text) < 200 &&
+								(strings.Contains(p.Text, "understand") ||
+									strings.Contains(p.Text, "help") ||
+									strings.Contains(p.Text, "I'll")) {
+								skipFirst = 2 // Skip both system prompt and ack
+								break
+							}
+						}
+					}
+				}
+				break
+			}
+		}
+	}
+
+	logging.Debug("system prompt detection",
+		"history_len", len(history),
+		"skipFirst", skipFirst,
+		"systemPrompt_found", systemPrompt != "")
+
+	// Convert remaining history
+	for i := skipFirst; i < len(history); i++ {
+		content := history[i]
+		logging.Debug("converting history item", "index", i, "role", content.Role)
+		if content.Role == genai.RoleUser {
+			messages = append(messages, c.buildUserMessage(content.Parts))
+		} else if content.Role == genai.RoleModel {
+			messages = append(messages, c.buildAssistantMessage(content.Parts))
+		}
+	}
+
+	// Add new user message (ensure non-empty content)
+	// Use array format for consistency with buildUserMessage
+	if newMessage == "" {
+		newMessage = "Continue."
+	}
+	messages = append(messages, map[string]interface{}{
+		"role": "user",
+		"content": []map[string]interface{}{
+			{"type": "text", "text": newMessage},
+		},
+	})
+
+	// Ensure strict role alternation (merge consecutive same-role messages)
+	messages = mergeConsecutiveMessages(messages)
+
+	// Log final messages structure
+	var msgRoles []string
+	for i, m := range messages {
+		role := stringFromMap(m, "role")
+		msgRoles = append(msgRoles, fmt.Sprintf("[%d]%s", i, role))
+	}
+	logging.Debug("final messages", "count", len(messages), "roles", strings.Join(msgRoles, ","))
+
+	return messages, systemPrompt
+}
+
+// convertHistoryToMessages converts Gemini history to Anthropic messages format.
+func (c *AnthropicClient) convertHistoryToMessages(history []*genai.Content, newMessage string) []map[string]interface{} {
+	messages, _ := c.convertHistoryToMessagesWithSystem(history, newMessage)
+	return messages
+}
+
+// convertHistoryWithResultsAndSystem converts history with function results to messages,
+// extracting the system prompt. Returns (messages, systemPrompt).
+func (c *AnthropicClient) convertHistoryWithResultsAndSystem(history []*genai.Content, results []*genai.FunctionResponse) ([]map[string]interface{}, string) {
+	messages := make([]map[string]interface{}, 0)
+	var systemPrompt string
+	skipFirst := 0
+
+	logging.Debug("convertHistoryWithResultsAndSystem", "history_len", len(history), "results_len", len(results))
+
+	// Sanitize tool pairs before conversion — last defense against corrupted history.
+	// Include pending results so current tool_use IDs are preserved in SendFunctionResponse.
+	history = sanitizeToolPairsWithPendingResults(history, results)
+
+	// Check if first message is a system prompt using stricter heuristics
+	if len(history) >= 1 && history[0].Role == genai.RoleUser {
+		for _, part := range history[0].Parts {
+			if part.Text != "" {
+				text := part.Text
+				// Use stricter heuristics - require multiple indicators
+				indicators := 0
+				if strings.Contains(text, "You are a") || strings.Contains(text, "You are an") {
+					indicators += 2
+				}
+				if strings.HasPrefix(text, "You are") {
+					indicators += 2
+				}
+				if strings.Contains(text, "IMPORTANT:") || strings.Contains(text, "MANDATORY:") {
+					indicators++
+				}
+				if strings.Contains(text, "available tools") || strings.Contains(text, "function calling") {
+					indicators++
+				}
+				if strings.Contains(text, "system prompt") || strings.Contains(text, "System:") {
+					indicators += 2
+				}
+				isSystemPrompt := (indicators >= 2) || (len(text) > 1000 && indicators >= 1)
+
+				if isSystemPrompt {
+					systemPrompt = text
+					skipFirst = 1
+					logging.Debug("extracted system prompt from history (with results)", "length", len(systemPrompt), "indicators", indicators)
+
+					// Also skip model acknowledgment if present
+					if len(history) >= 2 && history[1].Role == genai.RoleModel {
+						for _, p := range history[1].Parts {
+							if p.Text != "" && len(p.Text) < 200 &&
+								(strings.Contains(p.Text, "understand") ||
+									strings.Contains(p.Text, "help") ||
+									strings.Contains(p.Text, "I'll")) {
+								skipFirst = 2
+								break
+							}
+						}
+					}
+				}
+				break
+			}
+		}
+	}
+
+	// Convert remaining history
+	for i := skipFirst; i < len(history); i++ {
+		content := history[i]
+		// Detailed logging to debug ID mismatch
+		var partDetails []string
+		for j, part := range content.Parts {
+			if part.FunctionCall != nil {
+				partDetails = append(partDetails, fmt.Sprintf("part[%d]:FunctionCall(id=%s,name=%s)", j, part.FunctionCall.ID, part.FunctionCall.Name))
+			} else if part.FunctionResponse != nil {
+				partDetails = append(partDetails, fmt.Sprintf("part[%d]:FunctionResponse(id=%s,name=%s)", j, part.FunctionResponse.ID, part.FunctionResponse.Name))
+			} else if part.Text != "" {
+				partDetails = append(partDetails, fmt.Sprintf("part[%d]:Text(len=%d)", j, len(part.Text)))
+			}
+		}
+		logging.Debug("converting history item", "index", i, "role", content.Role, "parts", partDetails)
+
+		if content.Role == genai.RoleUser {
+			messages = append(messages, c.buildUserMessage(content.Parts))
+		} else if content.Role == genai.RoleModel {
+			messages = append(messages, c.buildAssistantMessage(content.Parts))
+		}
+	}
+
+	// Add function result as user message
+	resultContents := make([]map[string]interface{}, 0)
+	for idx, result := range results {
+		toolUseID := result.ID
+		if toolUseID == "" {
+			toolUseID = fallbackToolID(result.Name, idx)
+			logging.Warn("tool result missing ID, using generated fallback ID",
+				"name", result.Name,
+				"tool_use_id", toolUseID)
+		}
+		logging.Debug("adding tool result", "tool_use_id", toolUseID, "name", result.Name)
+
+		var contentStr string
+		resp := result.Response
+		if resp != nil {
+			// Callers use different conventions: "result" (studio agent loop),
+			// "content" (agent framework), "data" (structured). Accept all so
+			// tool output reaches the model.
+			if c, ok := resp["result"].(string); ok && c != "" {
+				contentStr = c
+			} else if content, ok := resp["content"].(string); ok && content != "" {
+				contentStr = content
+			} else if data, ok := resp["data"]; ok && data != nil {
+				if jsonBytes, err := json.Marshal(data); err == nil {
+					contentStr = string(jsonBytes)
+				}
+			}
+			if errStr, ok := resp["error"].(string); ok && errStr != "" {
+				if contentStr != "" {
+					contentStr = contentStr + "\nError: " + errStr
+				} else {
+					contentStr = "Error: " + errStr
+				}
+			}
+		}
+
+		if contentStr == "" {
+			contentStr = "Operation completed"
+		}
+
+		resultContents = append(resultContents, map[string]interface{}{
+			"type":        "tool_result",
+			"tool_use_id": toolUseID,
+			"id":          toolUseID, // Z.AI compatibility
+			"content":     contentStr,
+		})
+	}
+
+	messages = append(messages, map[string]interface{}{
+		"role":    "user",
+		"content": resultContents,
+	})
+
+	// Ensure strict role alternation (merge consecutive same-role messages)
+	messages = mergeConsecutiveMessages(messages)
+
+	return messages, systemPrompt
+}
+
+// convertHistoryWithResults converts history with function results to messages.
+func (c *AnthropicClient) convertHistoryWithResults(history []*genai.Content, results []*genai.FunctionResponse) []map[string]interface{} {
+	messages, _ := c.convertHistoryWithResultsAndSystem(history, results)
+	return messages
+}
+
+// buildUserMessage builds a user message from parts.
+// Parts arrive in order: [FunctionResponse, InlineData, FunctionResponse, InlineData, ...]
+// InlineData (images) follow their associated FunctionResponse and must be merged
+// into the preceding tool_result for Anthropic's multimodal tool_result format.
+func (c *AnthropicClient) buildUserMessage(parts []*genai.Part) map[string]interface{} {
+	content := make([]map[string]interface{}, 0)
+
+	// Index of the last tool_result in content, for attaching trailing InlineData
+	lastToolResultIdx := -1
+	toolResultOrdinal := 0
+
+	for _, part := range parts {
+		if part.Text != "" {
+			content = append(content, map[string]interface{}{
+				"type": "text",
+				"text": part.Text,
+			})
+		}
+		// Handle InlineData parts (images from multimodal tools).
+		// These follow their FunctionResponse in the parts list, so we
+		// retroactively enrich the last emitted tool_result.
+		if part.InlineData != nil {
+			imageBlock := map[string]interface{}{
+				"type": "image",
+				"source": map[string]interface{}{
+					"type":       "base64",
+					"media_type": part.InlineData.MIMEType,
+					"data":       base64.StdEncoding.EncodeToString(part.InlineData.Data),
+				},
+			}
+
+			if lastToolResultIdx >= 0 {
+				tr := content[lastToolResultIdx]
+				// Upgrade plain string content to array format if needed
+				switch existing := tr["content"].(type) {
+				case string:
+					tr["content"] = []map[string]interface{}{
+						{"type": "text", "text": existing},
+						imageBlock,
+					}
+				case []map[string]interface{}:
+					tr["content"] = append(existing, imageBlock)
+				}
+			} else {
+				// No preceding tool_result — add as standalone image block
+				content = append(content, imageBlock)
+			}
+			continue
+		}
+		// Handle FunctionResponse parts (tool_result)
+		if part.FunctionResponse != nil {
+			toolUseID := part.FunctionResponse.ID
+			if toolUseID == "" {
+				toolUseID = fallbackToolID(part.FunctionResponse.Name, toolResultOrdinal)
+				logging.Warn("FunctionResponse missing ID in buildUserMessage",
+					"name", part.FunctionResponse.Name,
+					"fallback_tool_use_id", toolUseID)
+			}
+
+			// Extract content string from the response map. Callers use a few
+			// different conventions: "result" (studio agent loop), "content"
+			// (agent framework), "data" (for structured payloads). Honour any
+			// of them so tool output actually reaches the model — otherwise
+			// every tool call looks like "Operation completed" and the agent
+			// thinks nothing was returned.
+			var contentStr string
+			resp := part.FunctionResponse.Response
+			if resp != nil {
+				if c, ok := resp["result"].(string); ok && c != "" {
+					contentStr = c
+				} else if c, ok := resp["content"].(string); ok && c != "" {
+					contentStr = c
+				} else if data, ok := resp["data"]; ok && data != nil {
+					if jsonBytes, err := json.Marshal(data); err == nil {
+						contentStr = string(jsonBytes)
+					}
+				}
+				if errStr, ok := resp["error"].(string); ok && errStr != "" {
+					if contentStr != "" {
+						contentStr = contentStr + "\nError: " + errStr
+					} else {
+						contentStr = "Error: " + errStr
+					}
+				}
+			}
+			if contentStr == "" {
+				contentStr = "Operation completed"
+			}
+
+			logging.Debug("buildUserMessage tool_result", "tool_use_id", toolUseID, "name", part.FunctionResponse.Name)
+			content = append(content, map[string]interface{}{
+				"type":        "tool_result",
+				"tool_use_id": toolUseID,
+				"id":          toolUseID,
+				"content":     contentStr,
+			})
+			lastToolResultIdx = len(content) - 1
+			toolResultOrdinal++
+		}
+	}
+
+	// Anthropic API requires non-empty content array
+	if len(content) == 0 {
+		logging.Warn("buildUserMessage: empty content, adding placeholder", "parts_count", len(parts))
+		content = append(content, map[string]interface{}{
+			"type": "text",
+			"text": "Continue.",
+		})
+	}
+
+	return map[string]interface{}{
+		"role":    "user",
+		"content": content,
+	}
+}
+
+// buildAssistantMessage builds an assistant message from parts.
+func (c *AnthropicClient) buildAssistantMessage(parts []*genai.Part) map[string]interface{} {
+	content := make([]map[string]interface{}, 0)
+	toolUseOrdinal := 0
+
+	// When thinking is enabled, strict validators (Kimi) reject assistant
+	// messages that carry tool_use but no reasoning_content block. If the
+	// preserved parts lack a Thought part but contain a tool_use, inject a
+	// placeholder thinking block so old history remains valid on round-trip.
+	hasThinking := false
+	hasToolUse := false
+	for _, p := range parts {
+		if p == nil {
+			continue
+		}
+		if p.Thought && p.Text != "" {
+			hasThinking = true
+		}
+		if p.FunctionCall != nil {
+			hasToolUse = true
+		}
+	}
+	c.mu.RLock()
+	thinkingEnabled := c.config.EnableThinking && c.config.ThinkingBudget > 0
+	c.mu.RUnlock()
+	if thinkingEnabled && hasToolUse && !hasThinking {
+		content = append(content, map[string]interface{}{
+			"type":     "thinking",
+			"thinking": "(Reasoning from a prior turn; not preserved.)",
+		})
+	}
+
+	for _, part := range parts {
+		// Thinking (extended reasoning) blocks — preserve on round-trip so
+		// strict providers (Kimi; Anthropic native when thinking is enabled)
+		// don't reject subsequent assistant messages with tool_use.
+		if part.Thought && part.Text != "" {
+			block := map[string]interface{}{
+				"type":     "thinking",
+				"thinking": part.Text,
+			}
+			if len(part.ThoughtSignature) > 0 {
+				block["signature"] = string(part.ThoughtSignature)
+			}
+			content = append(content, block)
+			continue
+		}
+		if part.Text != "" {
+			content = append(content, map[string]interface{}{
+				"type": "text",
+				"text": part.Text,
+			})
+		}
+		if part.FunctionCall != nil {
+			// Convert function call to Anthropic format
+			// Use original ID from model response - this MUST match tool_use_id in tool_result
+			toolID := part.FunctionCall.ID
+			if toolID == "" {
+				// Generate deterministic fallback ID so repeated tool names don't collide.
+				toolID = fallbackToolID(part.FunctionCall.Name, toolUseOrdinal)
+				logging.Warn("FunctionCall missing ID in buildAssistantMessage, using generated fallback ID",
+					"name", part.FunctionCall.Name,
+					"fallback_tool_use_id", toolID)
+			}
+			logging.Debug("buildAssistantMessage tool_use", "id", toolID, "name", part.FunctionCall.Name)
+			content = append(content, map[string]interface{}{
+				"type":  "tool_use",
+				"id":    toolID,
+				"name":  part.FunctionCall.Name,
+				"input": part.FunctionCall.Args,
+			})
+			toolUseOrdinal++
+		}
+	}
+
+	// Anthropic/DeepSeek API requires non-empty content array for assistant messages
+	if len(content) == 0 {
+		logging.Warn("buildAssistantMessage: empty content, adding placeholder", "parts_count", len(parts))
+		content = append(content, map[string]interface{}{
+			"type": "text",
+			"text": "I'll help you with that.",
+		})
+	}
+
+	return map[string]interface{}{
+		"role":    "assistant",
+		"content": content,
+	}
+}
+
+// convertSchemaToJSON converts a genai.Schema to Anthropic-compatible JSON Schema format.
+// genai uses uppercase types ("STRING", "OBJECT") but Anthropic expects lowercase ("string", "object").
+func convertSchemaToJSON(schema *genai.Schema) map[string]interface{} {
+	if schema == nil {
+		return nil
+	}
+
+	result := make(map[string]interface{})
+
+	// Convert type to lowercase (genai uses "STRING", Anthropic expects "string")
+	if schema.Type != "" {
+		result["type"] = strings.ToLower(string(schema.Type))
+	}
+
+	if schema.Description != "" {
+		result["description"] = schema.Description
+	}
+
+	if len(schema.Enum) > 0 {
+		result["enum"] = schema.Enum
+	}
+
+	// Convert nested properties recursively
+	if len(schema.Properties) > 0 {
+		props := make(map[string]interface{})
+		for name, propSchema := range schema.Properties {
+			props[name] = convertSchemaToJSON(propSchema)
+		}
+		result["properties"] = props
+	}
+
+	if len(schema.Required) > 0 {
+		result["required"] = schema.Required
+	}
+
+	// Convert array items schema
+	if schema.Items != nil {
+		result["items"] = convertSchemaToJSON(schema.Items)
+	}
+
+	return result
+}
+
+// convertToolsToAnthropicFrom converts the given Gemini tools to Anthropic format.
+func (c *AnthropicClient) convertToolsToAnthropicFrom(genaiTools []*genai.Tool) []map[string]interface{} {
+	tools := make([]map[string]interface{}, 0)
+
+	for _, tool := range genaiTools {
+		for _, decl := range tool.FunctionDeclarations {
+			// Convert parameters schema properly using recursive conversion
+			inputSchema := convertSchemaToJSON(decl.Parameters)
+
+			anthropicTool := map[string]interface{}{
+				"name":         decl.Name,
+				"description":  decl.Description,
+				"input_schema": inputSchema,
+			}
+			tools = append(tools, anthropicTool)
+		}
+	}
+
+	return tools
+}
+
+// stringFromMap safely extracts a string value from a map.
+func stringFromMap(m map[string]interface{}, key string) string {
+	if v, ok := m[key]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// randomID generates a unique ID for tool_use.
+func randomID() string {
+	b := make([]byte, 12)
+	if _, err := cryptorand.Read(b); err != nil {
+		return fmt.Sprintf("toolu_%d", time.Now().UnixNano())
+	}
+	return "toolu_" + hex.EncodeToString(b)
+}
+
+func sanitizeToolIDComponent(s string) string {
+	if s == "" {
+		return "tool"
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	out := strings.Trim(b.String(), "_")
+	if out == "" {
+		return "tool"
+	}
+	return out
+}
+
+func fallbackToolID(name string, ordinal int) string {
+	return fmt.Sprintf("fallback_%s_%d", sanitizeToolIDComponent(name), ordinal)
+}
+
+// mergeConsecutiveMessages ensures strict user/assistant role alternation
+// required by Anthropic-compatible APIs (Anthropic, MiniMax, DeepSeek, etc.).
+// Consecutive messages with the same role are merged by combining their content arrays.
+func mergeConsecutiveMessages(messages []map[string]interface{}) []map[string]interface{} {
+	if len(messages) <= 1 {
+		return messages
+	}
+
+	merged := make([]map[string]interface{}, 0, len(messages))
+	merged = append(merged, messages[0])
+
+	for i := 1; i < len(messages); i++ {
+		prev := merged[len(merged)-1]
+		curr := messages[i]
+
+		prevRole := stringFromMap(prev, "role")
+		currRole := stringFromMap(curr, "role")
+
+		if prevRole == currRole {
+			// Merge content arrays
+			prevContent := extractContentArray(prev["content"])
+			currContent := extractContentArray(curr["content"])
+			prev["content"] = append(prevContent, currContent...)
+			logging.Debug("merged consecutive messages", "role", prevRole, "index", i)
+		} else {
+			merged = append(merged, curr)
+		}
+	}
+
+	return merged
+}
+
+// extractContentArray normalizes message content to []map[string]interface{}.
+func extractContentArray(v interface{}) []map[string]interface{} {
+	switch c := v.(type) {
+	case []map[string]interface{}:
+		return c
+	case string:
+		return []map[string]interface{}{{"type": "text", "text": c}}
+	default:
+		return nil
+	}
+}
+
+// truncateString truncates a string to maxLen characters with ellipsis.
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}

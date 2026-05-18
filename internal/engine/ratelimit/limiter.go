@@ -1,0 +1,340 @@
+package ratelimit
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/ginkida/gokin-studio/internal/engine/logging"
+)
+
+// Limiter provides rate limiting for API requests.
+type Limiter struct {
+	requestBucket *TokenBucket
+	tokenBucket   *TokenBucket
+	enabled       bool
+	mu            sync.RWMutex
+
+	// Statistics
+	totalRequests   int64
+	blockedRequests int64
+	totalTokens     int64
+}
+
+// Config holds rate limiter configuration.
+type Config struct {
+	Enabled           bool
+	RequestsPerMinute int
+	TokensPerMinute   int64
+	BurstSize         int
+}
+
+// DefaultConfig returns the default rate limiter configuration.
+func DefaultConfig() Config {
+	return Config{
+		Enabled:           true,
+		RequestsPerMinute: 60,
+		TokensPerMinute:   1000000,
+		BurstSize:         10,
+	}
+}
+
+// NewLimiter creates a new rate limiter with the given configuration.
+func NewLimiter(cfg Config) *Limiter {
+	// Calculate refill rates (tokens per second)
+	requestRefillRate := float64(cfg.RequestsPerMinute) / 60.0
+	tokenRefillRate := float64(cfg.TokensPerMinute) / 60.0
+
+	// Burst size determines max tokens in bucket
+	requestBurst := float64(cfg.BurstSize)
+	if requestBurst < 1 {
+		requestBurst = 1
+	}
+
+	// Token bucket burst is a percentage of per-minute limit
+	tokenBurst := float64(cfg.TokensPerMinute) / 10.0 // Allow 10% burst
+
+	return &Limiter{
+		requestBucket: NewTokenBucket(requestBurst, requestRefillRate),
+		tokenBucket:   NewTokenBucket(tokenBurst, tokenRefillRate),
+		enabled:       cfg.Enabled,
+	}
+}
+
+// Acquire blocks until a request slot is available.
+// estimatedTokens is the estimated number of tokens for the request.
+func (l *Limiter) Acquire(estimatedTokens int64) error {
+	if !l.isEnabled() {
+		return nil
+	}
+
+	l.mu.Lock()
+	l.totalRequests++
+	l.mu.Unlock()
+
+	// First, acquire a request slot
+	l.requestBucket.Consume(1)
+
+	// Then, acquire token capacity
+	if estimatedTokens > 0 {
+		l.tokenBucket.Consume(float64(estimatedTokens))
+	}
+
+	return nil
+}
+
+// TryAcquire attempts to acquire a request slot without blocking.
+// Returns true if successful, false if rate limited.
+func (l *Limiter) TryAcquire(estimatedTokens int64) bool {
+	if !l.isEnabled() {
+		return true
+	}
+
+	l.mu.Lock()
+	l.totalRequests++
+	l.mu.Unlock()
+
+	// Try to acquire request slot
+	if !l.requestBucket.TryConsume(1) {
+		l.mu.Lock()
+		l.blockedRequests++
+		l.mu.Unlock()
+		return false
+	}
+
+	// Try to acquire token capacity
+	if estimatedTokens > 0 {
+		if !l.tokenBucket.TryConsume(float64(estimatedTokens)) {
+			// Put back the request slot we took
+			l.requestBucket.Return(1)
+			l.mu.Lock()
+			l.blockedRequests++
+			l.mu.Unlock()
+			return false
+		}
+	}
+
+	return true
+}
+
+// EstimateWaitTime returns the estimated wait time for a request without acquiring slots.
+func (l *Limiter) EstimateWaitTime(estimatedTokens int64) time.Duration {
+	if !l.isEnabled() {
+		return 0
+	}
+
+	var maxWait time.Duration
+	reqWait := l.requestBucket.EstimateWaitTime(1)
+	if reqWait > maxWait {
+		maxWait = reqWait
+	}
+
+	if estimatedTokens > 0 {
+		tokWait := l.tokenBucket.EstimateWaitTime(float64(estimatedTokens))
+		if tokWait > maxWait {
+			maxWait = tokWait
+		}
+	}
+
+	return maxWait
+}
+
+// AcquireWithTimeout attempts to acquire a request slot with a timeout.
+// Returns nil on success, error if timeout expired.
+func (l *Limiter) AcquireWithTimeout(estimatedTokens int64, timeout time.Duration) error {
+	if !l.isEnabled() {
+		return nil
+	}
+
+	l.mu.Lock()
+	l.totalRequests++
+	l.mu.Unlock()
+
+	// Try to acquire request slot with timeout
+	if !l.requestBucket.ConsumeWithTimeout(1, timeout) {
+		l.mu.Lock()
+		l.blockedRequests++
+		l.mu.Unlock()
+		return fmt.Errorf("rate limit exceeded: request limit")
+	}
+
+	// Try to acquire token capacity with remaining timeout
+	if estimatedTokens > 0 {
+		if !l.tokenBucket.ConsumeWithTimeout(float64(estimatedTokens), timeout) {
+			l.requestBucket.Return(1) // Return the request slot acquired above
+			l.mu.Lock()
+			l.blockedRequests++
+			l.mu.Unlock()
+			return fmt.Errorf("rate limit exceeded: token limit")
+		}
+	}
+
+	return nil
+}
+
+// AcquireWithContext attempts to acquire a request slot respecting context cancellation.
+// Uses context-aware bucket consumption directly — no goroutines leaked on cancel.
+func (l *Limiter) AcquireWithContext(ctx context.Context, estimatedTokens int64) error {
+	if !l.isEnabled() {
+		return nil
+	}
+
+	l.mu.Lock()
+	l.totalRequests++
+	l.mu.Unlock()
+
+	if err := l.requestBucket.ConsumeWithContext(ctx, 1); err != nil {
+		return err
+	}
+	if estimatedTokens > 0 {
+		if err := l.tokenBucket.ConsumeWithContext(ctx, float64(estimatedTokens)); err != nil {
+			l.requestBucket.Return(1)
+			return err
+		}
+	}
+
+	// Proactive Adaptation: If we are in the "Danger Zone" (< 5% tokens/requests),
+	// add a small safety delay to slow down and avoid hard 429s.
+	l.mu.RLock()
+	reqRem := l.requestBucket.Available()
+	reqCap := l.requestBucket.Capacity()
+	tokRem := l.tokenBucket.Available()
+	tokCap := l.tokenBucket.Capacity()
+	l.mu.RUnlock()
+
+	isDanger := (reqCap > 0 && reqRem/reqCap < 0.05) || (tokCap > 0 && tokRem/tokCap < 0.05)
+	if isDanger {
+		logging.Debug("Rate limit danger zone detected, injecting safety delay", "req_rem", reqRem, "tok_rem", tokRem)
+		select {
+		case <-time.After(1 * time.Second):
+			// Safety burst completed
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	return nil
+}
+
+// RecordUsage records actual token usage after a request completes.
+// This can be used to adjust estimates for future requests.
+func (l *Limiter) RecordUsage(actualTokens int64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.totalTokens += actualTokens
+}
+
+// UpdateLimits updates the rate limiter parameters based on provider metadata.
+func (l *Limiter) UpdateLimits(reqLimit, reqRemaining int64, reqReset time.Duration, tokLimit, tokRemaining int64, tokReset time.Duration) {
+	if !l.isEnabled() {
+		return
+	}
+
+	// Update requests bucket
+	if reqLimit > 0 {
+		// refill rate = limit / reset_time_in_seconds
+		// If reset is 0, assume 60s (per minute)
+		resetSec := reqReset.Seconds()
+		if resetSec <= 0 {
+			resetSec = 60
+		}
+		refillRate := float64(reqLimit) / resetSec
+		l.requestBucket.UpdateParameters(float64(reqLimit), refillRate)
+	}
+	if reqRemaining > 0 {
+		l.requestBucket.Sync(float64(reqRemaining))
+	}
+
+	// Update tokens bucket
+	if tokLimit > 0 {
+		resetSec := tokReset.Seconds()
+		if resetSec <= 0 {
+			resetSec = 60
+		}
+		refillRate := float64(tokLimit) / resetSec
+		l.tokenBucket.UpdateParameters(float64(tokLimit), refillRate)
+	}
+	if tokRemaining > 0 {
+		l.tokenBucket.Sync(float64(tokRemaining))
+	}
+}
+
+// ReturnTokens returns tokens back to the buckets.
+// This should be called when a request fails after tokens were acquired,
+// to prevent bucket exhaustion due to failed requests.
+func (l *Limiter) ReturnTokens(requestTokens int, estimatedTokens int64) {
+	if !l.isEnabled() {
+		return
+	}
+	if requestTokens > 0 {
+		l.requestBucket.Return(float64(requestTokens))
+	}
+	if estimatedTokens > 0 {
+		l.tokenBucket.Return(float64(estimatedTokens))
+	}
+}
+
+// Stats returns rate limiter statistics.
+func (l *Limiter) Stats() Stats {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	return Stats{
+		Enabled:           l.enabled,
+		TotalRequests:     l.totalRequests,
+		BlockedRequests:   l.blockedRequests,
+		TotalTokens:       l.totalTokens,
+		AvailableRequests: l.requestBucket.Available(),
+		AvailableTokens:   l.tokenBucket.Available(),
+	}
+}
+
+// Stats holds rate limiter statistics.
+type Stats struct {
+	Enabled           bool
+	TotalRequests     int64
+	BlockedRequests   int64
+	TotalTokens       int64
+	AvailableRequests float64
+	AvailableTokens   float64
+}
+
+// SetEnabled enables or disables the rate limiter.
+func (l *Limiter) SetEnabled(enabled bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.enabled = enabled
+}
+
+// isEnabled checks if the limiter is enabled (thread-safe).
+func (l *Limiter) isEnabled() bool {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.enabled
+}
+
+// Reset resets all buckets and statistics.
+func (l *Limiter) Reset() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.requestBucket.Reset()
+	l.tokenBucket.Reset()
+	l.totalRequests = 0
+	l.blockedRequests = 0
+	l.totalTokens = 0
+}
+
+// EstimateTokens estimates the number of tokens for a message.
+// This is a rough estimate based on character count.
+func EstimateTokens(message string) int64 {
+	// Rough estimate: ~4 characters per token
+	return int64(len(message) / 4)
+}
+
+// EstimateTokensFromContents estimates tokens for multiple content items.
+func EstimateTokensFromContents(contents int, avgLength int) int64 {
+	// Estimate based on number of contents and average length
+	return int64(contents * avgLength / 4)
+}

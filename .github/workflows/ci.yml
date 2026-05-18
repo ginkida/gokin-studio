@@ -1,0 +1,88 @@
+name: CI
+
+# Fast checks: backend tests + frontend type-check/build. Runs on PR + push
+# to main so regressions land visibly. Cross-platform binary builds are
+# only done on tag push (see release.yml).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend:
+    name: Go tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      # WebKit + GTK headers are referenced by Wails packages but Go test
+      # runs of `internal/...` don't need a UI binary — pure unit tests.
+      # Install anyway because some engine packages cgo-link against them.
+      - name: Install Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev pkg-config
+
+      - name: Run studio + engine tests
+        run: go test -count=1 ./internal/...
+
+      - name: Run with race detector (studio only)
+        run: go test -race -count=1 ./internal/studio/...
+
+      - name: Coverage
+        run: |
+          go test -coverprofile=coverage.out ./internal/studio/...
+          go tool cover -func=coverage.out | tail -1
+
+  frontend:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install
+        working-directory: frontend
+        run: npm ci
+
+      # tsc + vite build catches type errors AND ensures the iter 910+
+      # bundle splitting still keeps chunks under the size warning cap.
+      - name: Type-check + build
+        working-directory: frontend
+        run: npm run build
+
+  vet:
+    name: go vet
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Install Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev pkg-config
+
+      - name: go vet
+        run: go vet ./...

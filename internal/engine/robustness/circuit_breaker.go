@@ -1,0 +1,139 @@
+package robustness
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"time"
+)
+
+var (
+	ErrCircuitOpen = errors.New("circuit breaker is open")
+)
+
+type State int
+
+const (
+	StateClosed State = iota
+	StateHalfOpen
+	StateOpen
+)
+
+func (s State) String() string {
+	switch s {
+	case StateClosed:
+		return "closed"
+	case StateHalfOpen:
+		return "half_open"
+	case StateOpen:
+		return "open"
+	default:
+		return "unknown"
+	}
+}
+
+type CircuitBreaker struct {
+	mu           sync.RWMutex
+	state        State
+	failures     int
+	threshold    int
+	resetTimeout time.Duration
+	lastFailure  time.Time
+}
+
+func NewCircuitBreaker(threshold int, resetTimeout time.Duration) *CircuitBreaker {
+	return &CircuitBreaker{
+		threshold:    threshold,
+		resetTimeout: resetTimeout,
+		state:        StateClosed,
+	}
+}
+
+func (cb *CircuitBreaker) Execute(ctx context.Context, fn func() error) error {
+	if !cb.allowRequest() {
+		return ErrCircuitOpen
+	}
+
+	err := fn()
+	if err != nil {
+		cb.recordFailure()
+		return err
+	}
+
+	cb.recordSuccess()
+	return nil
+}
+
+func (cb *CircuitBreaker) allowRequest() bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	if cb.state == StateClosed {
+		return true
+	}
+
+	if cb.state == StateOpen {
+		if time.Since(cb.lastFailure) > cb.resetTimeout {
+			// Allow a probe request in half-open mode.
+			cb.state = StateHalfOpen
+			return true
+		}
+		return false
+	}
+
+	return true // Half-open
+}
+
+// CanExecute returns true if the circuit would allow request execution now.
+// This is a read-only query that does not transition state.
+func (cb *CircuitBreaker) CanExecute() bool {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+
+	if cb.state == StateClosed {
+		return true
+	}
+	if cb.state == StateOpen {
+		return time.Since(cb.lastFailure) > cb.resetTimeout
+	}
+	return true // Half-open
+}
+
+func (cb *CircuitBreaker) recordFailure() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	cb.failures++
+	cb.lastFailure = time.Now()
+
+	if cb.state == StateHalfOpen || cb.failures >= cb.threshold {
+		cb.state = StateOpen
+	}
+}
+
+func (cb *CircuitBreaker) recordSuccess() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	if cb.state == StateHalfOpen {
+		cb.state = StateClosed
+		cb.failures = 0
+	} else if cb.state == StateClosed {
+		cb.failures = 0
+	}
+}
+
+func (cb *CircuitBreaker) GetState() State {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+	return cb.state
+}
+
+// Reset forces the circuit breaker back to closed state with zero failures.
+// Used after provider failover to give the new provider a clean slate.
+func (cb *CircuitBreaker) Reset() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.state = StateClosed
+	cb.failures = 0
+}

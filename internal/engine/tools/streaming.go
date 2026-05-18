@@ -1,0 +1,118 @@
+package tools
+
+import "context"
+
+// streamingCallbackKey is the context key for streaming callbacks.
+type streamingCallbackKey struct{}
+
+// StreamingCallback is a function that receives streaming text output.
+type StreamingCallback func(text string)
+
+// ContextWithStreamingCallback returns a new context with the streaming callback attached.
+// This allows tool execution to stream output back to the caller in real-time.
+func ContextWithStreamingCallback(ctx context.Context, onText StreamingCallback) context.Context {
+	return context.WithValue(ctx, streamingCallbackKey{}, onText)
+}
+
+// GetStreamingCallback retrieves the streaming callback from the context, if present.
+// Returns nil if no callback was attached.
+func GetStreamingCallback(ctx context.Context) StreamingCallback {
+	if cb, ok := ctx.Value(streamingCallbackKey{}).(StreamingCallback); ok {
+		return cb
+	}
+	return nil
+}
+
+// progressCallbackKey is the context key for progress callbacks.
+type progressCallbackKey struct{}
+
+// ProgressCallback is a function that receives progress updates.
+type ProgressCallback func(progress float64, currentStep string)
+
+// ContextWithProgressCallback returns a new context with the progress callback attached.
+func ContextWithProgressCallback(ctx context.Context, onProgress ProgressCallback) context.Context {
+	return context.WithValue(ctx, progressCallbackKey{}, onProgress)
+}
+
+// GetProgressCallback retrieves the progress callback from the context, if present.
+func GetProgressCallback(ctx context.Context) ProgressCallback {
+	if cb, ok := ctx.Value(progressCallbackKey{}).(ProgressCallback); ok {
+		return cb
+	}
+	return nil
+}
+
+// toolsUsedKey is the context key for tracking tools used.
+type toolsUsedKey struct{}
+
+// ToolsUsedTracker tracks which tools have been used during execution.
+type ToolsUsedTracker struct {
+	tools []string
+}
+
+// Add adds a tool to the tracker.
+func (t *ToolsUsedTracker) Add(toolName string) {
+	t.tools = append(t.tools, toolName)
+}
+
+// List returns all tools used.
+func (t *ToolsUsedTracker) List() []string {
+	return t.tools
+}
+
+// ContextWithToolsTracker returns a new context with a tools used tracker attached.
+func ContextWithToolsTracker(ctx context.Context, tracker *ToolsUsedTracker) context.Context {
+	return context.WithValue(ctx, toolsUsedKey{}, tracker)
+}
+
+// GetToolsTracker retrieves the tools used tracker from the context, if present.
+func GetToolsTracker(ctx context.Context) *ToolsUsedTracker {
+	if tracker, ok := ctx.Value(toolsUsedKey{}).(*ToolsUsedTracker); ok {
+		return tracker
+	}
+	return nil
+}
+
+// filePeekCallbackKey is the context key for file peek callbacks.
+type filePeekCallbackKey struct{}
+
+// FilePeekCallback is a function that receives file peek updates.
+type FilePeekCallback func(filePath, title, content, action string)
+
+// ContextWithFilePeekCallback returns a new context with the file peek callback attached.
+func ContextWithFilePeekCallback(ctx context.Context, onFilePeek FilePeekCallback) context.Context {
+	return context.WithValue(ctx, filePeekCallbackKey{}, onFilePeek)
+}
+
+// GetFilePeekCallback retrieves the file peek callback from the context, if present.
+func GetFilePeekCallback(ctx context.Context) FilePeekCallback {
+	if cb, ok := ctx.Value(filePeekCallbackKey{}).(FilePeekCallback); ok {
+		return cb
+	}
+	return nil
+}
+
+// EmitFilePeek is a helper to safely emit a file peek if the callback is present.
+func EmitFilePeek(ctx context.Context, filePath, title, content, action string) {
+	if cb := GetFilePeekCallback(ctx); cb != nil {
+		cb(filePath, title, content, action)
+	}
+}
+
+// memoryNotifyKey is the context key for memory notification callbacks.
+type memoryNotifyKey struct{}
+
+// MemoryNotifyCallback is called when a memory operation completes (save, recall, forget).
+type MemoryNotifyCallback func(action, summary string)
+
+// ContextWithMemoryNotify attaches a memory notification callback to the context.
+func ContextWithMemoryNotify(ctx context.Context, cb MemoryNotifyCallback) context.Context {
+	return context.WithValue(ctx, memoryNotifyKey{}, cb)
+}
+
+// EmitMemoryNotify sends a memory notification if a callback is present.
+func EmitMemoryNotify(ctx context.Context, action, summary string) {
+	if cb, ok := ctx.Value(memoryNotifyKey{}).(MemoryNotifyCallback); ok && cb != nil {
+		cb(action, summary)
+	}
+}
