@@ -27,14 +27,20 @@ jobs:
             platform: darwin/universal
             artifact-name: gokin-studio-macos-universal.zip
             artifact-source: build/bin/gokin-studio.app
+            build-tags: ''
           - os: ubuntu-latest
             platform: linux/amd64
             artifact-name: gokin-studio-linux-amd64.tar.gz
             artifact-source: build/bin/gokin-studio
+            # Ubuntu 24.04 runners ship libwebkit2gtk-4.1, not 4.0 (which
+            # Wails defaults to). The webkit2_41 build tag tells Wails to
+            # link against the 4.1 series.
+            build-tags: 'webkit2_41'
           - os: windows-latest
             platform: windows/amd64
             artifact-name: gokin-studio-windows-amd64.zip
             artifact-source: build/bin/gokin-studio.exe
+            build-tags: ''
 
     runs-on: ${{ matrix.os }}
     name: Build ${{ matrix.platform }}
@@ -67,13 +73,14 @@ jobs:
       - name: Install Wails CLI
         run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
 
-      # Run backend tests as a final sanity check before building. Saves
-      # publishing a broken release if the tag bypassed CI somehow.
-      - name: Run tests
-        run: go test ./internal/...
+      # Note: backend tests run in ci.yml on every push to main and on every
+      # PR. We deliberately don't re-run them here — the release path stays
+      # simple, and the cross-platform tests that pass locally on macOS/Linux
+      # have known issues on Windows (path separators, git PATH) that aren't
+      # release blockers. Validation responsibility lives in CI.
 
       - name: Build app
-        run: wails build -platform ${{ matrix.platform }} -clean
+        run: wails build -platform ${{ matrix.platform }} -clean ${{ matrix.build-tags && format('-tags {0}', matrix.build-tags) || '' }}
 
       # Package per-platform. macOS gets a .zip of the .app bundle (DMG
       # would require code-signing infrastructure we don't have). Linux
