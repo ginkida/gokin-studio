@@ -163,6 +163,17 @@ function AppContent() {
       }
     }
     const settingsHandler = () => setView('settings')
+    // iter 990+: open Settings then defer the open-logs dispatch via rAF so
+    // SettingsPage has time to mount and register its listener. detail.level
+    // (e.g. 'error') is forwarded so the modal can pre-filter to errors when
+    // opened from the status-bar indicator.
+    const openLogsHandler = (e: Event) => {
+      const detail = (e as CustomEvent).detail || {}
+      setView('settings')
+      requestAnimationFrame(() => {
+        window.dispatchEvent(new CustomEvent('gokin:show-logs', { detail }))
+      })
+    }
     const renamedHandler = (e: Event) => {
       const { sessionID, name } = (e as CustomEvent).detail || {}
       if (!sessionID || !name) return
@@ -199,12 +210,14 @@ function AppContent() {
       }).catch(() => {})
     }
     window.addEventListener('gokin:open-settings', settingsHandler)
+    window.addEventListener('gokin:open-logs', openLogsHandler)
     window.addEventListener('gokin:switch-tab', switchHandler)
     window.addEventListener('gokin:session-renamed', renamedHandler)
     window.addEventListener('gokin:cycle-session', cycleHandler)
     window.addEventListener('gokin:sessions-changed', sessionsChangedHandler)
     return () => {
       window.removeEventListener('gokin:open-settings', settingsHandler)
+      window.removeEventListener('gokin:open-logs', openLogsHandler)
       window.removeEventListener('gokin:switch-tab', switchHandler)
       window.removeEventListener('gokin:session-renamed', renamedHandler)
       window.removeEventListener('gokin:cycle-session', cycleHandler)

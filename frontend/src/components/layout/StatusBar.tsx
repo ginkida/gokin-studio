@@ -1,6 +1,16 @@
-import { Brain } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { Brain, AlertOctagon } from 'lucide-react'
 import { useProjectStore } from '../../stores/projectStore'
 import { useChatStore } from '../../stores/chatStore'
+import { RecentErrorCount, RecentErrors } from '../../../wailsjs/go/studio/Studio'
+
+// iter 990+: window in which recent backend errors light up the status bar.
+// 5 minutes is long enough that a single error stays visible across a quick
+// task switch (so the user can come back and notice it), short enough that
+// yesterday's resolved hiccup doesn't permanently glow the bar red.
+const ERROR_WINDOW_MS = 5 * 60 * 1000
+// Poll cadence. 30s keeps perceived latency low without spamming the bridge.
+const ERROR_POLL_MS = 30 * 1000
 
 export function StatusBar() {
   const activeProject = useProjectStore((s) =>
@@ -32,6 +42,44 @@ export function StatusBar() {
     return false
   })
 
+  // iter 990+: error indicator. Polls the backend's RecentErrorCount every
+  // 30s. When > 0, the badge appears; click opens Settings → Logs scoped to
+  // error level so the user can see what went wrong. Tooltip previews the
+  // first few error messages so a glance answers "what's broken?".
+  const [errorCount, setErrorCount] = useState(0)
+  const [errorPreview, setErrorPreview] = useState<string>('')
+  useEffect(() => {
+    let cancelled = false
+    const tick = async () => {
+      try {
+        const n = await RecentErrorCount(ERROR_WINDOW_MS)
+        if (cancelled) return
+        setErrorCount(typeof n === 'number' ? n : 0)
+        if (n > 0) {
+          const recent = await RecentErrors(3)
+          if (cancelled) return
+          const lines = (recent || []).map((e: any) =>
+            `${e.source}: ${(e.message || '').slice(0, 140)}`
+          )
+          setErrorPreview(lines.join('\n'))
+        } else {
+          setErrorPreview('')
+        }
+      } catch {
+        // Backend down / Wails bridge mid-startup — silently keep previous count.
+      }
+    }
+    void tick()
+    const id = window.setInterval(tick, ERROR_POLL_MS)
+    return () => {
+      cancelled = true
+      window.clearInterval(id)
+    }
+  }, [])
+  const handleOpenErrors = () => {
+    window.dispatchEvent(new CustomEvent('gokin:open-logs', { detail: { level: 'error' } }))
+  }
+
   return (
     <div className="status-bar">
       <div className="status-left">
@@ -53,6 +101,17 @@ export function StatusBar() {
         )}
       </div>
       <div className="status-right">
+        {errorCount > 0 && (
+          <button
+            type="button"
+            className="status-error-badge"
+            onClick={handleOpenErrors}
+            title={`${errorCount} error${errorCount === 1 ? '' : 's'} in the last 5 minutes — click to view logs\n\n${errorPreview}`}
+          >
+            <AlertOctagon size={11} />
+            <span>{errorCount > 99 ? '99+' : errorCount}</span>
+          </button>
+        )}
         {msgCount > 0 && <span className="status-info">{msgCount} msg{msgCount === 1 ? '' : 's'}</span>}
         <span className="status-info">{projectCount} project{projectCount !== 1 ? 's' : ''}</span>
         <span className="status-version">v1.0</span>

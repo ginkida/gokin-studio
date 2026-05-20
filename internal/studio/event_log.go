@@ -208,6 +208,57 @@ func (s *Studio) ClearLogs() {
 	s.eventLog.Clear()
 }
 
+// RecentErrorCount returns the number of error-level entries logged in the
+// last `windowMs` milliseconds. A window of 0 means "no time limit" (entire
+// buffer). Multi-count deduped entries (iter 720+) are counted by their Count
+// field, not as a single row — so a render-loop bug surfaces as the real
+// occurrence count rather than 1. Used by the status-bar error indicator
+// (iter 990+) to surface backend issues without the user opening Diagnostics.
+//
+// Safe to call from any goroutine. Reads via Snapshot() so it doesn't block
+// concurrent Log() callers for more than a brief RLock.
+func (s *Studio) RecentErrorCount(windowMs int64) int {
+	s.ensureEventLog()
+	entries := s.eventLog.Snapshot()
+	cutoff := int64(0)
+	if windowMs > 0 {
+		cutoff = time.Now().UnixMilli() - windowMs
+	}
+	count := 0
+	// Walk newest-first; we can early-exit once entries fall before cutoff.
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
+		if cutoff > 0 && e.TimestampMs < cutoff {
+			break
+		}
+		if e.Level != "error" {
+			continue
+		}
+		count += max(e.Count, 1)
+	}
+	return count
+}
+
+// RecentErrors returns up to `limit` most-recent error-level entries
+// (newest first). limit=0 means "no limit" (return all errors in buffer).
+// Used by the status-bar tooltip (iter 990+) to preview which errors are
+// driving the count, without forcing the user to open Diagnostics.
+func (s *Studio) RecentErrors(limit int) []EventLogEntry {
+	s.ensureEventLog()
+	entries := s.eventLog.Snapshot()
+	out := make([]EventLogEntry, 0)
+	for i := len(entries) - 1; i >= 0; i-- {
+		if entries[i].Level != "error" {
+			continue
+		}
+		out = append(out, entries[i])
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
 // ensureEventLog lazy-inits the log so tests that construct &Studio{}
 // directly don't NPE. Idempotent — safe to call from every public method.
 //

@@ -299,12 +299,24 @@ export function SettingsPage() {
       setLogsLoading(false)
     }).catch(() => { setLogsLoading(false) })
   }
-  const openLogs = () => {
+  const openLogs = (preset?: { level?: 'all' | 'info' | 'warn' | 'error' }) => {
     setShowLogs(true)
-    setLogFilter('all')
+    setLogFilter(preset?.level || 'all')
     setLogSourceFilter('all')
     refreshLogs()
   }
+  // iter 990+: status-bar error indicator dispatches `gokin:show-logs` after
+  // App.tsx switches to the Settings tab (so this component is mounted by the
+  // time the event lands). detail.level pre-filters the modal — typically
+  // 'error' since the indicator only counts errors.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail || {}
+      openLogs({ level: detail.level })
+    }
+    window.addEventListener('gokin:show-logs', handler)
+    return () => window.removeEventListener('gokin:show-logs', handler)
+  }, [])
   const handleClearLogs = async () => {
     try { await ClearLogs(); refreshLogs() } catch (e: any) {
       console.error('ClearLogs failed:', e)
