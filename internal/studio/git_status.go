@@ -162,6 +162,15 @@ func (s *Studio) GetProjectGitContext(projectID string) (*ProjectGitContext, err
 
 // runGit executes `git <args>` in dir with a 3-second timeout, returning
 // stdout trimmed. Any error or non-zero exit yields "".
+//
+// iter 970+: hardened against two crash modes seen on Linux:
+//  1. nil-deref on cmd.Process.Kill() when timeout fires before git's PATH
+//     lookup completes — fork/exec hasn't populated Process yet, so the
+//     pointer is nil. Guarded by an explicit nil check now.
+//  2. goroutine panics (e.g. cmd.Output's internal buffer pool race) used
+//     to take down the whole app since the goroutine wasn't recovered.
+//     defer recoverPanic now catches it; runGit then returns "" as if the
+//     command failed cleanly.
 func runGit(dir string, args ...string) string {
 	full := append([]string{"-C", dir}, args...)
 	cmd := exec.Command("git", full...)
@@ -170,8 +179,9 @@ func runGit(dir string, args ...string) string {
 	var out []byte
 	var err error
 	go func() {
+		defer recoverPanic("git-exec", nil)
+		defer close(done)
 		out, err = cmd.Output()
-		close(done)
 	}()
 	select {
 	case <-done:
@@ -180,7 +190,12 @@ func runGit(dir string, args ...string) string {
 		}
 		return strings.TrimRight(string(out), "\n")
 	case <-time.After(3 * time.Second):
-		_ = cmd.Process.Kill()
+		// Process may be nil if exec.LookPath failed (git not installed),
+		// or if the goroutine panicked before fork/exec completed. Either
+		// way Kill on nil would panic the caller — guard explicitly.
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
 		return ""
 	}
 }

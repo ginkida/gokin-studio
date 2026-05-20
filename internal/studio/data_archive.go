@@ -140,18 +140,51 @@ func writeConfigArchive(out io.Writer, dir string) (int, error) {
 			return nil
 		}
 		hdr.Typeflag = tar.TypeReg
-		hdr.Size = info.Size()
-		if err := tw.WriteHeader(hdr); err != nil {
-			return err
-		}
+		// iter 980+: open BEFORE writing the header so a failed open
+		// (permission revoked, file deleted between WalkDir and now) skips
+		// the entry entirely. Previously the header was written first,
+		// then os.Open failure returned nil — leaving an orphan header
+		// promising N bytes with 0 bytes following. The next entry's bytes
+		// were then misinterpreted as this entry's content → corrupt
+		// archive, unreadable on restore.
+		//
+		// Also: use fstat on the open fd instead of WalkDir's `info` so
+		// the header Size matches the bytes we actually have. If the file
+		// shrank between WalkDir and Open (log rotation, DB checkpoint),
+		// info.Size() would over-promise and io.Copy would under-deliver
+		// → same corruption.
 		f, err := os.Open(path)
 		if err != nil {
+			// Common case: file deleted between WalkDir and Open (cache
+			// dir churn, temp files). Skip cleanly — the archive stays
+			// valid, the caller's filesCount accurately reflects what
+			// landed inside.
 			return nil
 		}
-		_, copyErr := io.Copy(tw, f)
+		fi, err := f.Stat()
+		if err != nil {
+			_ = f.Close()
+			return nil
+		}
+		hdr.Size = fi.Size()
+		hdr.ModTime = fi.ModTime()
+		if err := tw.WriteHeader(hdr); err != nil {
+			_ = f.Close()
+			return err
+		}
+		copied, copyErr := io.Copy(tw, f)
 		_ = f.Close()
 		if copyErr != nil {
 			return copyErr
+		}
+		// io.Copy can return fewer bytes than hdr.Size if the file was
+		// truncated mid-copy. tar.Writer.Close would later reject the
+		// archive with "unexpected EOF on file". Surface as a real error
+		// so the export is aborted with a clean message instead of
+		// producing a half-written corrupt file the user will only learn
+		// is broken when they try to restore.
+		if copied != hdr.Size {
+			return fmt.Errorf("file %q changed during archive (header size %d, copied %d)", rel, hdr.Size, copied)
 		}
 		filesCount++
 		return nil

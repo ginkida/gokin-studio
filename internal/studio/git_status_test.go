@@ -1,6 +1,7 @@
 package studio
 
 import (
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -265,6 +266,25 @@ func TestRunGit_NonZeroExitReturnsEmpty(t *testing.T) {
 	got := runGit(t.TempDir(), "this-is-not-a-real-git-subcommand")
 	if got != "" {
 		t.Errorf("expected empty string for failed git, got %q", got)
+	}
+}
+
+// TestRunGit_MissingBinaryNoPanic — if git isn't on PATH (rare on dev
+// machines but real on minimal Linux containers, and the actual scenario
+// behind several iter-700+ diagnostics warnings), runGit must NOT panic
+// even if the timeout branch fires before exec.LookPath errors back. This
+// is the regression guard for the iter 970+ nil-Process.Kill fix.
+func TestRunGit_MissingBinaryNoPanic(t *testing.T) {
+	// Strip PATH so /usr/bin/git can't be found. runGit's `exec.Command`
+	// resolves the binary lazily inside Output(); with PATH empty the
+	// goroutine returns an error fast and `<-done` fires before the
+	// timeout. Either path must complete without panic and return "".
+	oldPath := os.Getenv("PATH")
+	t.Cleanup(func() { _ = os.Setenv("PATH", oldPath) })
+	_ = os.Setenv("PATH", "")
+	got := runGit(t.TempDir(), "rev-parse", "--show-toplevel")
+	if got != "" {
+		t.Errorf("expected empty result when git is missing, got %q", got)
 	}
 }
 

@@ -38,9 +38,19 @@ func (m *StudioMessenger) SendMessage(msgType string, toRole string, content str
 		if p.ID == m.projectID {
 			continue // don't send to self
 		}
+		// iter 980+: read p.Name under p.mu.RLock to avoid a torn read
+		// racing with RenameProject. With studio.mu only, the map shape is
+		// safe but the field bytes inside *Project are not — RenameProject
+		// writes p.Name under p.mu.Lock(), not s.mu. Without this lock,
+		// the prefix match could see a half-updated string and route the
+		// ask_agent query to the wrong project (or miss its intended
+		// target and fall through to the "first other project" branch).
+		p.mu.RLock()
+		pName := p.Name
+		p.mu.RUnlock()
 		// Match by name (case-insensitive prefix).
-		if len(p.Name) >= len(toRole) && len(toRole) > 0 {
-			if strings.EqualFold(p.Name, toRole) || strings.EqualFold(p.Name[:len(toRole)], toRole) {
+		if len(pName) >= len(toRole) && len(toRole) > 0 {
+			if strings.EqualFold(pName, toRole) || strings.EqualFold(pName[:len(toRole)], toRole) {
 				target = p
 				break
 			}
@@ -75,6 +85,32 @@ func (m *StudioMessenger) SendMessage(msgType string, toRole string, content str
 		m.studio.wg.Add(1)
 	}
 	go func() {
+		// iter 970+: panic barrier ahead of the cleanup defer so a panic
+		// inside the LLM call below still drains the wg counter and removes
+		// the pending entry (otherwise Shutdown blocks forever on wg.Wait
+		// and ReceiveResponse leaks).
+		defer func() {
+			if r := recover(); r != nil {
+				logFn := func(level, source, message string) {
+					if m.studio != nil {
+						m.studio.LogEvent(level, source, message)
+					}
+				}
+				// recoverPanic expects a non-nil recovered value to act on;
+				// since we already called recover(), we re-panic into it via
+				// a temporary func so it can run its stderr + log routines.
+				func() {
+					defer recoverPanic("messenger-ask-agent", logFn)
+					panic(r)
+				}()
+				// Surface to caller as an error string so the dispatched
+				// query unsticks instead of hanging on ch.
+				select {
+				case ch <- fmt.Sprintf("error: internal panic — %v", r):
+				default:
+				}
+			}
+		}()
 		defer func() {
 			if m.studio != nil {
 				m.studio.wg.Done()

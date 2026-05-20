@@ -78,27 +78,20 @@ func (s *Studio) Startup(ctx context.Context) {
 	// slow file walk on a giant config dir doesn't block UI bring-up. Errors
 	// are logged but never crash. Skipped entirely when the user has set
 	// Settings.AutoCleanupDisabled.
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				fmt.Fprintf(os.Stderr, "gokin-studio: auto-cleanup panic recovered: %v\n", r)
-			}
-		}()
+	//
+	// iter 970+: safeGoFn replaces inline defer/recover so panics surface in
+	// the event log (visible via Diagnostics → View Logs) instead of only
+	// stderr, which is invisible to users launching from a desktop launcher.
+	safeGoFn("auto-cleanup", s.LogEvent, func() {
 		_ = s.RunAutoCleanupIfDue()
-	}()
+	})
 
 	// iter 840+: background auto-backup pass — once per 24h, opt-in via
 	// Settings.AutoBackupEnabled. Writes a tar.gz snapshot to configDir/backups/
-	// and prunes the oldest beyond AutoBackupRetention. Same goroutine-with-
-	// defer-recover pattern as auto-cleanup.
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				fmt.Fprintf(os.Stderr, "gokin-studio: auto-backup panic recovered: %v\n", r)
-			}
-		}()
+	// and prunes the oldest beyond AutoBackupRetention.
+	safeGoFn("auto-backup", s.LogEvent, func() {
 		_, _ = s.RunAutoBackupIfDue()
-	}()
+	})
 }
 
 // Shutdown is called by Wails when the app closes.
@@ -968,7 +961,14 @@ func (s *Studio) SendMessage(projectID, message, sessionID string) error {
 	sid := sessionID
 	// Go 1.25's WaitGroup.Go subsumes the Add(1) + defer Done() boilerplate
 	// and scopes the goroutine to the wg lifecycle in one call.
+	//
+	// iter 970+: defense-in-depth panic barrier. SendMessage has its own
+	// internal recover at function entry (project.go:565), but if the
+	// closure itself panics before SendMessage starts (extremely rare but
+	// possible if `p`/`settings` capture a poisoned value), this catches it
+	// and surfaces in the event log instead of killing the process.
 	s.wg.Go(func() {
+		defer recoverPanic("send-message", s.LogEvent)
 		p.SendMessage(s.ctx, message, settings, sid)
 	})
 	return nil
@@ -1849,7 +1849,13 @@ func (s *Studio) Dispatch(fromID, toID, fromSessionID, task string) error {
 		dispatchFn = s.testDispatchFn
 	}
 	// Go 1.25 wg.Go: same lifecycle scoping in one call.
+	//
+	// iter 970+: panic barrier. dispatchInternal does network I/O against a
+	// second project's LLM client; any panic there (provider library bug,
+	// nil-deref on a race) previously killed the whole app. Now surfaces in
+	// the event log.
 	s.wg.Go(func() {
+		defer recoverPanic("dispatch", s.LogEvent)
 		dispatchFn(from, to, fromSid, task, settings)
 	})
 	return nil

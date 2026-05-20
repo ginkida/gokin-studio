@@ -42,6 +42,11 @@ type Project struct {
 	// retryInitialDelay overrides the 2s first-retry backoff in sendWithRetry.
 	// Set to a small value (e.g. time.Millisecond) in tests to keep them fast.
 	retryInitialDelay time.Duration
+	// testTurnTimeout overrides the 30-minute per-turn ceiling. Test-only;
+	// set to e.g. 50*time.Millisecond to exercise the DeadlineExceeded
+	// codepath without actually waiting 30 minutes. Production callers
+	// leave it at zero and get the default 30-minute ceiling.
+	testTurnTimeout time.Duration
 
 	studio     *Studio // back-reference for inter-project communication
 	client     client.Client
@@ -403,7 +408,15 @@ func (p *Project) emitEvent(wailsCtx context.Context, event string, data any) {
 				if event == EventChatRetry {
 					level = "warn"
 				}
-				p.studio.LogEvent(level, "agent", fmt.Sprintf("[%s] %s", p.Name, msg))
+				// iter 985+: snapshot p.Name under RLock. emitEvent is
+				// called from many code paths including ones that don't
+				// hold p.mu (e.g. inside the agent loop after a partial
+				// snapshot). RenameProject writes p.Name under p.mu.Lock,
+				// so an unlocked read is a documented race.
+				p.mu.RLock()
+				pName := p.Name
+				p.mu.RUnlock()
+				p.studio.LogEvent(level, "agent", fmt.Sprintf("[%s] %s", pName, msg))
 			}
 		}()
 	}
@@ -614,19 +627,34 @@ func (p *Project) SendMessage(wailsCtx context.Context, message string, settings
 	// Persist the bump so sidebar ordering survives restarts. Uses the async
 	// variant because we don't hold s.mu here; saveConfig (the sync variant)
 	// is only safe under s.mu, and using it here risks double-lock deadlock.
+	//
+	// iter 980+: was a bare `go p.studio.saveConfigAsync()` — most reachable
+	// goroutine launch in the app (every agent turn), so a panic here (yaml
+	// edge case, full disk causing os.WriteFile to behave oddly) had the
+	// highest blast radius. safeGoFn surfaces the panic in the event log
+	// instead of crashing.
 	if p.studio != nil {
-		go p.studio.saveConfigAsync()
+		safeGoFn("save-config-on-turn", p.studio.LogEvent, p.studio.saveConfigAsync)
 	}
 	// 30-minute hard ceiling for an entire agent run. Long tasks (refactors,
 	// large explorations) can legitimately take this long. User can always
 	// stop manually via the chat header.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	turnTimeout := 30 * time.Minute
+	if p.testTurnTimeout > 0 {
+		turnTimeout = p.testTurnTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), turnTimeout)
 	session.cancelFn = cancel
+	// iter 985+: snapshot p.Name alongside the other mutable fields under a
+	// single RLock so the post-lock defaultSystemPrompt() call below doesn't
+	// race with RenameProject. Previously p.Name was read outside the lock,
+	// which produced torn reads under -race.
 	p.mu.RLock()
 	c := p.client
 	reg := p.registry
 	pinnedCtx := p.pinnedContext
 	sysPr := p.SystemPrompt
+	pName := p.Name
 	p.mu.RUnlock()
 	session.mu.Unlock()
 
@@ -637,7 +665,7 @@ func (p *Project) SendMessage(wailsCtx context.Context, message string, settings
 	if pinnedCtx != "" {
 		base := sysPr
 		if base == "" {
-			base = defaultSystemPrompt(p.Directory, p.Name)
+			base = defaultSystemPrompt(p.Directory, pName)
 		}
 		c.SetSystemInstruction(base + "\n\n## Pinned Context\n" + pinnedCtx)
 	}
@@ -1015,6 +1043,23 @@ outer:
 		break
 	}
 
+	// iter 980+: surface ctx.DeadlineExceeded as a real chat:error so the
+	// user understands why the agent stopped. Previously the loop broke
+	// silently and chat:complete fired with empty text — the spinner
+	// cleared but no message explained the 30-minute cap was hit. Users
+	// reported "agent just stopped doing anything" on long refactors.
+	//
+	// context.Canceled (user clicked Stop) intentionally falls through
+	// without a synthesized error — the user just initiated that stop,
+	// they don't need a banner explaining their own action.
+	if ctx.Err() == context.DeadlineExceeded {
+		p.emitEvent(wailsCtx, EventChatError, ChatTextEvent{
+			ProjectID: p.ID,
+			SessionID: sid,
+			Text:      "Agent stopped after the 30-minute per-turn limit. Long tasks can be broken into smaller steps, or you can re-send to continue from here.",
+		})
+	}
+
 	p.mu.RLock()
 	completedProvider := p.Provider
 	completedModel := p.Model
@@ -1174,7 +1219,21 @@ func (p *Project) pruneAbandonedEmptySessions() {
 }
 
 // ToConfig converts to persistable config.
+//
+// iter 980+: takes p.mu.RLock() internally because all callers (saveConfig,
+// saveConfigAsync) hold s.mu but NOT p.mu. Without this lock, ToConfig
+// raced with Set* mutations (RenameProject writing Name, SetProjectProvider
+// writing Provider+Model, etc.) which happen under p.mu.Lock(). The race
+// produced torn YAML on disk — e.g. Provider=kimi but Model=glm-5.1 if a
+// concurrent agent turn called saveConfigAsync between the two field
+// writes. Manifested as "I switched provider but after restart the model
+// went back to the previous one".
+//
+// Safe because no current caller holds p.mu (verified by grep). If a future
+// caller does, it must read fields manually instead of calling ToConfig.
 func (p *Project) ToConfig() ProjectConfig {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	return ProjectConfig{
 		ID:             p.ID,
 		Name:           p.Name,

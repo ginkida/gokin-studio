@@ -24,6 +24,13 @@ type Terminal struct {
 
 // NewTerminal spawns a shell in projectDir and streams output via Wails events.
 func NewTerminal(wailsCtx context.Context, projectDir, projectID, termID string) (*Terminal, error) {
+	return newTerminalWithLogger(wailsCtx, projectDir, projectID, termID, nil)
+}
+
+// newTerminalWithLogger is the testable / panic-aware variant. logFn is used
+// to record PTY read-loop panics into the studio event log so users can see
+// them in Diagnostics. Pass nil when not wired (early bring-up, tests).
+func newTerminalWithLogger(wailsCtx context.Context, projectDir, projectID, termID string, logFn func(level, source, message string)) (*Terminal, error) {
 	shell := os.Getenv("SHELL")
 	if shell == "" {
 		shell = "/bin/bash"
@@ -47,8 +54,13 @@ func NewTerminal(wailsCtx context.Context, projectDir, projectID, termID string)
 		cancel:    cancel,
 	}
 
-	// Read loop: PTY output → Wails events → xterm.js
+	// Read loop: PTY output → Wails events → xterm.js. Linux PTY read paths
+	// have historically been a source of unexpected panics (closed-fd reads
+	// after process exit, EventsEmit during shutdown when wailsCtx is nil).
+	// recoverPanic keeps the panic from killing the whole app and surfaces
+	// it in the event log so users can report it.
 	go func() {
+		defer recoverPanic("terminal-read-loop", logFn)
 		buf := make([]byte, 4096)
 		for {
 			n, err := ptmx.Read(buf)
