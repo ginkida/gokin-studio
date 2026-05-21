@@ -126,3 +126,18 @@ func EstimateCost(provider, model string, inputTokens, outputTokens, cacheReadTo
 func (s *Studio) EstimateCost(provider, model string, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens int) float64 {
 	return EstimateCost(provider, model, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens)
 }
+
+// GetModelPricing exposes the full pricing struct (per-million-token rates)
+// for a given (provider, model) pair. iter 1050+ uses this to compute a
+// LIVE cost preview in the chat input footer as the user types: backend
+// is called once when the active project's model changes; the frontend
+// then multiplies cached rates by the running token estimate locally so
+// every keystroke doesn't cross the Wails bridge.
+//
+// Returns a zero ModelPricing struct (all fields 0) for unknown models or
+// local providers like Ollama. The frontend treats all-zero as "no cost
+// preview" and hides the chip — which matches the desired behavior
+// (showing "≈$0.0000" on every keystroke is just noise).
+func (s *Studio) GetModelPricing(provider, model string) ModelPricing {
+	return LookupPricing(provider, model)
+}

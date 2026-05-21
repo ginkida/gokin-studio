@@ -3507,6 +3507,13 @@
 
 .chat-char-count { font-family: 'Geist Mono', 'SF Mono', monospace; }
 .chat-send-hint { opacity: 0.7; }
+/* iter 1050+: live cost-preview chip inline with chars/tokens. Subtly green
+   to suggest "money" without competing visually with the main token count. */
+.chat-cost-preview {
+  color: var(--success);
+  opacity: 0.85;
+  cursor: help;
+}
 
 /* ============================================
    Terminal

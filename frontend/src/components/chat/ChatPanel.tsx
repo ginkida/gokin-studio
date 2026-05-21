@@ -9,7 +9,7 @@ import { useSettingsStore } from '../../stores/settingsStore'
 import { DispatchModal } from '../dispatch/DispatchModal'
 import { FilePicker } from '../files/FilePicker'
 import { Send, Square, ChevronRight, CheckCircle, XCircle, Trash2, ArrowRightLeft, AlertTriangle, Brain, ExternalLink, ListChecks, Circle, Database, FileText, Download, Search, X, MessageSquare, Zap, Bot, User, Terminal, TerminalSquare, Pencil, Eye, EyeOff, GitBranch, FolderSearch, Loader2, Copy, Check, MoreHorizontal, RotateCcw, FolderTree, Pin, GitFork, Bookmark, BookmarkPlus, BookmarkMinus, Activity, DollarSign } from 'lucide-react'
-import { SendMessage, StopGeneration, ClearHistory, GetHistory, SetProjectSystemPrompt, ExportChat, ListDirectory, EditUserMessage, ReadFileContent, GetRecoveryEvents, DiscardRecoveryEvents, AnswerQuestion, CancelQuestion, ListProjectMemory, DeleteMemoryEntry, ClearPinnedContext, SearchProjectHistory, SaveDraft, GetDraft, ForkChatSession, PinMessage, UnpinMessage, ListPinnedMessages, ListPromptTemplates, SaveUserPromptTemplate, DeleteUserPromptTemplate, ListUserPromptTemplates, GetProjectGitContext, ProjectUsageStats, ExportProjectAllSessions, SummarizeSession, SetProjectBudget, SetProjectEnforceBudget, SetProjectProvider, GetProject, ListUserSnippets, ListChatSessions, DeleteChatSession, ListProjectFiles, ExportSessionJSON, ImportSessionJSON, ExportProjectUsageCSV } from '../../../wailsjs/go/studio/Studio'
+import { SendMessage, StopGeneration, ClearHistory, GetHistory, SetProjectSystemPrompt, ExportChat, ListDirectory, EditUserMessage, ReadFileContent, GetRecoveryEvents, DiscardRecoveryEvents, AnswerQuestion, CancelQuestion, ListProjectMemory, DeleteMemoryEntry, ClearPinnedContext, SearchProjectHistory, SaveDraft, GetDraft, ForkChatSession, PinMessage, UnpinMessage, ListPinnedMessages, ListPromptTemplates, SaveUserPromptTemplate, DeleteUserPromptTemplate, ListUserPromptTemplates, GetProjectGitContext, ProjectUsageStats, ExportProjectAllSessions, SummarizeSession, SetProjectBudget, SetProjectEnforceBudget, SetProjectProvider, GetProject, ListUserSnippets, ListChatSessions, DeleteChatSession, ListProjectFiles, ExportSessionJSON, ImportSessionJSON, ExportProjectUsageCSV, GetModelPricing } from '../../../wailsjs/go/studio/Studio'
 import { ClipboardSetText, EventsOn } from '../../../wailsjs/runtime/runtime'
 import { isProjectMuted } from '../../lib/mutedProjects'
 
@@ -811,6 +811,25 @@ export function ChatPanel({ sessionId, sessionName }: { sessionId?: string; sess
     }).catch(() => { if (!cancelled) setGitCtx(null) })
     return () => { cancelled = true }
   }, [activeProjectId])
+
+  // iter 1050+: fetch the active model's input rate (USD per million tokens)
+  // ONCE per (project, provider, model) change so the live cost preview in
+  // the chat input footer can compute estimated cost from `tokens × rate`
+  // locally on every keystroke without crossing the Wails bridge. All-zero
+  // pricing (Ollama, unknown model) clears inputRate to 0 → frontend hides
+  // the cost chip, matching the iter 290+ "0 means don't display" convention.
+  const [inputRateUSDPerMTok, setInputRateUSDPerMTok] = useState(0)
+  useEffect(() => {
+    if (!activeProject) { setInputRateUSDPerMTok(0); return }
+    let cancelled = false
+    GetModelPricing(activeProject.provider || 'glm', activeProject.model || 'glm-5.1')
+      .then((p: any) => {
+        if (cancelled) return
+        setInputRateUSDPerMTok(p?.InputPerMTok || 0)
+      })
+      .catch(() => { if (!cancelled) setInputRateUSDPerMTok(0) })
+    return () => { cancelled = true }
+  }, [activeProject?.provider, activeProject?.model])
 
   // Load project-wide accumulated cost on project switch and refresh on every
   // chat:complete so the budget chip stays accurate without a manual reopen
@@ -3756,7 +3775,32 @@ export function ChatPanel({ sessionId, sessionName }: { sessionId?: string; sess
           )}
         </div>
         <div className="chat-input-footer">
-          <span className="chat-char-count">{input.length > 0 ? `${input.length.toLocaleString()} chars · ~${Math.ceil(input.length / 4).toLocaleString()} tokens` : ''}</span>
+          {/* iter 1050+: cost preview alongside chars/tokens. tokens × inputRate
+              gives an UPPER BOUND on what this user message ALONE will cost
+              (ignoring the existing history, which the model also reprocesses
+              every turn). It's a "minimum spend for this send"; the real
+              billed cost will be higher once history tokens are added. The
+              "≈" prefix and "input only" tooltip make this explicit. */}
+          {(() => {
+            if (input.length === 0) {
+              return <span className="chat-char-count"></span>
+            }
+            const tokens = Math.ceil(input.length / 4)
+            const cost = inputRateUSDPerMTok > 0 ? (tokens / 1_000_000) * inputRateUSDPerMTok : 0
+            return (
+              <span className="chat-char-count">
+                {input.length.toLocaleString()} chars · ~{tokens.toLocaleString()} tokens
+                {cost > 0 && (
+                  <span
+                    className="chat-cost-preview"
+                    title="Lower-bound cost for this message alone — actual cost adds history tokens reprocessed each turn"
+                  >
+                    {' · '}≈{formatCostUSD(cost)} input
+                  </span>
+                )}
+              </span>
+            )
+          })()}
           <span className="chat-send-hint">Enter to send · Shift+Enter for new line</span>
         </div>
       </div>
