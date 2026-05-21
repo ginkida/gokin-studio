@@ -239,6 +239,24 @@
   border-left-color: var(--accent);
 }
 
+/* iter 1060+: drag-reorder visual states. is-dragging dims the row being
+   dragged; drop-target highlights the row the dragged item will land
+   BEFORE (matches the iter 540+ session-tab pattern: drop-on-X = insert
+   before X, mental model "indicator on left edge"). */
+.project-item.is-dragging {
+  opacity: 0.45;
+  background: var(--bg-deepest);
+}
+.project-item.drop-target {
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.project-item[draggable="true"] {
+  cursor: grab;
+}
+.project-item[draggable="true"]:active {
+  cursor: grabbing;
+}
+
 .project-icon-wrap {
   position: relative;
   flex-shrink: 0;

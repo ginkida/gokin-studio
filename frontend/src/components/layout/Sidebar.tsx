@@ -3,7 +3,7 @@ import { useProjectStore, ProjectInfo } from '../../stores/projectStore'
 import { useChatStore } from '../../stores/chatStore'
 import { ProviderSelect } from '../project/ProviderSelect'
 import { Zap, FolderPlus, Trash2, GitBranch, Settings, FolderOpen, Folder, PanelLeftClose, PanelLeftOpen, Search, X, Pin, PinOff, Download, Upload, Volume2, VolumeX } from 'lucide-react'
-import { AddProject, RemoveProject, BrowseDirectory, RenameProject, SetProjectPinned, ExportProjectJSON, ImportProjectJSON } from '../../../wailsjs/go/studio/Studio'
+import { AddProject, RemoveProject, BrowseDirectory, RenameProject, SetProjectPinned, ExportProjectJSON, ImportProjectJSON, GetProjectOrder, ReorderProjects } from '../../../wailsjs/go/studio/Studio'
 import { isProjectMuted, toggleProjectMute, unmuteProject, clearProjectLocalStorage } from '../../lib/mutedProjects'
 
 interface SidebarProps {
@@ -82,6 +82,22 @@ export function Sidebar({ onOpenSettings, onToggleCollapse, collapsed }: Sidebar
     const refresh = () => setMuteTick((t) => t + 1)
     window.addEventListener('gokin:muted-changed', refresh)
     return () => window.removeEventListener('gokin:muted-changed', refresh)
+  }, [])
+
+  // iter 1060+: user-defined project order, loaded once on mount and
+  // updated optimistically on each drop (then persisted server-side).
+  // Empty array = "no custom order" → projects sort by lastUsedAt-default.
+  // The order maps an ID to its index in this array; indices not in the
+  // map fall to the end of the sort.
+  const [projectOrder, setProjectOrder] = useState<string[]>([])
+  const [draggingProjectId, setDraggingProjectId] = useState<string | null>(null)
+  const [dropTargetId, setDropTargetId] = useState<string | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    GetProjectOrder()
+      .then((order) => { if (!cancelled) setProjectOrder(order || []) })
+      .catch(() => { /* silent: fall back to default sort */ })
+    return () => { cancelled = true }
   }, [])
   // muteTick is read in the render path indirectly via isProjectMuted() —
   // this comment exists so a future refactor doesn't strip the seemingly-
@@ -379,13 +395,26 @@ export function Sidebar({ onOpenSettings, onToggleCollapse, collapsed }: Sidebar
 
       <div className="project-list">
         {(() => {
+          // iter 1060+: build O(1) index map from projectOrder for the sort
+          // comparator. IDs not in the map sort after IDs that are — newly
+          // added projects appear at the bottom of the unordered group
+          // until the user explicitly drags them.
+          const orderIdx: Record<string, number> = {}
+          projectOrder.forEach((id, i) => { orderIdx[id] = i })
           const sorted = [...projects].sort((a, b) => {
             // Pinned projects always sort above unpinned. Within each pin
-            // group, recent-first ordering applies (lastUsedAt desc, alpha
-            // tiebreaker for never-used projects).
+            // group, the user-defined order (iter 1060+) takes precedence,
+            // then lastUsedAt-default, then alpha tiebreaker.
             const ap = a.pinned ? 1 : 0
             const bp = b.pinned ? 1 : 0
             if (ap !== bp) return bp - ap
+            const aIdx = orderIdx[a.id]
+            const bIdx = orderIdx[b.id]
+            const aHas = aIdx !== undefined
+            const bHas = bIdx !== undefined
+            if (aHas && bHas) return aIdx - bIdx
+            if (aHas) return -1 // a is ordered, b is not → a first
+            if (bHas) return 1
             const ai = a.lastUsedAt || 0
             const bi = b.lastUsedAt || 0
             if (ai !== bi) {
@@ -420,13 +449,62 @@ export function Sidebar({ onOpenSettings, onToggleCollapse, collapsed }: Sidebar
           return filtered.map((p) => (
           <div
             key={p.id}
-            className={`project-item ${activeProjectId === p.id ? 'active' : ''}`}
+            className={`project-item ${activeProjectId === p.id ? 'active' : ''} ${draggingProjectId === p.id ? 'is-dragging' : ''} ${dropTargetId === p.id ? 'drop-target' : ''}`}
             onClick={() => setActiveProject(p.id)}
             onContextMenu={(e) => {
               e.preventDefault()
               setCtxMenu({ id: p.id, x: e.clientX, y: e.clientY })
             }}
             title={p.directory}
+            draggable={editingName !== p.id && q === ''}
+            onDragStart={(e) => {
+              // iter 1060+: only allow drag-reorder when search is empty —
+              // reordering within a filtered view would persist a partial
+              // order that doesn't reflect the real layout the user sees.
+              setDraggingProjectId(p.id)
+              try {
+                e.dataTransfer.setData('text/plain', p.id)
+                e.dataTransfer.effectAllowed = 'move'
+              } catch { /* Firefox edge cases */ }
+            }}
+            onDragEnd={() => { setDraggingProjectId(null); setDropTargetId(null) }}
+            onDragOver={(e) => {
+              if (!draggingProjectId || draggingProjectId === p.id) return
+              e.preventDefault()
+              try { e.dataTransfer.dropEffect = 'move' } catch { /* ignore */ }
+              if (dropTargetId !== p.id) setDropTargetId(p.id)
+            }}
+            onDragLeave={(e) => {
+              // Only clear when leaving the project-item itself, not when
+              // moving across a child element. Without this guard, hover
+              // over the rename input or icon would flicker the indicator.
+              if (!(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node | null)) {
+                if (dropTargetId === p.id) setDropTargetId(null)
+              }
+            }}
+            onDrop={(e) => {
+              e.preventDefault()
+              const src = draggingProjectId
+              setDraggingProjectId(null)
+              setDropTargetId(null)
+              if (!src || src === p.id) return
+              // Compute the new order: insert src BEFORE p in the current
+              // sorted list. Persist the full visible list as the new order
+              // so the backend filters against live projects on save.
+              const sortedIds = sorted.map((x) => x.id)
+              const fromIdx = sortedIds.indexOf(src)
+              const toIdx = sortedIds.indexOf(p.id)
+              if (fromIdx < 0 || toIdx < 0) return
+              const next = [...sortedIds]
+              next.splice(fromIdx, 1)
+              const insertAt = next.indexOf(p.id) // p's index shifts if src was before it
+              next.splice(insertAt, 0, src)
+              setProjectOrder(next) // optimistic local update
+              ReorderProjects(next).catch(() => {
+                // Best-effort: on failure, the next page reload will
+                // re-sync from the backend's last-saved order.
+              })
+            }}
           >
             <div className="project-icon-wrap">
               <Folder size={16} className="project-folder-icon" />
