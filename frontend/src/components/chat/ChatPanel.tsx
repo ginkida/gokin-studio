@@ -4131,6 +4131,44 @@ function formatElapsed(ms: number): string {
   return remMin > 0 ? `${hours}h ${remMin}m` : `${hours}h`
 }
 
+// iter 1000+: live elapsed-time chip rendered next to the Loader2 spinner
+// in a pending tool card. Watches the wall clock so a hung tool surfaces
+// "1m 23s..." instead of just an indefinitely-spinning icon. Updates once
+// per second; auto-stops + unmounts itself when isPending flips false.
+//
+// Color escalation thresholds (matches the user's mental model of "this is
+// taking longer than I expected"):
+//   - 0-30s: muted (normal, no extra attention)
+//   - 30s-2m: amber (slow but not pathological)
+//   - 2m+: red ("something might be stuck")
+//
+// Tooltip shows the ISO start timestamp so power users can correlate with
+// other logs / system metrics.
+function ToolElapsedChip({ startedAt, isPending }: { startedAt: number; isPending: boolean }) {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!isPending || !startedAt) return
+    // Tick once per second. The initial render also shows the current time
+    // so we don't need to wait a full second for the first paint.
+    setNow(Date.now())
+    const id = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(id)
+  }, [isPending, startedAt])
+  if (!isPending || !startedAt) return null
+  const elapsedMs = Math.max(0, now - startedAt)
+  let cls = 'tool-elapsed-chip'
+  if (elapsedMs >= 120_000) cls += ' tool-elapsed-red'
+  else if (elapsedMs >= 30_000) cls += ' tool-elapsed-amber'
+  return (
+    <span
+      className={cls}
+      title={`Running since ${new Date(startedAt).toLocaleTimeString()}`}
+    >
+      {formatElapsed(elapsedMs)}
+    </span>
+  )
+}
+
 // Build suggestion chips based on detected project language.
 function suggestionsForLang(lang: string | null): string[] {
   const base = ['Explain this codebase structure', 'Find potential bugs']
@@ -4775,7 +4813,10 @@ function MessageBubbleInner({ message, onRerun, canEdit, onEditSubmit, changedFi
               <span className="tool-primary">{shortenForPill(String(primary))}</span>
             )}
             {isPending ? (
-              <Loader2 size={12} className="tool-spinner" />
+              <>
+                <Loader2 size={12} className="tool-spinner" />
+                <ToolElapsedChip startedAt={message.timestamp || 0} isPending={isPending} />
+              </>
             ) : message.toolSuccess ? (
               <CheckCircle size={12} className="tool-ok" />
             ) : (

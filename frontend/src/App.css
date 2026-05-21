@@ -2455,6 +2455,35 @@
 .tool-ok { color: var(--success); }
 .tool-fail { color: var(--error); }
 
+/* iter 1000+: live elapsed chip on pending tool cards. Sits between the
+   spinner and chevron. Color escalates with time to flag hung tools:
+   - default: muted (normal run)
+   - amber: > 30s (slower than expected)
+   - red: > 2 minutes (likely stuck) */
+.tool-elapsed-chip {
+  font-family: 'Geist Mono', 'SF Mono', 'JetBrains Mono', 'Cascadia Code', monospace;
+  font-size: 10px;
+  color: var(--text-muted);
+  background: var(--bg-elevated);
+  padding: 1px 6px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+  transition: color 0.2s ease, border-color 0.2s ease, background 0.2s ease;
+}
+.tool-elapsed-chip.tool-elapsed-amber {
+  color: #d97706;
+  border-color: rgba(217, 119, 6, 0.35);
+  background: rgba(217, 119, 6, 0.08);
+}
+.tool-elapsed-chip.tool-elapsed-red {
+  color: #ef4444;
+  border-color: rgba(239, 68, 68, 0.45);
+  background: rgba(239, 68, 68, 0.1);
+  font-weight: 600;
+}
+
 .tool-chevron {
   color: var(--text-muted);
   transition: transform 0.15s ease;
