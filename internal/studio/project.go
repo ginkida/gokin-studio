@@ -959,6 +959,23 @@ outer:
 					copy(out, session.history)
 					return out
 				})
+				// iter 1030+: wire the engine's ProgressCallback so partial output
+				// from long-running tools (bash via stdout pipe) streams to the
+				// frontend as chat:tool_progress events. progress=0 means "here's
+				// the next chunk of stdout/stderr text"; progress=-1 means "just
+				// a byte counter update" (we ignore those — the frontend's
+				// elapsed-time chip already conveys "still running"). Skipping the
+				// counter path keeps event volume low (1 event per ~100ms of
+				// stdout, not 1 per 32KB AND 1 per 100ms).
+				toolName := fc.Name
+				toolCtx = tools.ContextWithProgressCallback(toolCtx, func(progress float64, step string) {
+					if progress != 0 || step == "" {
+						return
+					}
+					p.emitEvent(wailsCtx, EventChatToolProgress, ChatToolProgressEvent{
+						ProjectID: p.ID, SessionID: sid, Tool: toolName, Text: step,
+					})
+				})
 				result, toolErr := safeToolExecute(toolCtx, tool, fc.Args)
 				success := toolErr == nil && result.Success
 				content := result.Content

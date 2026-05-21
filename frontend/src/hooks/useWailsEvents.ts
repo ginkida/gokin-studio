@@ -54,6 +54,10 @@ export function useWailsEvents() {
         const key = chatKey(data); if (!key) return
         useChatStore.getState().addToolCall(key, data.tool, data.args)
       }),
+      EventsOn('chat:tool_progress', (data: any) => {
+        const key = chatKey(data); if (!key) return
+        useChatStore.getState().addToolProgress(key, data.tool, data.text)
+      }),
       EventsOn('chat:tool_result', (data: any) => {
         const key = chatKey(data); if (!key) return
         useChatStore.getState().addToolResult(key, data.tool, data.success, data.content)

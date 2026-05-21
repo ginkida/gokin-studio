@@ -7,7 +7,8 @@ const (
 	EventChatThinking      = "chat:thinking"
 	EventChatThinkingDelta = "chat:thinking_delta"
 	EventChatToolCall      = "chat:tool_call"
-	EventChatToolResult = "chat:tool_result"
+	EventChatToolProgress  = "chat:tool_progress"
+	EventChatToolResult    = "chat:tool_result"
 	EventChatComplete   = "chat:complete"
 	EventChatError      = "chat:error"
 	EventChatRetry      = "chat:retry"
@@ -54,6 +55,20 @@ type ChatToolResultEvent struct {
 	Tool      string `json:"tool"`
 	Success   bool   `json:"success"`
 	Content   string `json:"content"`
+}
+
+// ChatToolProgressEvent carries an incremental chunk of output from a
+// long-running tool (currently only bash via the engine's ProgressCallback).
+// Text is the NEW bytes since the previous event — the frontend
+// concatenates into a streamingOutput buffer on the matching pending tool
+// message. Emitted at ~100ms cadence (engine's StreamingFlushInterval) so
+// users see live progress on long builds/tests instead of an indefinite
+// spinner. Cleared when the corresponding chat:tool_result lands.
+type ChatToolProgressEvent struct {
+	ProjectID string `json:"projectID"`
+	SessionID string `json:"sessionID"`
+	Tool      string `json:"tool"`
+	Text      string `json:"text"`
 }
 
 // ChatRetryEvent is emitted when an LLM call is being retried after a transient error.

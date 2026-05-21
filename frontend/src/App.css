@@ -2455,6 +2455,33 @@
 .tool-ok { color: var(--success); }
 .tool-fail { color: var(--error); }
 
+/* iter 1030+: live streaming output preview on pending tool cards. Sits
+   between the tool header and the expanded detail. Auto-cleared when the
+   tool resolves (streamingOutput is dropped in addToolResult).
+   - Fixed-width monospace, dimmed so it doesn't compete with finished tools
+   - max-height keeps the UI height stable on long builds (tailLines further
+     bounds the content)
+   - left border matches the pending-rail color for visual continuity */
+.tool-streaming {
+  border-top: 1px solid var(--border-subtle);
+  background: var(--bg-deepest);
+  padding: 6px 12px 8px;
+  border-left: 3px solid var(--accent);
+  max-height: 160px;
+  overflow: hidden;
+  cursor: default;
+}
+.tool-streaming-output {
+  font-family: 'Geist Mono', 'SF Mono', 'JetBrains Mono', 'Cascadia Code', monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-muted);
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  opacity: 0.85;
+}
+
 /* iter 1000+: live elapsed chip on pending tool cards. Sits between the
    spinner and chevron. Color escalates with time to flag hung tools:
    - default: muted (normal run)

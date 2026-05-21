@@ -4162,6 +4162,18 @@ function formatElapsed(ms: number): string {
   return remMin > 0 ? `${hours}h ${remMin}m` : `${hours}h`
 }
 
+// iter 1030+: keep only the last N lines of a streaming output blob so the
+// preview area stays a fixed visual size during long builds. Trims from the
+// FRONT (oldest lines drop) so the user always sees the most recent activity
+// — important for compiler output where "first 1000 unrelated lines, then
+// the actual error at the bottom" is the common pattern.
+function tailLines(s: string, n: number): string {
+  if (!s) return ''
+  const lines = s.split('\n')
+  if (lines.length <= n) return s
+  return lines.slice(-n).join('\n')
+}
+
 // iter 1000+: live elapsed-time chip rendered next to the Loader2 spinner
 // in a pending tool card. Watches the wall clock so a hung tool surfaces
 // "1m 23s..." instead of just an indefinitely-spinning icon. Updates once
@@ -4855,6 +4867,18 @@ function MessageBubbleInner({ message, onRerun, canEdit, onEditSubmit, changedFi
             )}
             <ChevronRight size={10} className={`tool-chevron ${expanded ? 'expanded' : ''}`} />
           </div>
+          {isPending && message.streamingOutput && (
+            // iter 1030+: live preview of the tool's running stdout (currently
+            // only bash via the engine's ProgressCallback at 100ms cadence).
+            // Always visible while pending — collapses automatically when the
+            // tool resolves and streamingOutput is cleared. Capped at 100 KB
+            // in the store; we tail the last ~12 lines for UI compactness.
+            <div className="tool-streaming" onClick={(e) => e.stopPropagation()}>
+              <pre className="tool-streaming-output">
+                {tailLines(message.streamingOutput, 12)}
+              </pre>
+            </div>
+          )}
           {expanded && (
             <div className="tool-detail">
               {isBash ? (

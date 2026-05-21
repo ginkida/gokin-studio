@@ -7,6 +7,12 @@ export interface ChatMessage {
   toolName?: string
   toolArgs?: Record<string, unknown>
   toolSuccess?: boolean
+  // iter 1030+: streamingOutput is the accumulated live stdout for a still-
+  // running tool (currently only bash). Appended to on every chat:tool_progress
+  // event. Rendered inline during isPending so users see a live preview of
+  // a long build instead of just a spinner. Untouched once the tool resolves —
+  // the authoritative content field replaces this view in the rendered card.
+  streamingOutput?: string
   dispatchTarget?: string
   dispatchSuccess?: boolean
   durationMs?: number
@@ -84,6 +90,7 @@ interface ChatStore extends ChatState {
   addThinking: (chatKey: string, text: string) => void
   finalizeAssistant: (chatKey: string, text: string) => void
   addToolCall: (chatKey: string, tool: string, args: Record<string, unknown>) => void
+  addToolProgress: (chatKey: string, tool: string, text: string) => void
   addToolResult: (chatKey: string, tool: string, success: boolean, content: string) => void
   addDispatchResult: (chatKey: string, target: string, success: boolean, content: string) => void
   setSessionActive: (chatKey: string, active: boolean) => void
@@ -283,13 +290,37 @@ export const useChatStore = create<ChatStore>((set) => ({
       },
     })),
 
+  addToolProgress: (projectId, tool, text) =>
+    set((s) => {
+      if (!text) return s
+      const msgs = [...(s.messages[projectId] || [])]
+      // Append partial output to the latest PENDING tool call of this name.
+      // Capped at 100 KB so a runaway log doesn't bloat memory; the
+      // authoritative full content arrives via addToolResult anyway.
+      const MAX_STREAM_BYTES = 100_000
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i]
+        if (m.toolName === tool && m.role === 'tool' && m.toolSuccess === undefined) {
+          const next = (m.streamingOutput || '') + text
+          const trimmed = next.length > MAX_STREAM_BYTES
+            ? '…' + next.slice(next.length - MAX_STREAM_BYTES)
+            : next
+          msgs[i] = { ...m, streamingOutput: trimmed }
+          break
+        }
+      }
+      return { messages: { ...s.messages, [projectId]: msgs } }
+    }),
+
   addToolResult: (projectId, tool, success, content) =>
     set((s) => {
       const msgs = [...(s.messages[projectId] || [])]
       // Update last PENDING tool call for this tool (toolSuccess is undefined until resolved).
       for (let i = msgs.length - 1; i >= 0; i--) {
         if (msgs[i].toolName === tool && msgs[i].role === 'tool' && msgs[i].toolSuccess === undefined) {
-          msgs[i] = { ...msgs[i], content, toolSuccess: success }
+          // iter 1030+: drop streamingOutput once authoritative content lands.
+          // The rendered tool card switches to the regular bash-output view.
+          msgs[i] = { ...msgs[i], content, toolSuccess: success, streamingOutput: undefined }
           break
         }
       }
