@@ -36,6 +36,7 @@ export function ChatPanel({ sessionId, sessionName }: { sessionId?: string; sess
   const settings = useSettingsStore((s) => s.settings)
 
   const setMessages = useChatStore((s) => s.setMessages)
+  const setScrollPosition = useChatStore((s) => s.setScrollPosition)
 
   const updateProject = useProjectStore((s) => s.updateProject)
 
@@ -291,14 +292,36 @@ export function ChatPanel({ sessionId, sessionName }: { sessionId?: string; sess
 
 
   // Load persisted history when switching sessions (only if chat is empty).
+  //
+  // iter 1010+: after content is loaded, restore the saved scroll position
+  // for this chatKey if any. Save-on-switch can't live in this effect's
+  // cleanup because by the time cleanup runs, React has already committed
+  // the NEW chatKey's render — DOM scrollTop is meaningless for the OLD
+  // chatKey. Instead, scroll position is saved live in handleScroll (see
+  // below). Sentinel -1 means "user was at bottom" → scroll to bottom on
+  // return so any new content that arrived in the interim is visible.
+  const AT_BOTTOM_PX = 80
   useEffect(() => {
     if (!activeProjectId || !chatKey) return
+    const applyScroll = () => {
+      const el = chatContainerRef.current
+      if (!el) return
+      const saved = useChatStore.getState().scrollPositions[chatKey]
+      if (saved !== undefined && saved >= 0) {
+        // Clamp to current scrollable range — content may have changed
+        // between saves so the literal saved pixel can exceed the new max.
+        const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight)
+        el.scrollTop = Math.min(saved, maxScroll)
+        const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+        userScrolledUpRef.current = distanceFromBottom > AT_BOTTOM_PX
+      } else {
+        messagesEndRef.current?.scrollIntoView({ behavior: 'auto' as ScrollBehavior })
+        userScrolledUpRef.current = false
+      }
+    }
     const existing = useChatStore.getState().messages[chatKey]
     if (existing && existing.length > 0) {
-      // Already loaded — just scroll to bottom.
-      requestAnimationFrame(() => {
-        messagesEndRef.current?.scrollIntoView({ behavior: 'auto' as ScrollBehavior })
-      })
+      requestAnimationFrame(applyScroll)
       return
     }
     let cancelled = false
@@ -311,14 +334,11 @@ export function ChatPanel({ sessionId, sessionName }: { sessionId?: string; sess
           content: m.content,
           timestamp: m.timestamp || 0,
         })))
-        // Scroll after DOM updates with the loaded history.
-        requestAnimationFrame(() => {
-          messagesEndRef.current?.scrollIntoView({ behavior: 'auto' as ScrollBehavior })
-        })
+        requestAnimationFrame(applyScroll)
       }
     }).catch(() => {})
     return () => { cancelled = true }
-  }, [activeProjectId, chatKey, setMessages])
+  }, [activeProjectId, chatKey, setMessages, currentSessionId])
 
   // Check for interrupted turn recovery each time the session switches.
   // Clear synchronously first so stale banner from the old session never
@@ -873,6 +893,14 @@ export function ChatPanel({ sessionId, sessionName }: { sessionId?: string; sess
   }, [projectTotalCostUSD, activeProject?.budgetUSD, activeProjectId, activeProject, currentSessionId])
 
   // Track scroll position; if user scrolls away from bottom, pause auto-scroll.
+  //
+  // iter 1010+: also persist the scrollTop to chatStore.scrollPositions on
+  // every scroll (already rAF-throttled, so this is at most one update per
+  // frame). Sentinel -1 marks "at bottom" so the next session-switch back
+  // here auto-scrolls to bottom (showing any new content that streamed in).
+  // We save live instead of on session-switch because by the time React
+  // fires the cleanup of the chatKey effect, the DOM has already been
+  // committed to show the NEW chatKey — the OLD scrollTop is gone.
   const scrollRaf = useRef(0)
   const handleScroll = () => {
     cancelAnimationFrame(scrollRaf.current)
@@ -883,6 +911,9 @@ export function ChatPanel({ sessionId, sessionName }: { sessionId?: string; sess
       const isNearBottom = distanceFromBottom < 80
       userScrolledUpRef.current = !isNearBottom
       setShowScrollBtn(!isNearBottom)
+      if (chatKey) {
+        setScrollPosition(chatKey, isNearBottom ? -1 : el.scrollTop)
+      }
     })
   }
 

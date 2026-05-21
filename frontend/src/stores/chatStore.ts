@@ -68,6 +68,11 @@ interface ChatState {
   // while the user isn't currently viewing it. Cleared when the user switches
   // to that tab. Drives the amber dot/count badge on inactive session tabs.
   unread: Record<string, number>           // chatKey → unread turn count
+  // iter 1010+: scroll position per session so flipping tabs doesn't lose
+  // the user's reading position in a long chat. Saved on session switch,
+  // restored when returning. -1 sentinel means "user was at bottom, scroll
+  // to bottom on return so new content shows up".
+  scrollPositions: Record<string, number>  // chatKey → scrollTop, or -1 = at bottom
 }
 
 interface ChatStore extends ChatState {
@@ -101,6 +106,9 @@ interface ChatStore extends ChatState {
   // whose key starts with the given projectID prefix. Called when a project
   // is removed so its per-session state doesn't leak indefinitely.
   dropProject: (projectID: string) => void
+  // iter 1010+: persist the per-session scroll position so switching tabs
+  // and back doesn't reset reading position. Pass -1 to record "at bottom".
+  setScrollPosition: (chatKey: string, pos: number) => void
 }
 
 let counter = 0
@@ -118,6 +126,7 @@ export const useChatStore = create<ChatStore>((set) => ({
   askUser: {},
   activeSession: {},
   unread: {},
+  scrollPositions: {},
 
   bumpUnread: (chatKey) =>
     set((s) => ({
@@ -311,6 +320,10 @@ export const useChatStore = create<ChatStore>((set) => ({
       // with whatever was unread, no point keeping a stale count around.
       const nextUnread = { ...s.unread }
       delete nextUnread[projectId]
+      // iter 1010+: same for scroll position — after /clear the content is
+      // empty so any saved position is meaningless.
+      const nextScroll = { ...s.scrollPositions }
+      delete nextScroll[projectId]
       return {
         messages: { ...s.messages, [projectId]: [] },
         streaming: { ...s.streaming, [projectId]: '' },
@@ -322,6 +335,7 @@ export const useChatStore = create<ChatStore>((set) => ({
         drafts: { ...s.drafts, [projectId]: '' },
         sessionActive: { ...s.sessionActive, [projectId]: false },
         unread: nextUnread,
+        scrollPositions: nextScroll,
       }
     }),
 
@@ -339,6 +353,7 @@ export const useChatStore = create<ChatStore>((set) => ({
         lastTurnUsage: del(s.lastTurnUsage),
         askUser: del(s.askUser),
         unread: del(s.unread),
+        scrollPositions: del(s.scrollPositions),
       }
     }),
 
@@ -370,7 +385,13 @@ export const useChatStore = create<ChatStore>((set) => ({
         lastTurnUsage: drop(s.lastTurnUsage),
         askUser: drop(s.askUser),
         unread: drop(s.unread),
+        scrollPositions: drop(s.scrollPositions),
         activeSession: dropExact(s.activeSession),
       }
     }),
+
+  setScrollPosition: (chatKey, pos) =>
+    set((s) => ({
+      scrollPositions: { ...s.scrollPositions, [chatKey]: pos },
+    })),
 }))
