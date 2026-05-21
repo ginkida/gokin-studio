@@ -235,6 +235,25 @@ func IsRetryableAPIError(err error) bool {
 	return false
 }
 
+// RetryAfterFromError extracts the server-provided Retry-After duration from
+// an error chain. Returns 0 if no HTTPError with RetryAfter is present.
+// Callers that schedule their own retry can use this to honor the server's
+// hint instead of guessing (e.g. studio's sendWithRetry).
+//
+// The engine layer's own retry loop already honors this for in-loop retries,
+// but when the engine returns an error to a caller-level retry layer (studio),
+// the hint must be re-extracted from the error.
+func RetryAfterFromError(err error) time.Duration {
+	if err == nil {
+		return 0
+	}
+	var httpErr *HTTPError
+	if errors.As(err, &httpErr) && httpErr.RetryAfter > 0 {
+		return httpErr.RetryAfter
+	}
+	return 0
+}
+
 // IsRateLimitError returns true when the error indicates API rate limiting (429).
 func IsRateLimitError(err error) bool {
 	if err == nil {

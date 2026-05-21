@@ -1487,6 +1487,13 @@ func toolSetsForProvider(provider string) []tools.ToolSet {
 // (rate limit 429, server errors 5xx, network/timeout). notify, if non-nil,
 // is called before each retry so the UI can surface a warning banner.
 // initialDelay sets the first backoff (doubled each attempt: d, 2d, 4d…).
+//
+// iter 1020+: when the provider returns 429 with a Retry-After header, the
+// engine wraps it in HTTPError.RetryAfter. We extract that via
+// client.RetryAfterFromError and use it as the next delay if greater than
+// our exponential value. Capped at RetryAfterMaxDelay so a misbehaving
+// provider can't lock the UI for minutes — at that point the user is
+// better served by a clean failure they can act on.
 func sendWithRetry(
 	ctx context.Context,
 	notify func(attempt, max, delayMs int, reason string),
@@ -1515,21 +1522,41 @@ func sendWithRetry(
 			break
 		}
 
+		// Honor the server's Retry-After hint when it's longer than our own
+		// backoff. Capped so a hostile/misbehaving provider can't park the
+		// UI in a "retrying in 3600s" state — past the cap the user should
+		// be shown a failure they can manually retry.
+		next := delay
+		if hint := client.RetryAfterFromError(err); hint > 0 && hint > next {
+			if hint > RetryAfterMaxDelay {
+				hint = RetryAfterMaxDelay
+			}
+			next = hint
+		}
+
 		// Notify UI: retry pending. Frontend renders this as a transient warning.
 		if notify != nil {
-			notify(attempt, maxAttempts, int(delay/time.Millisecond), summarizeRetryReason(err))
+			notify(attempt, maxAttempts, int(next/time.Millisecond), summarizeRetryReason(err))
 		}
 
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(delay):
+		case <-time.After(next):
 		}
 		delay *= 2 // exponential backoff: d, 2d, 4d
 	}
 
 	return nil, fmt.Errorf("failed after %d attempts: %w", maxAttempts, lastErr)
 }
+
+// RetryAfterMaxDelay caps the Retry-After hint we'll wait for. A provider
+// telling us to wait 30 minutes (e.g. daily-quota-exceeded soft-rate-limit)
+// is better surfaced as a failure than as a hung UI — the user can /clear,
+// switch providers, or come back later. 30 seconds is the sweet spot: long
+// enough to ride out most genuine rate-limit windows, short enough to keep
+// the UX from feeling broken.
+const RetryAfterMaxDelay = 30 * time.Second
 
 // summarizeRetryReason maps an error to a short human-readable label.
 func summarizeRetryReason(err error) string {
