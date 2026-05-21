@@ -16,6 +16,7 @@ export interface ProjectInfo {
   thinkingMode?: string  // "" | "enabled" | "disabled"
   thinkingBudget?: number
   budgetUSD?: number
+  enforceBudget?: boolean
   pinned?: boolean
   contextWindow?: number
   pinnedContext?: string

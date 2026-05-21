@@ -9,7 +9,7 @@ import { useSettingsStore } from '../../stores/settingsStore'
 import { DispatchModal } from '../dispatch/DispatchModal'
 import { FilePicker } from '../files/FilePicker'
 import { Send, Square, ChevronRight, CheckCircle, XCircle, Trash2, ArrowRightLeft, AlertTriangle, Brain, ExternalLink, ListChecks, Circle, Database, FileText, Download, Search, X, MessageSquare, Zap, Bot, User, Terminal, TerminalSquare, Pencil, Eye, EyeOff, GitBranch, FolderSearch, Loader2, Copy, Check, MoreHorizontal, RotateCcw, FolderTree, Pin, GitFork, Bookmark, BookmarkPlus, BookmarkMinus, Activity, DollarSign } from 'lucide-react'
-import { SendMessage, StopGeneration, ClearHistory, GetHistory, SetProjectSystemPrompt, ExportChat, ListDirectory, EditUserMessage, ReadFileContent, GetRecoveryEvents, DiscardRecoveryEvents, AnswerQuestion, CancelQuestion, ListProjectMemory, DeleteMemoryEntry, ClearPinnedContext, SearchProjectHistory, SaveDraft, GetDraft, ForkChatSession, PinMessage, UnpinMessage, ListPinnedMessages, ListPromptTemplates, SaveUserPromptTemplate, DeleteUserPromptTemplate, ListUserPromptTemplates, GetProjectGitContext, ProjectUsageStats, ExportProjectAllSessions, SummarizeSession, SetProjectBudget, SetProjectProvider, GetProject, ListUserSnippets, ListChatSessions, DeleteChatSession, ListProjectFiles, ExportSessionJSON, ImportSessionJSON, ExportProjectUsageCSV } from '../../../wailsjs/go/studio/Studio'
+import { SendMessage, StopGeneration, ClearHistory, GetHistory, SetProjectSystemPrompt, ExportChat, ListDirectory, EditUserMessage, ReadFileContent, GetRecoveryEvents, DiscardRecoveryEvents, AnswerQuestion, CancelQuestion, ListProjectMemory, DeleteMemoryEntry, ClearPinnedContext, SearchProjectHistory, SaveDraft, GetDraft, ForkChatSession, PinMessage, UnpinMessage, ListPinnedMessages, ListPromptTemplates, SaveUserPromptTemplate, DeleteUserPromptTemplate, ListUserPromptTemplates, GetProjectGitContext, ProjectUsageStats, ExportProjectAllSessions, SummarizeSession, SetProjectBudget, SetProjectEnforceBudget, SetProjectProvider, GetProject, ListUserSnippets, ListChatSessions, DeleteChatSession, ListProjectFiles, ExportSessionJSON, ImportSessionJSON, ExportProjectUsageCSV } from '../../../wailsjs/go/studio/Studio'
 import { ClipboardSetText, EventsOn } from '../../../wailsjs/runtime/runtime'
 import { isProjectMuted } from '../../lib/mutedProjects'
 
@@ -91,6 +91,9 @@ export function ChatPanel({ sessionId, sessionName }: { sessionId?: string; sess
   const [budgetDraft, setBudgetDraft] = useState('')
   const [budgetError, setBudgetError] = useState<string | null>(null)
   const [budgetSaving, setBudgetSaving] = useState(false)
+  // iter 1040+: strict-mode toggle. When on AND budget > 0, the backend
+  // blocks new SendMessage calls once cumulative cost reaches the budget.
+  const [budgetEnforceDraft, setBudgetEnforceDraft] = useState(false)
   // Conversation summary modal: triggers an LLM call against the current
   // session's history and shows a 3-5 bullet TL;DR. Useful for long
   // sessions or handoff between contexts. Costs tokens, so the modal
@@ -1140,6 +1143,7 @@ export function ChatPanel({ sessionId, sessionName }: { sessionId?: string; sess
       case '/memory': openMemoryViewer(); break
       case '/budget':
         setBudgetDraft(activeProject?.budgetUSD ? String(activeProject.budgetUSD) : '')
+        setBudgetEnforceDraft(!!activeProject?.enforceBudget)
         setBudgetError(null)
         setShowBudget(true)
         break
@@ -1703,6 +1707,7 @@ export function ChatPanel({ sessionId, sessionName }: { sessionId?: string; sess
                 }
                 onClick={() => {
                   setBudgetDraft(String(budget))
+                  setBudgetEnforceDraft(!!activeProject?.enforceBudget)
                   setBudgetError(null)
                   setShowBudget(true)
                 }}
@@ -1844,6 +1849,7 @@ export function ChatPanel({ sessionId, sessionName }: { sessionId?: string; sess
                   </button>
                   <button onClick={() => {
                     setBudgetDraft(activeProject.budgetUSD ? String(activeProject.budgetUSD) : '')
+                    setBudgetEnforceDraft(!!activeProject.enforceBudget)
                     setBudgetError(null)
                     setShowBudget(true)
                     setShowMenu(false)
@@ -2354,6 +2360,23 @@ export function ChatPanel({ sessionId, sessionName }: { sessionId?: string; sess
                   }}
                 />
               </div>
+              {/* iter 1040+: strict mode toggle. Disabled when the budget is
+                  empty (clearing the cap also implicitly turns enforcement
+                  off — saved as false to match). */}
+              <label className="budget-enforce-row">
+                <input
+                  type="checkbox"
+                  checked={budgetEnforceDraft}
+                  onChange={(e) => { setBudgetEnforceDraft(e.target.checked); setBudgetError(null) }}
+                  disabled={!budgetDraft.trim() || parseFloat(budgetDraft) <= 0}
+                />
+                <span className="budget-enforce-label">
+                  <span>Strict mode</span>
+                  <span className="budget-enforce-hint">
+                    Block new turns once the budget is reached. Without this, exceeding the budget only triggers warning toasts.
+                  </span>
+                </span>
+              </label>
               {budgetError && <div className="budget-error"><AlertTriangle size={12} /> {budgetError}</div>}
             </div>
             <div className="budget-actions">
@@ -2383,7 +2406,17 @@ export function ChatPanel({ sessionId, sessionName }: { sessionId?: string; sess
                   setBudgetSaving(true)
                   try {
                     await SetProjectBudget(activeProjectId, value)
-                    useProjectStore.getState().updateProject(activeProjectId, { budgetUSD: value })
+                    // iter 1040+: persist strict-mode alongside the budget.
+                    // Clearing the cap (value=0) also implicitly clears
+                    // strict mode — a no-budget project has nothing to
+                    // enforce, and leaving the flag on creates confusing
+                    // semantics ("enforced but unbounded").
+                    const enforce = value > 0 && budgetEnforceDraft
+                    await SetProjectEnforceBudget(activeProjectId, enforce)
+                    useProjectStore.getState().updateProject(activeProjectId, {
+                      budgetUSD: value,
+                      enforceBudget: enforce,
+                    })
                     setShowBudget(false)
                     setBudgetError(null)
                   } catch (err: any) {
@@ -2941,6 +2974,7 @@ export function ChatPanel({ sessionId, sessionName }: { sessionId?: string; sess
                           className="usage-stats-budget-edit"
                           onClick={() => {
                             setBudgetDraft(String(budget))
+                            setBudgetEnforceDraft(!!activeProject?.enforceBudget)
                             setBudgetError(null)
                             setShowBudget(true)
                           }}

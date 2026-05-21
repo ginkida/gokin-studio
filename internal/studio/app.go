@@ -384,6 +384,28 @@ func (s *Studio) SetProjectBudget(id string, budgetUSD float64) error {
 	return nil
 }
 
+// SetProjectEnforceBudget toggles the iter 1040+ strict budget enforcement
+// flag. When enabled AND BudgetUSD > 0, SendMessage blocks new turns once
+// cumulative cost meets/exceeds the budget. Off (the default) keeps the
+// historical behavior: only warning toasts fire at 80%/100%.
+//
+// Setting to true does NOT retroactively stop an already-active turn —
+// only future SendMessage calls. To stop an active runaway, use the
+// frontend's Stop button OR set the budget to 0 first.
+func (s *Studio) SetProjectEnforceBudget(id string, enforce bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.projects[id]
+	if !ok {
+		return fmt.Errorf("project not found: %s", id)
+	}
+	p.mu.Lock()
+	p.EnforceBudget = enforce
+	p.mu.Unlock()
+	s.saveConfig()
+	return nil
+}
+
 // SetProjectPinned anchors a project to the top of the sidebar (or unanchors
 // it). Pinned projects keep their lastUsedAt-desc order among themselves; the
 // rest follow with the same rule. Survives restart via saveConfig.

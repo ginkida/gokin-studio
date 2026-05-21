@@ -34,6 +34,10 @@ type Project struct {
 	ThinkingMode   string // "" = auto, "enabled", "disabled"
 	ThinkingBudget int32  // 0 = use default (4096) when enabled
 	BudgetUSD      float64 // 0 = no budget set; otherwise per-month spend cap in USD
+	// EnforceBudget, when true, blocks new SendMessage calls once cumulative
+	// cost (cached, seeded from ProjectUsageStats on first need, bumped on
+	// chat:complete) reaches BudgetUSD. Requires BudgetUSD > 0 to take effect.
+	EnforceBudget  bool
 	Pinned         bool   // true = anchor to top of sidebar regardless of LastUsedAt
 
 	// testEmitter, when non-nil, replaces wailsRuntime.EventsEmit so unit tests
@@ -67,6 +71,17 @@ type Project struct {
 	// so it survives history compaction. Protected by mu.
 	pinnedContext string
 
+	// iter 1040+: cached cumulative cost across every session in this project,
+	// in USD. Seeded LAZILY on first need (via ProjectUsageStats which walks
+	// every session JSON file — O(N) but happens once), then bumped O(1) on
+	// each chat:complete. Used by the strict budget enforcement path so the
+	// pre-flight check in SendMessage doesn't pay the cost of a full disk
+	// walk on every send. Protected by costMu (not mu) so the SendMessage
+	// pre-flight doesn't contend with the long-running mu read locks.
+	cachedTotalCostUSD float64
+	costSeeded         bool
+	costMu             sync.Mutex
+
 	mu sync.RWMutex
 }
 
@@ -87,6 +102,7 @@ type ProjectInfo struct {
 	ThinkingMode   string  `json:"thinkingMode,omitempty"`
 	ThinkingBudget int32   `json:"thinkingBudget,omitempty"`
 	BudgetUSD      float64 `json:"budgetUSD,omitempty"`
+	EnforceBudget  bool    `json:"enforceBudget,omitempty"`
 	Pinned         bool    `json:"pinned,omitempty"`
 	ContextWindow  int     `json:"contextWindow"`
 	PinnedContext  string  `json:"pinnedContext,omitempty"`
@@ -115,6 +131,7 @@ func NewProject(pc ProjectConfig) *Project {
 		ThinkingMode:   pc.ThinkingMode,
 		ThinkingBudget: pc.ThinkingBudget,
 		BudgetUSD:      pc.BudgetUSD,
+		EnforceBudget:  pc.EnforceBudget,
 		Pinned:         pc.Pinned,
 		lastUsedAt:     pc.LastUsedAt,
 		sessions:       make(map[string]*ChatSession),
@@ -251,6 +268,7 @@ func (p *Project) Info() *ProjectInfo {
 		ThinkingMode:   p.ThinkingMode,
 		ThinkingBudget: p.ThinkingBudget,
 		BudgetUSD:      p.BudgetUSD,
+		EnforceBudget:  p.EnforceBudget,
 		Pinned:         p.Pinned,
 		GitBranch:      branch,
 		ContextWindow:  contextWindowForProvider(p.Provider, p.Model),
@@ -603,6 +621,31 @@ func (p *Project) SendMessage(wailsCtx context.Context, message string, settings
 			ProjectID: p.ID, SessionID: sid, Text: "session not found: " + sid,
 		})
 		return
+	}
+	// iter 1040+: strict budget enforcement. Opt-in via Project.EnforceBudget.
+	// Pre-flight check refuses new turns once cumulative cost across every
+	// session in this project meets/exceeds BudgetUSD. The cache is seeded
+	// lazily from ProjectUsageStats on first need (O(N sessions), happens
+	// once per app run) and bumped at chat:complete (O(1)). This catches
+	// the AFK-during-long-agent-run case: warning toasts (iter 610+) help
+	// when the user is watching, but a hard block is the only thing that
+	// stops a runaway during sleep.
+	p.mu.RLock()
+	enforce := p.EnforceBudget
+	budget := p.BudgetUSD
+	p.mu.RUnlock()
+	if enforce && budget > 0 {
+		spent := p.totalCostUSD()
+		if spent >= budget {
+			p.emitEvent(wailsCtx, EventChatError, ChatTextEvent{
+				ProjectID: p.ID,
+				SessionID: sid,
+				Text: fmt.Sprintf(
+					"Budget reached: spent $%.4f of $%.2f limit. Raise the budget in the project's budget editor, disable strict enforcement, or reset usage to continue.",
+					spent, budget),
+			})
+			return
+		}
 	}
 	if err := p.initClient(settings); err != nil {
 		p.emitEvent(wailsCtx, EventChatError, ChatTextEvent{
@@ -1094,6 +1137,12 @@ outer:
 	// per-token, not per-round. The frontend gets this as a $-figure so it
 	// doesn't have to duplicate the pricing table in TS.
 	estCost := EstimateCost(completedProvider, completedModel, totalInputTokens, totalOutputTokens, totalCacheRead, totalCacheWrite)
+	// iter 1040+: keep the cached running total in sync so the next
+	// SendMessage's pre-flight budget check is O(1). seedTotalCostUSD does
+	// the expensive disk walk only on first need; subsequent turns just
+	// add this turn's cost. Safe to call unconditionally — short-circuits
+	// when costSeeded is true.
+	p.bumpTotalCostUSD(estCost)
 	p.emitEvent(wailsCtx, EventChatComplete, ChatCompleteEvent{
 		ProjectID:            p.ID,
 		SessionID:            sid,
@@ -1235,6 +1284,53 @@ func (p *Project) pruneAbandonedEmptySessions() {
 	}
 }
 
+// totalCostUSD returns the cached cumulative cost across every session in
+// this project. iter 1040+: seeded lazily from ProjectUsageStats on first
+// need so cold starts pay the O(N sessions) disk walk only once; subsequent
+// calls are O(1). Used by SendMessage's strict-budget pre-flight check.
+//
+// Returns 0 if the studio back-reference is missing (test paths that
+// construct Project directly without wiring a *Studio) or if the underlying
+// stats call fails — in either case the budget check effectively no-ops,
+// which matches the documented opt-in semantics.
+func (p *Project) totalCostUSD() float64 {
+	p.costMu.Lock()
+	defer p.costMu.Unlock()
+	if !p.costSeeded {
+		if p.studio != nil {
+			stats, err := p.studio.ProjectUsageStats(p.ID)
+			if err == nil && stats != nil {
+				p.cachedTotalCostUSD = stats.TotalCostUSD
+			}
+		}
+		p.costSeeded = true
+	}
+	return p.cachedTotalCostUSD
+}
+
+// bumpTotalCostUSD adds delta to the cached total. Called from the
+// chat:complete path with the per-turn cost. Seeds the cache from disk on
+// first call so the initial bump combines disk-state plus this turn — a
+// rare but real scenario when the user adds a budget mid-session after
+// already accumulating cost.
+func (p *Project) bumpTotalCostUSD(delta float64) {
+	if delta <= 0 {
+		return
+	}
+	p.costMu.Lock()
+	defer p.costMu.Unlock()
+	if !p.costSeeded {
+		if p.studio != nil {
+			stats, err := p.studio.ProjectUsageStats(p.ID)
+			if err == nil && stats != nil {
+				p.cachedTotalCostUSD = stats.TotalCostUSD
+			}
+		}
+		p.costSeeded = true
+	}
+	p.cachedTotalCostUSD += delta
+}
+
 // ToConfig converts to persistable config.
 //
 // iter 980+: takes p.mu.RLock() internally because all callers (saveConfig,
@@ -1263,6 +1359,7 @@ func (p *Project) ToConfig() ProjectConfig {
 		ThinkingMode:   p.ThinkingMode,
 		ThinkingBudget: p.ThinkingBudget,
 		BudgetUSD:      p.BudgetUSD,
+		EnforceBudget:  p.EnforceBudget,
 		Pinned:         p.Pinned,
 		LastUsedAt:     p.lastUsedAt,
 	}

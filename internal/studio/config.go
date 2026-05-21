@@ -33,6 +33,13 @@ type ProjectConfig struct {
 	// progress vs. accumulated session usage and warn at 80%/100%. 0 = no
 	// budget set (no warnings). Capped at $100,000 to defend against typos.
 	BudgetUSD float64 `yaml:"budget_usd,omitempty" json:"budgetUSD,omitempty"`
+	// EnforceBudget, when true, hard-stops new agent turns once cumulative
+	// cost reaches BudgetUSD. Without this flag, exceeding the budget only
+	// triggers warning toasts (iter 610+) — a user who walked away during a
+	// long agent run could still burn far past the cap. With it, SendMessage
+	// returns a chat:error and the run is aborted. Opt-in (default false) so
+	// existing users aren't surprised by sudden blocks. Requires BudgetUSD > 0.
+	EnforceBudget bool `yaml:"enforce_budget,omitempty" json:"enforceBudget,omitempty"`
 	// Pinned, when true, anchors this project to the top of the sidebar
 	// regardless of LastUsedAt. Useful when a primary project keeps drifting
 	// down as the user briefly touches sibling projects. Pinned projects sort
