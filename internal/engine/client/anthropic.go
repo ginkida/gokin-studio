@@ -975,9 +975,15 @@ func (c *AnthropicClient) doStreamRequest(ctx context.Context, requestBody map[s
 
 				case <-idleTimer.C:
 					logging.Warn("stream idle timeout exceeded", "timeout", streamIdleTimeout, "partial", contentReceived)
-					chunks <- ResponseChunk{
+					// ctx-guarded: if the consumer already returned on cancel and
+					// the buffered channel is full, a bare send would block this
+					// producer goroutine forever (its deferred close never runs).
+					select {
+					case chunks <- ResponseChunk{
 						Error: &ErrStreamIdleTimeout{Timeout: streamIdleTimeout, Partial: contentReceived},
 						Done:  true,
+					}:
+					case <-ctx.Done():
 					}
 					return
 
@@ -1012,7 +1018,12 @@ func (c *AnthropicClient) doStreamRequest(ctx context.Context, requestBody map[s
 					if !result.ok {
 						if result.err != nil {
 							logging.Warn("SSE scanner error", "error", result.err)
-							chunks <- ResponseChunk{Error: result.err, Done: true}
+							// ctx-guarded so a full buffer + gone consumer on cancel
+							// can't strand this producer goroutine.
+							select {
+							case chunks <- ResponseChunk{Error: result.err, Done: true}:
+							case <-ctx.Done():
+							}
 						}
 						break scanLoop
 					}
@@ -1045,11 +1056,17 @@ func (c *AnthropicClient) doStreamRequest(ctx context.Context, requestBody map[s
 
 					// Skip "[DONE]" marker
 					if data == "[DONE]" {
-						// Send any accumulated tool calls before marking done
+						// Send any accumulated tool calls before marking done.
+						// ctx-guarded (matching the else branch) so a cancel with a
+						// full buffer can't strand this producer goroutine.
 						if len(accumulator.completedCalls) > 0 {
-							chunks <- ResponseChunk{
+							select {
+							case chunks <- ResponseChunk{
 								FunctionCalls: accumulator.completedCalls,
 								Done:          true,
+							}:
+							case <-ctx.Done():
+								return
 							}
 						} else {
 							select {
@@ -1081,9 +1098,14 @@ func (c *AnthropicClient) doStreamRequest(ctx context.Context, requestBody map[s
 						errCode := stringFromMap(errObj, "code")
 						errMsg := stringFromMap(errObj, "message")
 						logging.Error("Z.AI API error", "code", errCode, "message", errMsg)
-						chunks <- ResponseChunk{
+						// ctx-guarded so a full buffer + gone consumer on cancel
+						// can't strand this producer goroutine.
+						select {
+						case chunks <- ResponseChunk{
 							Error: fmt.Errorf("API error (%s): %s", errCode, errMsg),
 							Done:  true,
+						}:
+						case <-ctx.Done():
 						}
 						return
 					}
@@ -1314,12 +1336,21 @@ func (c *AnthropicClient) processStreamEvent(event map[string]interface{}, acc *
 				case "max_tokens":
 					chunk.FinishReason = genai.FinishReasonMaxTokens
 				case "tool_use":
-					// Include accumulated tool calls in the final chunk
-					if len(acc.completedCalls) > 0 {
-						chunk.FunctionCalls = acc.completedCalls
-						acc.callsEmitted = true
-					}
 					chunk.FinishReason = genai.FinishReasonStop
+				}
+				// Attach accumulated tool calls for ANY terminating stop_reason,
+				// not just "tool_use". Anthropic-compatible shims (GLM/MiniMax/
+				// Kimi/DeepSeek) sometimes stream tool_use content blocks while
+				// reporting stop_reason "end_turn"/"stop". Since the SSE loop
+				// returns on the first Done chunk, the message_stop fallback
+				// below is unreachable for a compliant stream — so without this
+				// the tool calls would be silently dropped and the agent would
+				// stop mid-task with no error. acc.callsEmitted + message_stop's
+				// !callsEmitted guard keep this idempotent (no duplicate
+				// tool_use blocks, which MiniMax rejects with 400).
+				if len(acc.completedCalls) > 0 && !acc.callsEmitted {
+					chunk.FunctionCalls = acc.completedCalls
+					acc.callsEmitted = true
 				}
 			}
 		}

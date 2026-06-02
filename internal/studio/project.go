@@ -467,6 +467,21 @@ func summarizeEventForLog(data any) string {
 }
 
 // initClient creates the LLM client for this project.
+// resetClientLocked closes the current per-project client (releasing its idle
+// HTTP connections) and clears it so the next SendMessage rebuilds it with the
+// new config. Caller MUST hold p.mu. With NewClientNoPool each project owns its
+// client instance and there's no shared pool to clean it up, so invalidation
+// has to close it explicitly. Close() only touches the client's own transport
+// (CloseIdleConnections / nil-out), so it's safe under p.mu, and an in-flight
+// turn keeps its own snapshotted client reference (idle-conn close leaves an
+// active streaming request alone).
+func (p *Project) resetClientLocked() {
+	if p.client != nil {
+		_ = p.client.Close()
+		p.client = nil
+	}
+}
+
 func (p *Project) initClient(settings Settings) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -532,7 +547,14 @@ func (p *Project) initClient(settings Settings) error {
 		}
 	}
 
-	c, err := client.NewClient(context.Background(), cfg, model)
+	// NewClientNoPool (not NewClient): each project owns a dedicated client
+	// instance. The shared connection pool is keyed only by provider:model, so
+	// two projects on the same model would otherwise alias to ONE client and
+	// clobber each other's system prompt / pinned context (project B's
+	// SetSystemInstruction overwriting project A's). Studio caches p.client per
+	// project and rebuilds it on settings/provider changes, so it never needs
+	// the pool.
+	c, err := client.NewClientNoPool(context.Background(), cfg, model)
 	if err != nil {
 		return fmt.Errorf("init client (%s/%s): %w", provider, model, err)
 	}
@@ -663,22 +685,8 @@ func (p *Project) SendMessage(wailsCtx context.Context, message string, settings
 		return
 	}
 	session.active = true
-	session.lastUsedAt = time.Now().UnixMilli()
-	p.mu.Lock()
-	p.lastUsedAt = session.lastUsedAt
-	p.mu.Unlock()
-	// Persist the bump so sidebar ordering survives restarts. Uses the async
-	// variant because we don't hold s.mu here; saveConfig (the sync variant)
-	// is only safe under s.mu, and using it here risks double-lock deadlock.
-	//
-	// iter 980+: was a bare `go p.studio.saveConfigAsync()` — most reachable
-	// goroutine launch in the app (every agent turn), so a panic here (yaml
-	// edge case, full disk causing os.WriteFile to behave oddly) had the
-	// highest blast radius. safeGoFn surfaces the panic in the event log
-	// instead of crashing.
-	if p.studio != nil {
-		safeGoFn("save-config-on-turn", p.studio.LogEvent, p.studio.saveConfigAsync)
-	}
+	now := time.Now().UnixMilli()
+	session.lastUsedAt = now
 	// 30-minute hard ceiling for an entire agent run. Long tasks (refactors,
 	// large explorations) can legitimately take this long. User can always
 	// stop manually via the chat header.
@@ -688,18 +696,40 @@ func (p *Project) SendMessage(wailsCtx context.Context, message string, settings
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), turnTimeout)
 	session.cancelFn = cancel
-	// iter 985+: snapshot p.Name alongside the other mutable fields under a
-	// single RLock so the post-lock defaultSystemPrompt() call below doesn't
-	// race with RenameProject. Previously p.Name was read outside the lock,
-	// which produced torn reads under -race.
-	p.mu.RLock()
+	session.mu.Unlock()
+
+	// Snapshot project state + bump the project's lastUsedAt under p.mu.
+	// CRITICAL: this runs OUTSIDE the session.mu section above. Readers like
+	// ListChatSessions / Info() / CreateChatSession lock p.mu THEN session.mu,
+	// so taking p.mu while holding session.mu here would be a lock-order
+	// inversion (a latent AB-BA deadlock against any of those readers).
+	// Acquiring the two locks separately keeps one global p.mu→session.mu
+	// order everywhere.
+	//
+	// iter 985+: p.Name is snapshotted here too so the post-lock
+	// defaultSystemPrompt() call below doesn't race with RenameProject.
+	p.mu.Lock()
+	p.lastUsedAt = now
 	c := p.client
 	reg := p.registry
 	pinnedCtx := p.pinnedContext
 	sysPr := p.SystemPrompt
 	pName := p.Name
-	p.mu.RUnlock()
-	session.mu.Unlock()
+	p.mu.Unlock()
+
+	// Persist the lastUsedAt bump so sidebar ordering survives restarts. Uses
+	// the async variant because we don't hold s.mu here; saveConfig (the sync
+	// variant) is only safe under s.mu, and using it here risks double-lock
+	// deadlock.
+	//
+	// iter 980+: was a bare `go p.studio.saveConfigAsync()` — most reachable
+	// goroutine launch in the app (every agent turn), so a panic here (yaml
+	// edge case, full disk causing os.WriteFile to behave oddly) had the
+	// highest blast radius. safeGoFn surfaces the panic in the event log
+	// instead of crashing.
+	if p.studio != nil {
+		safeGoFn("save-config-on-turn", p.studio.LogEvent, p.studio.saveConfigAsync)
+	}
 
 	// If the agent has previously pinned context via the pin_context tool,
 	// incorporate it into the system instruction for this run so it survives
@@ -800,11 +830,17 @@ func (p *Project) SendMessage(wailsCtx context.Context, message string, settings
 	var totalInputTokens, totalOutputTokens, totalCacheRead, totalCacheWrite int
 	var lastInputTokens, lastOutputTokens, lastCacheRead, lastCacheWrite int
 
+	// streamEmitted tracks whether the CURRENT stream attempt pushed any
+	// user-visible content (text/thinking) to the frontend. sendAndStream reads
+	// it to decide whether a mid-stream failure can be retried safely — only
+	// when nothing was shown yet, so a retry can't duplicate output.
+	var streamEmitted bool
 	// streamAndProcess streams an LLM response, emitting text deltas to the
 	// frontend in real time, and returns the fully accumulated response.
 	streamAndProcess := func(sr *client.StreamingResponse) (*client.Response, error) {
 		return client.ProcessStream(ctx, sr, &client.StreamHandler{
 			OnText: func(text string) {
+				streamEmitted = true
 				p.emitEvent(wailsCtx, EventChatDelta, ChatTextEvent{
 					ProjectID: p.ID, SessionID: sid, Text: text,
 				})
@@ -813,19 +849,17 @@ func (p *Project) SendMessage(wailsCtx context.Context, message string, settings
 				// Stream reasoning deltas so the user sees the model think in
 				// real time. The accumulated thinking is also persisted at
 				// end-of-turn via recordResponse (for replay + history).
+				streamEmitted = true
 				p.emitEvent(wailsCtx, EventChatThinkingDelta, ChatTextEvent{
 					ProjectID: p.ID, SessionID: sid, Text: text,
 				})
 			},
-			OnError: func(err error) {
-				if ctx.Err() == nil {
-					// Humanize the error (401/429/context length → friendlier
-					// guidance) the same way the post-send retry path does.
-					p.emitEvent(wailsCtx, EventChatError, ChatTextEvent{
-						ProjectID: p.ID, SessionID: sid, Text: humanizeAPIError(err),
-					})
-				}
-			},
+			// NOTE: the hard chat:error emit is NOT here anymore — it lives at
+			// the call site (via sendAndStream). OnError fires synchronously
+			// mid-stream, before we know whether the error is retryable with
+			// nothing emitted (in which case we retry silently rather than flash
+			// a scary error that then recovers). ProcessStream still returns the
+			// error, so no information is lost.
 		})
 	}
 
@@ -899,6 +933,49 @@ func (p *Project) SendMessage(wailsCtx context.Context, message string, settings
 		}
 	}
 
+	// sendAndStream issues one LLM request and consumes its stream as a single
+	// retryable unit. sendWithRetry alone only covers the pre-stream call, which
+	// returns at the 200 OK BEFORE any token streams; a transient failure that
+	// lands mid-stream (dropped connection, idle timeout) would otherwise abort
+	// the entire turn with no retry — losing a multi-minute refactor on one
+	// blip. Here we retry the whole request when the failure is transient AND
+	// nothing was streamed to the UI yet, so a retry cannot duplicate output or
+	// corrupt history (recordResponse runs only on the returned success). If
+	// content was already shown, the error isn't retryable, or ctx is cancelled,
+	// the error is returned for the caller to surface as a hard chat:error.
+	sendAndStream := func(mkSend func() (*client.StreamingResponse, error)) (*client.Response, error) {
+		const maxStreamAttempts = 3
+		delay := retryDelay
+		for attempt := 1; ; attempt++ {
+			resp, err := sendWithRetry(ctx, notifyRetry, retryDelay, mkSend)
+			if err != nil {
+				return nil, err
+			}
+			if resp == nil {
+				return nil, nil
+			}
+			streamEmitted = false
+			collected, serr := streamAndProcess(resp)
+			if serr == nil {
+				return collected, nil
+			}
+			if ctx.Err() != nil {
+				return nil, serr
+			}
+			if attempt < maxStreamAttempts && !streamEmitted && client.IsRetryableError(serr) {
+				notifyRetry(attempt, maxStreamAttempts, int(delay/time.Millisecond), summarizeRetryReason(serr))
+				select {
+				case <-time.After(delay):
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+				delay *= 2
+				continue
+			}
+			return nil, serr
+		}
+	}
+
 	// Agent loop: send -> stream -> if tool calls: execute -> send results -> repeat.
 	// The outer loop handles retries / multi-message sessions (turns cap = 50).
 	// The inner tool loop keeps executing tool-call rounds without re-entering
@@ -925,7 +1002,7 @@ outer:
 		maxCtx := contextWindowForProvider(provider, model)
 		historySnapshot = compactHistory(historySnapshot, maxCtx)
 
-		resp, err := sendWithRetry(ctx, notifyRetry, retryDelay, func() (*client.StreamingResponse, error) {
+		collected, err := sendAndStream(func() (*client.StreamingResponse, error) {
 			return c.SendMessageWithHistory(ctx, historySnapshot, "")
 		})
 		if err != nil {
@@ -937,16 +1014,7 @@ outer:
 			})
 			break
 		}
-		if resp == nil {
-			break
-		}
-
-		collected, err := streamAndProcess(resp)
-		if err != nil {
-			if ctx.Err() != nil {
-				break
-			}
-			// Error already emitted by OnError handler.
+		if collected == nil {
 			break
 		}
 
@@ -1062,7 +1130,7 @@ outer:
 				}
 			}
 
-			resp, err = sendWithRetry(ctx, notifyRetry, retryDelay, func() (*client.StreamingResponse, error) {
+			collected, err = sendAndStream(func() (*client.StreamingResponse, error) {
 				return c.SendFunctionResponse(ctx, historySnapshot, funcResponses)
 			})
 			if err != nil {
@@ -1074,27 +1142,24 @@ outer:
 				})
 				break outer
 			}
-			if resp == nil {
+			if collected == nil {
 				break outer
 			}
 
-			// Append function responses to history after the send succeeds, and before
+			// Append function responses to history AFTER the send+stream
+			// succeeds (and after any internal stream-retry), and before
 			// recordResponse, so history stays in causal order:
 			// [... model{tool_calls}, user{tool_results}, model{reply}].
+			// Appending only on success keeps a failed round from leaving an
+			// orphaned tool-results turn in history. SendFunctionResponse
+			// receives the responses via funcResponses (not from history), so
+			// the snapshot taken above already excludes them.
 			session.mu.Lock()
 			session.history = append(session.history, &genai.Content{
 				Role:  "user",
 				Parts: funcParts,
 			})
 			session.mu.Unlock()
-
-			collected, err = streamAndProcess(resp)
-			if err != nil {
-				if ctx.Err() != nil {
-					break outer
-				}
-				break outer
-			}
 
 			recordResponse(collected)
 		}
@@ -1137,12 +1202,15 @@ outer:
 	// per-token, not per-round. The frontend gets this as a $-figure so it
 	// doesn't have to duplicate the pricing table in TS.
 	estCost := EstimateCost(completedProvider, completedModel, totalInputTokens, totalOutputTokens, totalCacheRead, totalCacheWrite)
-	// iter 1040+: keep the cached running total in sync so the next
-	// SendMessage's pre-flight budget check is O(1). seedTotalCostUSD does
-	// the expensive disk walk only on first need; subsequent turns just
-	// add this turn's cost. Safe to call unconditionally — short-circuits
-	// when costSeeded is true.
-	p.bumpTotalCostUSD(estCost)
+	// A turn "persisted" its work when it finished normally OR hit the 30-minute
+	// deadline — BOTH produced legitimate output that belongs on disk. Only an
+	// explicit cancel (context.Canceled from user Stop, /clear, or session
+	// delete) skips persistence: /clear and DeleteChatSession own the on-disk
+	// state (a racing save here would resurrect a wiped chat), while a plain
+	// Stop stays recoverable via the preserved replay log below. The in-memory
+	// budget cache (bumpTotalCostUSD) is bumped in lockstep with the on-disk
+	// usage save inside the persist block, so the two never desync.
+	persisted := ctx.Err() != context.Canceled
 	p.emitEvent(wailsCtx, EventChatComplete, ChatCompleteEvent{
 		ProjectID:            p.ID,
 		SessionID:            sid,
@@ -1163,38 +1231,78 @@ outer:
 		PinnedContext:        currentPin,
 	})
 
-	// Turn finished cleanly — authoritative state is in history.json now,
-	// so the replay log is redundant and can be dropped.
-	replay.Complete()
+	// Drop the replay recovery log ONLY when we persisted to history.json
+	// (clean finish or 30-min deadline) — history is then the authoritative
+	// copy. On an explicit cancel, leave the log: the deferred replay.Close()
+	// preserves it so a plain user Stop stays recoverable on next load, and
+	// /clear / DeleteChatSession each call DiscardReplay so a wiped chat can't
+	// be resurrected from it.
+	if persisted {
+		replay.Complete()
+	}
 
 	p.emitEvent(wailsCtx, EventProjectStatus, map[string]any{
 		"id": p.ID, "sessionID": sid, "status": "idle", "gitBranch": p.gitBranch(),
 	})
 
-	// Bump per-session usage stats and persist them alongside history.
+	// Bump per-session usage stats and persist them alongside history — but
+	// ONLY when the turn persisted (normal finish or 30-min deadline). /clear
+	// (ClearHistory) and session delete (DeleteChatSession) cancel ctx via
+	// session.cancelFn and THEN wipe session.history + remove the history file;
+	// if the still-running agent goroutine saved here regardless, it would
+	// resurrect a just-cleared conversation or recreate a deleted session's
+	// ghost file (re-discovered by ListHistoryFilesForProject on next startup).
+	// On an explicit cancel those callers own the on-disk state, so we stay out.
+	//
+	// A 30-minute DeadlineExceeded, by contrast, produced real work — we MUST
+	// save it (the pre-iter-1070 code saved unconditionally; gating on Canceled
+	// preserves that for the timeout path while still ceding clear/delete).
+	//
 	// Counts are accumulated atomically under session.mu so concurrent
 	// SendMessage calls (different turns of the same session — shouldn't
 	// happen, but defensive) don't race on the running totals.
-	session.mu.Lock()
-	if session.usage == nil {
-		session.usage = &SessionUsage{}
+	if persisted {
+		var (
+			doSave         bool
+			usageSnapshot  SessionUsage
+			parentSnapshot string
+			histSnapshot   []*genai.Content
+			sessionName    string
+		)
+		session.mu.Lock()
+		// Re-check under the lock: a /clear can race in between the persisted
+		// check above and acquiring the lock, flipping ctx to Canceled (it
+		// cancels before wiping). If so, don't persist.
+		if ctx.Err() != context.Canceled {
+			if session.usage == nil {
+				session.usage = &SessionUsage{}
+			}
+			session.usage.TotalCostUSD += estCost
+			session.usage.TotalInputTokens += totalInputTokens
+			session.usage.TotalOutputTokens += totalOutputTokens
+			session.usage.TotalCacheTokens += totalCacheRead + totalCacheWrite
+			session.usage.TurnCount++
+			session.usage.LastTurnAt = time.Now().UnixMilli()
+			usageSnapshot = *session.usage // copy for the save
+			parentSnapshot = session.ParentID
+			histSnapshot = make([]*genai.Content, len(session.history))
+			copy(histSnapshot, session.history)
+			sessionName = session.Name
+			doSave = true
+		}
+		session.mu.Unlock()
+		if doSave {
+			// Use SaveHistoryWithUsage so the new totals are stamped onto disk
+			// (not preserved-from-previous-write, which would leave them stale
+			// for the very first turn of a session).
+			_ = SaveHistoryWithUsage(p.ID+"_"+sid, sessionName, parentSnapshot, &usageSnapshot, histSnapshot)
+			// Bump the in-memory budget cache in lockstep with the on-disk
+			// usage we just wrote, so strict-budget enforcement stays
+			// deterministic across restarts (the cache re-seeds from disk).
+			// bumpTotalCostUSD short-circuits when estCost <= 0.
+			p.bumpTotalCostUSD(estCost)
+		}
 	}
-	session.usage.TotalCostUSD += estCost
-	session.usage.TotalInputTokens += totalInputTokens
-	session.usage.TotalOutputTokens += totalOutputTokens
-	session.usage.TotalCacheTokens += totalCacheRead + totalCacheWrite
-	session.usage.TurnCount++
-	session.usage.LastTurnAt = time.Now().UnixMilli()
-	usageSnapshot := *session.usage // copy for the save
-	parentSnapshot := session.ParentID
-	histSnapshot := make([]*genai.Content, len(session.history))
-	copy(histSnapshot, session.history)
-	sessionName := session.Name
-	session.mu.Unlock()
-	// Use SaveHistoryWithUsage so the new totals are stamped onto disk
-	// (not preserved-from-previous-write, which would leave them stale
-	// for the very first turn of a session).
-	_ = SaveHistoryWithUsage(p.ID+"_"+sid, sessionName, parentSnapshot, &usageSnapshot, histSnapshot)
 }
 
 // Stop cancels an in-progress generation in all sessions.
@@ -1207,9 +1315,18 @@ func (p *Project) Stop() {
 	tm := p.taskManager
 	memStore := p.memoryStore
 	learning := p.projectLearning
+	cl := p.client
 	p.mu.RUnlock()
 	for _, s := range sessions {
 		s.Stop()
+	}
+	// Release the per-project client's idle HTTP connections on teardown.
+	// NewClientNoPool gives each project a dedicated instance with no shared
+	// pool to reap it; RemoveProject and Shutdown both call Stop, so this is
+	// the cleanup point. Closing only drops idle keep-alives, so any turn still
+	// finishing on its own snapshotted client reference is unaffected.
+	if cl != nil {
+		_ = cl.Close()
 	}
 	// Cancel every still-running background bash task. Without this, shell
 	// processes launched via bash(run_in_background=true) survive project

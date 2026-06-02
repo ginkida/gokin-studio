@@ -199,6 +199,19 @@ func (s *Studio) RemoveProject(id string) error {
 	}
 	removedName := p.Name
 	p.Stop()
+	// Close any terminals owned by this project so their PTY fd + child
+	// process + read-loop goroutine don't outlive the project. Without this,
+	// backend cleanup depended entirely on the frontend firing CloseTerminal
+	// on unmount, which can be missed (split view, lost termID reference).
+	// Mirrors Shutdown's terminal loop; t.Close() is idempotent. Safe under
+	// the held s.mu write lock — the read loop releases t.mu before taking
+	// s.mu, so there's no lock-order cycle.
+	for tid, t := range s.terminals {
+		if t.ProjectID == id {
+			delete(s.terminals, tid)
+			t.Close()
+		}
+	}
 	// Collect every session ID before we drop the project so we can clean up
 	// both the persisted history and any replay buffers on disk.
 	sessionIDs := make([]string, 0, len(p.sessions))
@@ -286,7 +299,7 @@ func (s *Studio) SetProjectProvider(id, provider, model string) error {
 	oldProv, oldModel, name := p.Provider, p.Model, p.Name
 	p.Provider = provider
 	p.Model = model
-	p.client = nil // force re-init
+	p.resetClientLocked() // close + clear so the next send re-inits
 	p.mu.Unlock()
 	s.saveConfig()
 	s.auditProjectProvider(name, oldProv, oldModel, provider, model)
@@ -304,7 +317,7 @@ func (s *Studio) SetProjectSystemPrompt(id, prompt string) error {
 	p.mu.Lock()
 	oldPrompt, name := p.SystemPrompt, p.Name
 	p.SystemPrompt = prompt
-	p.client = nil // force re-init to apply new prompt
+	p.resetClientLocked() // close + clear so the next send re-inits with the new prompt
 	p.mu.Unlock()
 	s.saveConfig()
 	s.auditProjectSystemPrompt(name, oldPrompt, prompt)
@@ -323,7 +336,7 @@ func (s *Studio) SetProjectModelParams(id string, temperature float32, maxTokens
 	oldTemp, oldMax, name := p.Temperature, p.MaxTokens, p.Name
 	p.Temperature = temperature
 	p.MaxTokens = maxTokens
-	p.client = nil // force re-init
+	p.resetClientLocked() // close + clear so the next send re-inits
 	p.mu.Unlock()
 	s.saveConfig()
 	s.auditProjectModelParams(name, oldTemp, temperature, oldMax, maxTokens)
@@ -350,7 +363,7 @@ func (s *Studio) SetProjectThinking(id, mode string, budget int32) error {
 	oldMode, oldBudget, name := p.ThinkingMode, p.ThinkingBudget, p.Name
 	p.ThinkingMode = mode
 	p.ThinkingBudget = budget
-	p.client = nil // force re-init
+	p.resetClientLocked() // close + clear so the next send re-inits
 	p.mu.Unlock()
 	s.saveConfig()
 	s.auditProjectThinking(name, oldMode, oldBudget, mode, budget)
@@ -460,10 +473,16 @@ func (s *Studio) CreateChatSession(projectID string) (*ChatSessionInfo, error) {
 
 	p.mu.Lock()
 	// Use max existing "Chat N" number + 1 so deletions don't create duplicates.
+	// sess.Name is read under sess.mu: the agent loop auto-renames a session on
+	// its first user turn under session.mu, so reading it under p.mu alone is a
+	// data race (and could corrupt the Sscanf parse on a torn string read).
 	maxNum := 0
 	for _, sess := range p.sessions {
+		sess.mu.RLock()
+		nm := sess.Name
+		sess.mu.RUnlock()
 		var n int
-		if _, err := fmt.Sscanf(sess.Name, "Chat %d", &n); err == nil && n > maxNum {
+		if _, err := fmt.Sscanf(nm, "Chat %d", &n); err == nil && n > maxNum {
 			maxNum = n
 		}
 	}
@@ -497,7 +516,11 @@ func (s *Studio) ListChatSessions(projectID string) ([]*ChatSessionInfo, error) 
 	// small (sessions per project rarely exceed dozens).
 	nameByID := make(map[string]string, len(p.sessions))
 	for sid, sess := range p.sessions {
+		// Name is owned by session.mu (the agent loop's first-turn auto-rename
+		// writes it under session.mu); read it there, not under p.mu alone.
+		sess.mu.RLock()
 		nameByID[sid] = sess.Name
+		sess.mu.RUnlock()
 	}
 	var result []*ChatSessionInfo
 	for _, sess := range p.sessions {
@@ -1149,12 +1172,14 @@ func (s *Studio) SearchProjectHistory(projectID, query string) ([]SearchHit, err
 	// taking each session's lock — avoids holding two locks at once.
 	p.mu.RLock()
 	type sessRef struct {
-		id, name string
-		sess     *ChatSession
+		id   string
+		sess *ChatSession
 	}
 	sessions := make([]sessRef, 0, len(p.sessions))
 	for sid, sess := range p.sessions {
-		sessions = append(sessions, sessRef{id: sid, name: sess.Name, sess: sess})
+		// Don't read sess.Name here under p.mu — it's owned by session.mu.
+		// Captured inside the per-session lock below instead.
+		sessions = append(sessions, sessRef{id: sid, sess: sess})
 	}
 	p.mu.RUnlock()
 
@@ -1167,6 +1192,7 @@ func (s *Studio) SearchProjectHistory(projectID, query string) ([]SearchHit, err
 
 	for _, ref := range sessions {
 		ref.sess.mu.RLock()
+		sessName := ref.sess.Name
 		filteredIdx := -1
 		count := 0
 		for _, c := range ref.sess.history {
@@ -1207,7 +1233,7 @@ func (s *Studio) SearchProjectHistory(projectID, query string) ([]SearchHit, err
 			}
 			hits = append(hits, SearchHit{
 				SessionID:   ref.id,
-				SessionName: ref.name,
+				SessionName: sessName,
 				MessageIdx:  filteredIdx,
 				Role:        role,
 				Snippet:     snippet,
@@ -1463,7 +1489,13 @@ func (s *Studio) ExportProjectAllSessions(projectID string) (string, error) {
 	}
 	refs := make([]sessRef, 0, len(p.sessions))
 	for _, sess := range p.sessions {
-		refs = append(refs, sessRef{sess: sess, lastUsedAt: sess.lastUsedAt})
+		// lastUsedAt is owned by session.mu (the agent loop bumps it under
+		// session.mu at the start of every turn); read it there, not under
+		// p.mu alone, to avoid a torn int64 read on 32-bit / a -race trip.
+		sess.mu.RLock()
+		lu := sess.lastUsedAt
+		sess.mu.RUnlock()
+		refs = append(refs, sessRef{sess: sess, lastUsedAt: lu})
 	}
 	p.mu.RUnlock()
 
@@ -1560,7 +1592,17 @@ func (s *Studio) OpenTerminal(projectID string) (string, error) {
 	}
 
 	termID := "term-" + uuid.New().String()[:8]
-	t, err := NewTerminal(s.ctx, p.Directory, projectID, termID)
+	// onExit drops the registry entry when the shell exits on its own so a
+	// long session of spawn/exit cycles doesn't accumulate dead *Terminal
+	// entries. The read loop has already reaped the child + closed the fd by
+	// the time this fires, so this only frees the (tiny) map slot. Deleting a
+	// missing key is a no-op, so the rare exit-before-insert case is benign.
+	onExit := func(id string) {
+		s.mu.Lock()
+		delete(s.terminals, id)
+		s.mu.Unlock()
+	}
+	t, err := newTerminalWithLogger(s.ctx, p.Directory, projectID, termID, s.LogEvent, onExit)
 	if err != nil {
 		return "", fmt.Errorf("open terminal: %w", err)
 	}
@@ -1807,7 +1849,7 @@ func (s *Studio) UpdateSettings(cfg StudioConfig) error {
 	s.config.Settings = cfg.Settings
 	for _, p := range s.projects {
 		p.mu.Lock()
-		p.client = nil
+		p.resetClientLocked() // close + clear so the next send re-inits with new settings
 		p.mu.Unlock()
 	}
 	if err := s.config.Save(); err != nil {
@@ -1830,7 +1872,7 @@ func (s *Studio) ApplyDefaultToProjects() error {
 		p.mu.Lock()
 		p.Provider = provider
 		p.Model = model
-		p.client = nil // force re-init with new provider
+		p.resetClientLocked() // close + clear so the next send re-inits with the new provider
 		p.mu.Unlock()
 	}
 

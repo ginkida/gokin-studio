@@ -4,7 +4,7 @@ import rehypeHighlight from 'rehype-highlight'
 import 'highlight.js/styles/github-dark-dimmed.min.css'
 import { useChatStore, ChatMessage, AskUserQuestion } from '../../stores/chatStore'
 import { TerminalPanel } from '../terminal/Terminal'
-import { useProjectStore } from '../../stores/projectStore'
+import { useProjectStore, type ProjectInfo } from '../../stores/projectStore'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { DispatchModal } from '../dispatch/DispatchModal'
 import { FilePicker } from '../files/FilePicker'
@@ -13,10 +13,54 @@ import { SendMessage, StopGeneration, ClearHistory, GetHistory, SetProjectSystem
 import { ClipboardSetText, EventsOn } from '../../../wailsjs/runtime/runtime'
 import { isProjectMuted } from '../../lib/mutedProjects'
 
+// ChatPanel is a thin wrapper: it renders the empty state when no project is
+// selected, and otherwise mounts ChatPanelBody. This split is REQUIRED for
+// Rules-of-Hooks correctness. ChatPanelBody declares ~14 hooks; a single
+// component must run the SAME number of hooks on every render of an instance.
+// Previously the no-project early return sat ABOVE those trailing hooks, so
+// deleting the last project (activeProjectId→null) or adding the first one
+// flipped the hook count on the same mounted instance → React error #310
+// ("rendered fewer/more hooks than during the previous render"), caught by the
+// ErrorBoundary as a full-app white screen. Keeping the project check in this
+// parent means ChatPanelBody only ever renders WITH a project, so its hook
+// list is constant. activeProject is passed as a guaranteed-defined prop so the
+// body never dereferences an undefined project.
 export function ChatPanel({ sessionId, sessionName }: { sessionId?: string; sessionName?: string }) {
-  const currentSessionId = sessionId || 'default'
   const activeProjectId = useProjectStore((s) => s.activeProjectId)
   const activeProject = useProjectStore((s) => s.projects.find((p) => p.id === s.activeProjectId))
+  if (!activeProjectId || !activeProject) {
+    return (
+      <div className="chat-panel">
+        <div className="chat-empty">
+          <MessageSquare size={32} style={{ opacity: 0.3, marginBottom: 8 }} />
+          <p>Select a project from the sidebar</p>
+          <p style={{ fontSize: 11, marginTop: 4 }}>or add a new one with the + button</p>
+        </div>
+      </div>
+    )
+  }
+  return (
+    <ChatPanelBody
+      sessionId={sessionId}
+      sessionName={sessionName}
+      activeProjectId={activeProjectId}
+      activeProject={activeProject}
+    />
+  )
+}
+
+function ChatPanelBody({
+  sessionId,
+  sessionName,
+  activeProjectId,
+  activeProject,
+}: {
+  sessionId?: string
+  sessionName?: string
+  activeProjectId: string
+  activeProject: ProjectInfo
+}) {
+  const currentSessionId = sessionId || 'default'
   const chatKey = activeProjectId ? activeProjectId + '_' + currentSessionId : ''
   const messages = useChatStore((s) => chatKey ? s.messages[chatKey] || [] : [])
   const streamingText = useChatStore((s) => chatKey ? s.streaming[chatKey] || '' : '')
@@ -944,17 +988,9 @@ export function ChatPanel({ sessionId, sessionName }: { sessionId?: string; sess
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
   }
 
-  if (!activeProjectId || !activeProject) {
-    return (
-      <div className="chat-panel">
-        <div className="chat-empty">
-          <MessageSquare size={32} style={{ opacity: 0.3, marginBottom: 8 }} />
-          <p>Select a project from the sidebar</p>
-          <p style={{ fontSize: 11, marginTop: 4 }}>or add a new one with the + button</p>
-        </div>
-      </div>
-    )
-  }
+  // activeProject is guaranteed non-null here (the ChatPanel wrapper gates this
+  // body on a selected project), so every hook below runs unconditionally and
+  // every activeProject access is type-safe.
 
   // Check if the provider's API key is configured
   const provider = activeProject.provider || 'glm'

@@ -24,13 +24,18 @@ type Terminal struct {
 
 // NewTerminal spawns a shell in projectDir and streams output via Wails events.
 func NewTerminal(wailsCtx context.Context, projectDir, projectID, termID string) (*Terminal, error) {
-	return newTerminalWithLogger(wailsCtx, projectDir, projectID, termID, nil)
+	return newTerminalWithLogger(wailsCtx, projectDir, projectID, termID, nil, nil)
 }
 
 // newTerminalWithLogger is the testable / panic-aware variant. logFn is used
 // to record PTY read-loop panics into the studio event log so users can see
-// them in Diagnostics. Pass nil when not wired (early bring-up, tests).
-func newTerminalWithLogger(wailsCtx context.Context, projectDir, projectID, termID string, logFn func(level, source, message string)) (*Terminal, error) {
+// them in Diagnostics. onExit, when non-nil, is invoked once the shell exits
+// on its own (user typed `exit`/Ctrl+D, or the shell crashed) so the owner
+// can drop its registry entry; the read loop also reaps the child + closes
+// the PTY fd before calling it, so the zombie process and file descriptor
+// don't leak while the terminal panel stays open. Pass nil for either when
+// not wired (early bring-up, tests).
+func newTerminalWithLogger(wailsCtx context.Context, projectDir, projectID, termID string, logFn func(level, source, message string), onExit func(termID string)) (*Terminal, error) {
 	shell := os.Getenv("SHELL")
 	if shell == "" {
 		shell = "/bin/bash"
@@ -65,11 +70,20 @@ func newTerminalWithLogger(wailsCtx context.Context, projectDir, projectID, term
 		for {
 			n, err := ptmx.Read(buf)
 			if err != nil {
-				// Check if this was a deliberate close
+				// Check if this was a deliberate close (Close() cancelled ctx
+				// and already reaped the child).
 				select {
 				case <-ctx.Done():
 					return
 				default:
+				}
+				// Shell exited on its own (exit / Ctrl+D / crash). Reap the
+				// child process and close the PTY fd here so we don't leak a
+				// zombie + descriptor while the panel stays open; Close() is
+				// idempotent, so a later CloseTerminal/Shutdown is a no-op.
+				t.Close()
+				if onExit != nil {
+					onExit(termID)
 				}
 				wailsRuntime.EventsEmit(wailsCtx, EventTerminalExit, map[string]any{
 					"id": termID,

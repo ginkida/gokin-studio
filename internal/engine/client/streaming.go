@@ -107,6 +107,14 @@ func ProcessStream(ctx context.Context, sr *StreamingResponse, handler *StreamHa
 			if chunk.CacheReadInputTokens > 0 {
 				resp.CacheReadInputTokens = chunk.CacheReadInputTokens
 			}
+			// Mirror Collect(): without this, cache-WRITE tokens are always
+			// dropped on the streaming path (the one studio uses), so cost
+			// estimation and strict budget enforcement undercount every
+			// caching-heavy turn. The SSE parser already emits this from
+			// usage.cache_creation_input_tokens.
+			if chunk.CacheCreationInputTokens > 0 {
+				resp.CacheCreationInputTokens = chunk.CacheCreationInputTokens
+			}
 			if chunk.RateLimit != nil {
 				resp.RateLimit = chunk.RateLimit
 				if handler.OnRateLimit != nil {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"google.golang.org/genai"
 )
@@ -15,13 +16,79 @@ func historyDir() string {
 	return filepath.Join(configDir(), "history")
 }
 
-// atomicWriteFile writes data to path atomically by writing to path+".tmp"
-// first, then renaming. Prevents a partial write from corrupting the file
-// if the process crashes mid-write or the disk fills up. Used by config and
-// history saves where a corrupt file means lost user state.
+// historyFileLocks serializes the read-modify-write / write / delete of a
+// given session's history file, keyed by file path. Without it, a rename or
+// edit landing concurrently with an agent turn's save can interleave their
+// load-modify-write cycles: the slower writer reads stale metadata (losing the
+// turn's usage stats) or overwrites the full history with a shorter snapshot
+// (losing the last turn until the next save — permanently if the app restarts
+// first). The atomic write (atomicWriteFile) keeps any single file valid, but
+// only this lock makes the load+write a single critical section.
+//
+// It is a LEAF lock: held only across the load + marshal + atomic write of one
+// file, never while holding session.mu / p.mu / s.mu, so it cannot take part
+// in a lock-order cycle even when a caller (e.g. RemoveProject) holds s.mu
+// across DeleteHistory.
+var (
+	historyFileLocksMu sync.Mutex
+	historyFileLocks   = map[string]*sync.Mutex{}
+)
+
+// lockHistoryFile acquires the per-file lock for path and returns its unlock.
+func lockHistoryFile(path string) func() {
+	historyFileLocksMu.Lock()
+	mu, ok := historyFileLocks[path]
+	if !ok {
+		mu = &sync.Mutex{}
+		historyFileLocks[path] = mu
+	}
+	historyFileLocksMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
+}
+
+// atomicWriteFile writes data to path atomically by writing to a UNIQUE
+// temp file in the same directory, then renaming. Prevents a partial write
+// from corrupting the file if the process crashes mid-write or the disk
+// fills up. Used by config and history saves where a corrupt file means
+// lost user state.
+//
+// The temp name is unique per call (os.CreateTemp) rather than a fixed
+// path+".tmp": two goroutines writing the SAME target concurrently (e.g.
+// two projects each firing saveConfigAsync on the same agent turn, both
+// targeting config.yaml) would otherwise share one temp inode, truncate
+// each other mid-write, and promote a torn/garbage file on rename — which
+// for config.yaml silently wipes every project + API key on next startup
+// (LoadConfig falls back to defaults on a parse error). A unique temp per
+// writer makes the rename last-writer-wins with each candidate being a
+// complete, valid snapshot. The leading dot keeps the temp hidden and out
+// of any "{prefix}*.json" history-file discovery scan.
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, perm); err != nil {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	// Best-effort cleanup if we return before a successful rename. After a
+	// successful rename tmp no longer exists, so the Remove is a harmless no-op.
+	defer func() { _ = os.Remove(tmp) }()
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Chmod(perm); err != nil {
+		_ = f.Close()
+		return err
+	}
+	// Flush to disk before the rename so a crash can't leave a renamed-but-
+	// empty file (the rename is only atomic w.r.t. the file's existence, not
+	// its buffered contents).
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)
@@ -96,6 +163,8 @@ func SaveHistory(projectID string, history []*genai.Content) error {
 // session with a custom label), we still write a file so the session tab
 // survives a restart.
 func SaveHistoryWithName(projectID, name string, history []*genai.Content) error {
+	unlock := lockHistoryFile(historyPath(projectID))
+	defer unlock()
 	prevParent, prevUsage := loadPrevMetadata(projectID)
 	return saveHistoryFull(projectID, name, prevParent, prevUsage, history)
 }
@@ -104,6 +173,8 @@ func SaveHistoryWithName(projectID, name string, history []*genai.Content) error
 // from disk. Used by ForkChatSession to stamp lineage onto a new session's
 // first save.
 func SaveHistoryWithMetadata(projectID, name, parentSessionID string, history []*genai.Content) error {
+	unlock := lockHistoryFile(historyPath(projectID))
+	defer unlock()
 	_, prevUsage := loadPrevMetadata(projectID)
 	return saveHistoryFull(projectID, name, parentSessionID, prevUsage, history)
 }
@@ -112,6 +183,8 @@ func SaveHistoryWithMetadata(projectID, name, parentSessionID string, history []
 // agent loop after each chat:complete to bump the running usage totals.
 // Caller provides parent (preserves lineage) AND usage (the new totals).
 func SaveHistoryWithUsage(projectID, name, parentSessionID string, usage *SessionUsage, history []*genai.Content) error {
+	unlock := lockHistoryFile(historyPath(projectID))
+	defer unlock()
 	return saveHistoryFull(projectID, name, parentSessionID, usage, history)
 }
 
@@ -246,8 +319,12 @@ func loadHistoryRaw(projectID string) ([]HistoryEntry, string, string, *SessionU
 	return hf.Entries, hf.Name, hf.ParentSessionID, hf.Usage, nil
 }
 
-// DeleteHistory removes a project's history file.
+// DeleteHistory removes a project's history file. Takes the per-file lock so a
+// delete can't interleave with an in-flight save of the same file (which would
+// otherwise leave the just-deleted file recreated).
 func DeleteHistory(projectID string) {
+	unlock := lockHistoryFile(historyPath(projectID))
+	defer unlock()
 	_ = os.Remove(historyPath(projectID))
 }
 

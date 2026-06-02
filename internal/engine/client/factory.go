@@ -48,6 +48,30 @@ func ClosePool() {
 // clients for the primary provider and each fallback provider.
 // Uses the connection pool to reuse existing clients when possible.
 func NewClient(ctx context.Context, cfg *config.Config, modelID string) (Client, error) {
+	return newClient(ctx, cfg, modelID, true)
+}
+
+// NewClientNoPool is like NewClient but NEVER uses the shared connection pool:
+// every call returns a fresh, independently-owned client instance.
+//
+// The shared pool is keyed only by "provider:model", so two callers wanting
+// the same provider+model receive the SAME client. That's a hazard for any
+// caller that mutates per-owner state on the client instance (system
+// instruction, tool set, status callback). Gokin Studio runs many concurrent
+// projects, each with its own system prompt + pinned context that it sets on
+// the client; with the shared pool, two projects on the same model (e.g. both
+// on the default glm-5.1) alias to one client, so project B's
+// SetSystemInstruction silently clobbers project A's — sending the wrong
+// persona / leaking one project's pinned context into another. Studio already
+// caches one client per project and rebuilds it on settings/provider changes,
+// so it gains nothing from pooling. Such multi-tenant callers should use this.
+func NewClientNoPool(ctx context.Context, cfg *config.Config, modelID string) (Client, error) {
+	return newClient(ctx, cfg, modelID, false)
+}
+
+// newClient is the shared implementation. usePool selects whether the global
+// connection pool is consulted/populated (true) or bypassed entirely (false).
+func newClient(ctx context.Context, cfg *config.Config, modelID string, usePool bool) (Client, error) {
 	// Migrate configuration to new format
 	config.MigrateConfig(cfg)
 
@@ -64,7 +88,8 @@ func NewClient(ctx context.Context, cfg *config.Config, modelID string) (Client,
 	logging.Debug("creating client",
 		"provider", cfg.Model.Provider,
 		"modelID", modelID,
-		"preset", cfg.Model.Preset)
+		"preset", cfg.Model.Preset,
+		"pooled", usePool)
 
 	// Determine the primary provider
 	provider := cfg.Model.Provider
@@ -74,16 +99,15 @@ func NewClient(ctx context.Context, cfg *config.Config, modelID string) (Client,
 
 	// If fallback providers are configured, build a FallbackClient
 	if len(cfg.Model.FallbackProviders) > 0 {
-		return newFallbackClientFromConfig(ctx, cfg, provider, modelID)
+		return newFallbackClientFromConfig(ctx, cfg, provider, modelID, usePool)
 	}
 
-	// Single client creation with pool support
-	return getOrCreateClient(ctx, cfg, provider, modelID)
+	return getOrCreateClient(ctx, cfg, provider, modelID, usePool)
 }
 
 // newFallbackClientFromConfig creates a FallbackClient with the primary provider
 // and each configured fallback provider.
-func newFallbackClientFromConfig(ctx context.Context, cfg *config.Config, primaryProvider, modelID string) (Client, error) {
+func newFallbackClientFromConfig(ctx context.Context, cfg *config.Config, primaryProvider, modelID string, usePool bool) (Client, error) {
 	var clients []Client
 	var clientProviders []string
 
@@ -111,7 +135,7 @@ func newFallbackClientFromConfig(ctx context.Context, cfg *config.Config, primar
 
 	// Create clients in health-prioritized order.
 	for _, provider := range orderedProviders {
-		c, err := getOrCreateClient(ctx, cfg, provider, modelID)
+		c, err := getOrCreateClient(ctx, cfg, provider, modelID, usePool)
 		if err != nil {
 			logging.Warn("failed to create fallback chain client",
 				"provider", provider,
@@ -130,7 +154,13 @@ func newFallbackClientFromConfig(ctx context.Context, cfg *config.Config, primar
 }
 
 // getOrCreateClient retrieves a client from the pool or creates a new one.
-func getOrCreateClient(ctx context.Context, cfg *config.Config, provider, modelID string) (Client, error) {
+// When usePool is false the pool is bypassed entirely and a fresh, dedicated
+// instance is returned (see NewClientNoPool).
+func getOrCreateClient(ctx context.Context, cfg *config.Config, provider, modelID string, usePool bool) (Client, error) {
+	if !usePool {
+		return createClientForProvider(ctx, cfg, provider, modelID)
+	}
+
 	pool := GetPool(cfg)
 
 	// Check pool first

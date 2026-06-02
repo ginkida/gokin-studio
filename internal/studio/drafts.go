@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 )
 
 // Draft persistence: when the user types a message into the chat input but
@@ -26,6 +27,22 @@ const DraftMaxBytes = 200 * 1024 // 200 KB
 
 func draftsDir() string {
 	return filepath.Join(configDir(), "drafts")
+}
+
+// truncateUTF8 cuts s to at most maxBytes WITHOUT splitting a multibyte
+// UTF-8 rune at the boundary. A naive s[:maxBytes] can land mid-rune for
+// Cyrillic/CJK/emoji content, persisting an invalid-UTF-8 tail that the
+// frontend then renders as a corrupted trailing character. Backs off to the
+// previous rune boundary (at most 3 bytes, since UTF-8 runes are ≤4 bytes).
+func truncateUTF8(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
 // draftPath returns the on-disk path for a given (project, session) pair.
@@ -77,9 +94,7 @@ func (s *Studio) SaveDraft(projectID, sessionID, text string) error {
 	if strings.TrimSpace(text) == "" {
 		return s.ClearDraft(projectID, sid)
 	}
-	if len(text) > DraftMaxBytes {
-		text = text[:DraftMaxBytes]
-	}
+	text = truncateUTF8(text, DraftMaxBytes)
 	if err := os.MkdirAll(draftsDir(), 0o700); err != nil {
 		return err
 	}

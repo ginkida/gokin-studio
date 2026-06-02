@@ -111,9 +111,7 @@ func (s *Studio) PinMessage(projectID, sessionID, role, content, messageID strin
 	if content == "" {
 		return "", fmt.Errorf("content cannot be empty")
 	}
-	if len(content) > PinContentMaxBytes {
-		content = content[:PinContentMaxBytes]
-	}
+	content = truncateUTF8(content, PinContentMaxBytes)
 	sid := sessionID
 	if sid == "" {
 		sid = "default"
