@@ -1067,6 +1067,16 @@ func (s *Studio) ClearHistory(projectID, sessionID string) error {
 	// /clear also implies "I'm done with whatever I was drafting" — drop the
 	// persisted draft so a stale half-typed message doesn't reappear next time.
 	_ = s.ClearDraft(projectID, sid)
+	// Reset per-session file trackers so the continuation hint after the next
+	// compaction doesn't suggest files from the now-cleared session.
+	p.mu.Lock()
+	if rt, ok := p.readTrackers[sid]; ok {
+		rt.Reset()
+	}
+	if wt, ok := p.writeTrackers[sid]; ok {
+		wt.Reset()
+	}
+	p.mu.Unlock()
 	return nil
 }
 
@@ -1144,9 +1154,9 @@ type MemoryEntryInfo struct {
 type SearchHit struct {
 	SessionID   string `json:"sessionID"`
 	SessionName string `json:"sessionName"`
-	MessageIdx  int    `json:"messageIdx"` // index of the matched message within the session's filtered history
-	Role        string `json:"role"`       // "user" or "assistant"
-	Snippet     string `json:"snippet"`    // ~120-char window around the first match, with the match preserved
+	MessageIdx  int    `json:"messageIdx"`  // index of the matched message within the session's filtered history
+	Role        string `json:"role"`        // "user" or "assistant"
+	Snippet     string `json:"snippet"`     // ~120-char window around the first match, with the match preserved
 	MatchOffset int    `json:"matchOffset"` // index of the match within Snippet (for highlighting)
 }
 

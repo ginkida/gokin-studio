@@ -201,6 +201,9 @@ type Executor struct {
 	// File read deduplication tracker
 	readTracker *FileReadTracker
 
+	// File write tracker (records successfully-mutated paths for continuation hints)
+	writeTracker *FileWriteTracker
+
 	// Auto-formatter for write/edit operations
 	formatter *Formatter
 
@@ -550,6 +553,12 @@ func (e *Executor) SetSearchCache(c *cache.SearchCache) {
 // SetReadTracker sets the file read deduplication tracker.
 func (e *Executor) SetReadTracker(tracker *FileReadTracker) {
 	e.readTracker = tracker
+}
+
+// SetWriteTracker sets the file write tracker. When set, any successful
+// write/edit/delete call records the mutated path for post-compaction hints.
+func (e *Executor) SetWriteTracker(tracker *FileWriteTracker) {
+	e.writeTracker = tracker
 }
 
 // GetNotificationManager returns the notification manager.
@@ -1652,6 +1661,15 @@ func (e *Executor) doExecuteTool(ctx context.Context, call *genai.FunctionCall) 
 			}
 			if path, ok := call.Args["file_path"].(string); ok {
 				e.readTracker.InvalidateFile(path)
+			}
+		}
+		// Record successfully-mutated paths for post-compaction continuation hints.
+		if result.Success && e.writeTracker != nil && isWriteOperation(call.Name) {
+			if path, ok := call.Args["path"].(string); ok && path != "" {
+				e.writeTracker.Record(path)
+			}
+			if path, ok := call.Args["file_path"].(string); ok && path != "" {
+				e.writeTracker.Record(path)
 			}
 		}
 	}

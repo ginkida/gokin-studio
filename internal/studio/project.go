@@ -82,6 +82,11 @@ type Project struct {
 	costSeeded         bool
 	costMu             sync.Mutex
 
+	// Per-session file trackers for post-compaction continuation hints.
+	// keyed by sessionID; allocated on demand in SendMessage.
+	readTrackers  map[string]*tools.FileReadTracker
+	writeTrackers map[string]*tools.FileWriteTracker
+
 	mu sync.RWMutex
 }
 
@@ -748,6 +753,25 @@ func (p *Project) SendMessage(wailsCtx context.Context, message string, settings
 	// finish so the authoritative state lives only in history.json afterwards.
 	replay := NewReplayLogger(p.ID, sid)
 
+	// Per-session file trackers: allocated on first use and reused across
+	// turns within the same session so read/write history accumulates.
+	p.mu.Lock()
+	if p.readTrackers == nil {
+		p.readTrackers = make(map[string]*tools.FileReadTracker)
+	}
+	if p.writeTrackers == nil {
+		p.writeTrackers = make(map[string]*tools.FileWriteTracker)
+	}
+	if _, ok := p.readTrackers[sid]; !ok {
+		p.readTrackers[sid] = tools.NewFileReadTracker()
+	}
+	if _, ok := p.writeTrackers[sid]; !ok {
+		p.writeTrackers[sid] = tools.NewFileWriteTracker()
+	}
+	readTracker := p.readTrackers[sid]
+	writeTracker := p.writeTrackers[sid]
+	p.mu.Unlock()
+
 	// retryDelay and notifyRetry are shared by both sendWithRetry call sites
 	// inside the agent loop below.
 	retryDelay := p.retryInitialDelay
@@ -1000,7 +1024,11 @@ outer:
 		p.mu.RUnlock()
 
 		maxCtx := contextWindowForProvider(provider, model)
+		lenBefore := len(historySnapshot)
 		historySnapshot = compactHistory(historySnapshot, maxCtx)
+		if len(historySnapshot) < lenBefore {
+			historySnapshot = injectContinuationHint(historySnapshot, message, readTracker, writeTracker)
+		}
 
 		collected, err := sendAndStream(func() (*client.StreamingResponse, error) {
 			return c.SendMessageWithHistory(ctx, historySnapshot, "")
@@ -1105,6 +1133,23 @@ outer:
 						content = content + "\n" + result.Error
 					} else {
 						content = result.Error
+					}
+				}
+
+				// Record reads and writes for the continuation hint.
+				if success {
+					switch fc.Name {
+					case "read":
+						if fp, _ := fc.Args["file_path"].(string); fp != "" {
+							readTracker.CheckAndRecord(fp, 1, 2000, len(result.Content))
+						}
+					case "write", "edit", "delete", "mkdir", "copy", "move", "batch":
+						if fp, _ := fc.Args["path"].(string); fp != "" {
+							writeTracker.Record(fp)
+						}
+						if fp, _ := fc.Args["file_path"].(string); fp != "" {
+							writeTracker.Record(fp)
+						}
 					}
 				}
 
@@ -1958,4 +2003,63 @@ func humanizeAPIError(err error) string {
 		return "Request timed out. The provider may be slow — try again or stop and rephrase. (" + raw + ")"
 	}
 	return "Error: " + raw
+}
+
+// injectContinuationHint appends a synthetic user message after history compaction
+// so the model can continue its task without re-reading already-loaded files.
+// Mirrors gokin's agent.injectContinuationHint but adapted for studio's simpler loop.
+func injectContinuationHint(
+	history []*genai.Content,
+	originalPrompt string,
+	readTracker *tools.FileReadTracker,
+	writeTracker *tools.FileWriteTracker,
+) []*genai.Content {
+	if len(history) == 0 {
+		return history
+	}
+
+	var b strings.Builder
+	b.WriteString("[System: Conversation was automatically compacted to free context space.")
+
+	if originalPrompt != "" {
+		task := originalPrompt
+		if runes := []rune(task); len(runes) > 500 {
+			task = string(runes[:500]) + "..."
+		}
+		b.WriteString("\nYour original task: ")
+		b.WriteString(task)
+	}
+
+	if readTracker != nil {
+		if files := readTracker.RecentlyReadFiles(15); len(files) > 0 {
+			b.WriteString("\n\nAlready-read files in this session (content was compacted; re-read only if you need specific details):")
+			for _, f := range files {
+				b.WriteString("\n- ")
+				b.WriteString(f)
+			}
+		}
+	}
+
+	if writeTracker != nil {
+		if files := writeTracker.RecentlyModifiedFiles(10); len(files) > 0 {
+			b.WriteString("\n\nFiles you already modified in this task (do not overwrite unless the user asked for a change):")
+			for _, f := range files {
+				b.WriteString("\n- ")
+				b.WriteString(f)
+			}
+		}
+	}
+
+	b.WriteString("\nContinue with your current task.]")
+	hint := b.String()
+
+	// Append to the last user message if possible (avoids consecutive same-role
+	// issues on strict providers), otherwise add a new user turn.
+	last := history[len(history)-1]
+	if last.Role == genai.RoleUser {
+		last.Parts = append(last.Parts, genai.NewPartFromText(hint))
+	} else {
+		history = append(history, genai.NewContentFromText(hint, genai.RoleUser))
+	}
+	return history
 }
