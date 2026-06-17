@@ -89,8 +89,14 @@ func (t *WriteTool) Validate(args map[string]any) error {
 		return NewValidationError("file_path", "is required")
 	}
 
-	if _, ok := GetString(args, "content"); !ok {
+	content, ok := GetString(args, "content")
+	if !ok {
 		return NewValidationError("content", "is required")
+	}
+
+	appendMode := GetBoolDefault(args, "append", false)
+	if content == "" && !appendMode {
+		return NewValidationError("content", "is empty — this would create a zero-byte file")
 	}
 
 	return nil
@@ -124,7 +130,7 @@ func (t *WriteTool) Execute(ctx context.Context, args map[string]any) (ToolResul
 
 	// Check if file exists and read old content for undo
 	var oldContent []byte
-	_, existErr := os.Stat(filePath)
+	existInfo, existErr := os.Stat(filePath)
 	isNew := os.IsNotExist(existErr)
 
 	if !isNew {
@@ -132,6 +138,23 @@ func (t *WriteTool) Execute(ctx context.Context, args map[string]any) (ToolResul
 		oldContent, err = os.ReadFile(filePath)
 		if err != nil {
 			return NewErrorResult(fmt.Sprintf("error reading existing file: %s", err)), nil
+		}
+
+		// Read-before-overwrite: a full overwrite of an existing file the model
+		// hasn't read this session silently discards whatever it didn't see.
+		// Mirror the EditTool read-before-edit guard; skip in append mode (nothing
+		// is lost when appending) and when no tracker is injected.
+		if !appendMode {
+			if rt, ok := ctx.Value(ReadTrackerCtxKey{}).(*FileReadTracker); ok && rt != nil {
+				if !rt.HasBeenRead(filePath) {
+					return NewErrorResult(fmt.Sprintf(
+						"read-before-overwrite: call the read tool on %s before overwriting it — "+
+							"a full write replaces the entire file and would discard anything you haven't seen. "+
+							"Read it first, then write (or use edit for a targeted change, or append=true to add without overwriting).",
+						filePath,
+					)), nil
+				}
+			}
 		}
 	}
 
@@ -155,9 +178,15 @@ func (t *WriteTool) Execute(ctx context.Context, args map[string]any) (ToolResul
 		}
 	}
 
-	// Write file atomically to prevent data corruption on interruption
+	// Write file atomically to prevent data corruption on interruption.
+	// Preserve the existing file's permission bits if the file already exists
+	// (e.g. don't turn an executable 0755 into a 0644).
+	perm := os.FileMode(0644)
+	if !isNew && existInfo != nil {
+		perm = existInfo.Mode().Perm()
+	}
 	newContent := []byte(finalContent)
-	if err := AtomicWrite(filePath, newContent, 0644); err != nil {
+	if err := AtomicWrite(filePath, newContent, perm); err != nil {
 		return NewErrorResult(fmt.Sprintf("error writing file: %s", err)), nil
 	}
 
