@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 
 	"google.golang.org/genai"
@@ -287,11 +288,8 @@ func (t *EditTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 	}
 
 	// Detect binary files by checking for null bytes in the first 512 bytes
-	checkLen := min(len(data), 512)
-	for _, b := range data[:checkLen] {
-		if b == 0 {
-			return NewErrorResult(fmt.Sprintf("cannot edit binary file: %s", filePath)), nil
-		}
+	if slices.Contains(data[:min(len(data), 512)], byte(0)) {
+		return NewErrorResult(fmt.Sprintf("cannot edit binary file: %s", filePath)), nil
 	}
 
 	content := string(data)
@@ -365,7 +363,7 @@ func (t *EditTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 
 				// Show diff preview and wait for approval if enabled
 				if t.diffEnabled && t.diffHandler != nil && !ShouldSkipDiff(ctx) {
-					approved, approveErr := t.diffHandler.PromptDiff(ctx, filePath, content, newContent, "edit", false)
+					approved, approveErr := maybePromptDiff(ctx, t.diffHandler, filePath, content, newContent, "edit", false)
 					if approveErr != nil {
 						return NewErrorResult(fmt.Sprintf("diff preview error: %s", approveErr)), nil
 					}
@@ -433,7 +431,7 @@ func (t *EditTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 	// Show diff preview and wait for approval if enabled
 	// Skip diff approval when running in delegated plan execution (context flag)
 	if t.diffEnabled && t.diffHandler != nil && !ShouldSkipDiff(ctx) {
-		approved, err := t.diffHandler.PromptDiff(ctx, filePath, content, newContent, "edit", false)
+		approved, err := maybePromptDiff(ctx, t.diffHandler, filePath, content, newContent, "edit", false)
 		if err != nil {
 			return NewErrorResult(fmt.Sprintf("diff preview error: %s", err)), nil
 		}
@@ -546,7 +544,7 @@ func (t *EditTool) executeMultiEdit(ctx context.Context, filePath string, edits 
 
 	// Show combined diff preview
 	if t.diffEnabled && t.diffHandler != nil && !ShouldSkipDiff(ctx) {
-		approved, err := t.diffHandler.PromptDiff(ctx, filePath, string(oldContent), content, "edit", false)
+		approved, err := maybePromptDiff(ctx, t.diffHandler, filePath, string(oldContent), content, "edit", false)
 		if err != nil {
 			return NewErrorResult(fmt.Sprintf("diff preview error: %s", err)), nil
 		}
@@ -636,7 +634,7 @@ func (t *EditTool) executeLineEdit(ctx context.Context, filePath string, lineSta
 
 	// Show diff preview
 	if t.diffEnabled && t.diffHandler != nil && !ShouldSkipDiff(ctx) {
-		approved, err := t.diffHandler.PromptDiff(ctx, filePath, content, newContent, "edit", false)
+		approved, err := maybePromptDiff(ctx, t.diffHandler, filePath, content, newContent, "edit", false)
 		if err != nil {
 			return NewErrorResult(fmt.Sprintf("diff preview error: %s", err)), nil
 		}
@@ -691,11 +689,8 @@ func (t *EditTool) executeInsertAfterLine(ctx context.Context, filePath string, 
 	}
 
 	// Detect binary files
-	checkLen := min(len(data), 512)
-	for _, b := range data[:checkLen] {
-		if b == 0 {
-			return NewErrorResult(fmt.Sprintf("cannot edit binary file: %s", filePath)), nil
-		}
+	if slices.Contains(data[:min(len(data), 512)], byte(0)) {
+		return NewErrorResult(fmt.Sprintf("cannot edit binary file: %s", filePath)), nil
 	}
 
 	content := string(data)
@@ -720,7 +715,7 @@ func (t *EditTool) executeInsertAfterLine(ctx context.Context, filePath string, 
 
 	// Show diff preview
 	if t.diffEnabled && t.diffHandler != nil && !ShouldSkipDiff(ctx) {
-		approved, err := t.diffHandler.PromptDiff(ctx, filePath, content, newContent, "edit", false)
+		approved, err := maybePromptDiff(ctx, t.diffHandler, filePath, content, newContent, "edit", false)
 		if err != nil {
 			return NewErrorResult(fmt.Sprintf("diff preview error: %s", err)), nil
 		}
@@ -790,15 +785,14 @@ func findFuzzyMatch(content, oldStr string) (string, int) {
 	}
 
 	// Find position in normalized content
-	normIdx := strings.Index(normalizedContent, normalizedOld)
-	if normIdx < 0 {
+	normPrefix, _, found := strings.Cut(normalizedContent, normalizedOld)
+	if !found {
 		return "", 0
 	}
 
 	// Map normalized position back to original content.
 	// The line number of the match start in normalized content
 	// equals the line number in original content.
-	normPrefix := normalizedContent[:normIdx]
 	startLine := strings.Count(normPrefix, "\n")
 
 	// Count how many lines the old_string spans
@@ -879,10 +873,7 @@ func lineSimilarity(a, b string) float64 {
 		return 0.0
 	}
 	lcs := lcsLength(a, b)
-	maxLen := len(a)
-	if len(b) > maxLen {
-		maxLen = len(b)
-	}
+	maxLen := max(len(a), len(b))
 	return float64(lcs) / float64(maxLen)
 }
 
@@ -1019,7 +1010,7 @@ func tryFuzzyReplace(content, old, new string, replaceAll bool) (string, string,
 		var matchStarts []int
 		for i := 0; i <= len(normalizedLines)-oldLineCount; i++ {
 			match := true
-			for j := 0; j < oldLineCount; j++ {
+			for j := range oldLineCount {
 				if normalizedLines[i+j] != normalizedOldLines[j] {
 					match = false
 					break
