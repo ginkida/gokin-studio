@@ -25,6 +25,11 @@ type FileReadRecord struct {
 	DupCount int
 }
 
+// ReadTrackerCtxKey is the context key used by project.go to inject the
+// per-session *FileReadTracker into tool calls (e.g. edit.go's Read-before-Edit
+// check) without storing mutable per-session state on the shared tool struct.
+type ReadTrackerCtxKey struct{}
+
 // FileReadTracker deduplicates file reads by tracking what was read and when.
 // If the same file range is requested again and the file hasn't changed (same ModTime+Size),
 // the executor replaces the full content with a short stub, saving context window space.

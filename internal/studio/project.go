@@ -1095,7 +1095,12 @@ outer:
 				// a global handler per call. Also seed a per-session history getter
 				// for history_search so concurrent sessions don't race on the shared
 				// tool's stored field.
+				//
+				// ReadTrackerCtxKey lets edit.go enforce the Read-before-Edit
+				// safety invariant: refuse to edit a file that hasn't been read in
+				// this session (prevents blind grep-based edits clobbering context).
 				toolCtx := withAskUserRouting(ctx, p.ID, sid)
+				toolCtx = context.WithValue(toolCtx, tools.ReadTrackerCtxKey{}, readTracker)
 				toolCtx = context.WithValue(toolCtx, tools.HistoryGetterCtxKey{}, func() []*genai.Content {
 					session.mu.RLock()
 					defer session.mu.RUnlock()
@@ -1166,7 +1171,9 @@ outer:
 					switch fc.Name {
 					case "read":
 						if fp, _ := fc.Args["file_path"].(string); fp != "" {
-							readTracker.CheckAndRecord(fp, 1, 2000, len(result.Content))
+							readOffset := stagnationFingerprintArg(fc.Args, "offset")
+							readLimit := stagnationFingerprintArg(fc.Args, "limit")
+							readTracker.CheckAndRecord(fp, readOffset, readLimit, len(result.Content))
 						}
 					case "write", "edit", "delete", "mkdir", "copy", "move", "batch":
 						if fp, _ := fc.Args["path"].(string); fp != "" {

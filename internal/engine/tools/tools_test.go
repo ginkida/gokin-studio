@@ -4119,9 +4119,9 @@ func TestLevenshtein_Basic(t *testing.T) {
 		{"a", "", 1},
 		{"", "a", 1},
 		{"edit", "edit", 0},
-		{"edit", "editt", 1},  // one insertion
-		{"read", "reed", 1},   // one substitution
-		{"bash", "batch", 2},  // two operations
+		{"edit", "editt", 1}, // one insertion
+		{"read", "reed", 1},  // one substitution
+		{"bash", "batch", 2}, // two operations
 	}
 	for _, tc := range tests {
 		got := levenshtein(tc.a, tc.b)
@@ -4321,5 +4321,96 @@ func TestFileReadTracker_RecentlyReadFiles(t *testing.T) {
 	// Most recently recorded should be first
 	if !strings.HasSuffix(recent[0], "e.go") {
 		t.Errorf("expected e.go first, got %s", recent[0])
+	}
+}
+
+// TestEditTool_ReadBeforeEdit_Blocked verifies that editing an existing file
+// that hasn't been read in the session is blocked when a ReadTracker is
+// injected via ReadTrackerCtxKey.
+func TestEditTool_ReadBeforeEdit_Blocked(t *testing.T) {
+	tmpDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	filePath := filepath.Join(tmpDir, "target.go")
+	if err := os.WriteFile(filePath, []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := NewEditTool(tmpDir)
+	rt := NewFileReadTracker()
+	ctx := context.WithValue(context.Background(), ReadTrackerCtxKey{}, rt)
+
+	// No read recorded → should be blocked.
+	result, err := tool.Execute(ctx, map[string]any{
+		"file_path":  filePath,
+		"old_string": "package main",
+		"new_string": "package main // edited",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Success {
+		t.Fatal("expected edit to be blocked (read-before-edit), but it succeeded")
+	}
+	if !strings.Contains(result.Error+result.Content, "read-before-edit") {
+		t.Errorf("expected read-before-edit message, got: %q", result.Error+result.Content)
+	}
+}
+
+// TestEditTool_ReadBeforeEdit_AllowedAfterRead verifies that an edit succeeds
+// once the file appears in the ReadTracker (i.e., the agent has read it).
+func TestEditTool_ReadBeforeEdit_AllowedAfterRead(t *testing.T) {
+	tmpDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	filePath := filepath.Join(tmpDir, "target.go")
+	if err := os.WriteFile(filePath, []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := NewEditTool(tmpDir)
+	rt := NewFileReadTracker()
+	rt.CheckAndRecord(filePath, 0, 0, 13) // simulate having read the file
+	ctx := context.WithValue(context.Background(), ReadTrackerCtxKey{}, rt)
+
+	result, err := tool.Execute(ctx, map[string]any{
+		"file_path":  filePath,
+		"old_string": "package main",
+		"new_string": "package main // edited",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Success {
+		t.Fatalf("expected edit to succeed after read, got error: %q", result.Error)
+	}
+}
+
+// TestEditTool_ReadBeforeEdit_NoTrackerNoBlock verifies that without a
+// ReadTracker in context, the safety check is a no-op (backward compat).
+func TestEditTool_ReadBeforeEdit_NoTrackerNoBlock(t *testing.T) {
+	tmpDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	filePath := filepath.Join(tmpDir, "target.go")
+	if err := os.WriteFile(filePath, []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := NewEditTool(tmpDir)
+	// No ReadTrackerCtxKey in context — check should be skipped.
+	result, err := tool.Execute(context.Background(), map[string]any{
+		"file_path":  filePath,
+		"old_string": "package main",
+		"new_string": "package main // edited",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Success {
+		t.Fatalf("expected edit to succeed without tracker, got: %q", result.Error)
 	}
 }

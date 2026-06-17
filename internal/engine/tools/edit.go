@@ -250,6 +250,21 @@ func (t *EditTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 		return NewErrorResult(err.Error()), nil
 	}
 
+	// Read-before-Edit safety check (ported from gokin): refuse to edit a
+	// file that hasn't been read in this session. Prevents the common failure
+	// where the model sees 3 lines from grep and edits blindly, clobbering
+	// surrounding code. Only fires for existing files (new files have no
+	// content to clobber); only when a tracker is injected via context.
+	if rt, ok := ctx.Value(ReadTrackerCtxKey{}).(*FileReadTracker); ok && rt != nil {
+		if _, statErr := os.Stat(filePath); statErr == nil && !rt.HasBeenRead(filePath) {
+			return NewErrorResult(fmt.Sprintf(
+				"read-before-edit: call the read tool on %s first so you have the full surrounding context. "+
+					"Editing based on grep snippets regularly clobbers nearby code. After reading, retry the edit.",
+				filePath,
+			)), nil
+		}
+	}
+
 	// Read existing file
 	data, err := os.ReadFile(filePath)
 	if err != nil {
