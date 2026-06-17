@@ -355,9 +355,18 @@ func (t *ReadTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 		}
 		return t.readNotebook(filePath)
 	default:
-		// Detect binary files by extension or null bytes in first 512 bytes
+		// Detect binary files by extension or null bytes in first 512 bytes.
+		// Return Error (not Success) so the model can't claim it read the file;
+		// Success caused models to make confident assertions about file contents
+		// that were never actually visible.
 		if isBinaryFile(filePath) {
-			return NewSuccessResult(fmt.Sprintf("Binary file (%s, %d bytes). Cannot display as text.", ext, info.Size())), nil
+			return NewErrorResult(fmt.Sprintf(
+				"Binary file: %s (%s, %d bytes). This tool returns text only. "+
+					"If you need the content, run a command that emits text "+
+					"(e.g. `strings`, `hexdump -C | head`, a decoder). "+
+					"Do not claim to have read this file.",
+				filePath, ext, info.Size(),
+			)), nil
 		}
 
 		// Check if file is large
@@ -401,12 +410,12 @@ func (t *ReadTool) readLargeFile(_ context.Context, filePath string, args map[st
 
 	// Format output
 	var builder strings.Builder
-	maxLineLen := 2000
+	const maxLineLenLarge = 2000
 
 	for i, line := range lines {
 		lineNum := startLine + i
-		if len(line) > maxLineLen {
-			line = line[:maxLineLen] + "..."
+		if runes := []rune(line); len(runes) > maxLineLenLarge {
+			line = string(runes[:maxLineLenLarge]) + "..."
 		}
 		builder.WriteString(fmt.Sprintf("%6d\t%s\n", lineNum, line))
 	}
@@ -513,7 +522,8 @@ func (t *ReadTool) readText(ctx context.Context, filePath string, args map[strin
 
 	lineNum := 0
 	linesRead := 0
-	maxLineLen := 2000
+	hasMoreAfterLimit := false // true when the file has lines past the requested limit
+	const maxLineLen = 2000
 
 	for scanner.Scan() {
 		lineNum++
@@ -523,16 +533,21 @@ func (t *ReadTool) readText(ctx context.Context, filePath string, args map[strin
 			continue
 		}
 
-		// Stop if we've read enough lines
+		// Once we've read `limit` lines, keep scanning to determine whether
+		// more content exists — but stop emitting. Without this, a file with
+		// exactly `limit` lines and one with 10× that count are
+		// indistinguishable, and the model can't tell whether to paginate.
 		if linesRead >= limit {
+			hasMoreAfterLimit = true
 			break
 		}
 
 		line := scanner.Text()
 
-		// Truncate long lines
-		if len(line) > maxLineLen {
-			line = line[:maxLineLen] + "..."
+		// Truncate long lines using rune boundaries to avoid splitting
+		// multibyte UTF-8 sequences (Cyrillic, CJK, emoji).
+		if runes := []rune(line); len(runes) > maxLineLen {
+			line = string(runes[:maxLineLen]) + "..."
 		}
 
 		// Format with line number (cat -n style)
@@ -551,6 +566,11 @@ func (t *ReadTool) readText(ctx context.Context, filePath string, args map[strin
 		} else {
 			content = "(empty file)"
 		}
+	} else if hasMoreAfterLimit {
+		// Append a truthful pagination hint so the model knows to keep reading.
+		endLine := offset + linesRead - 1
+		content += fmt.Sprintf("\n[File truncated at line %d. Use offset=%d to continue reading.]\n",
+			endLine, endLine+1)
 	}
 
 	// Record access pattern for predictive loading
