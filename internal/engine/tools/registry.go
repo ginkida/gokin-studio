@@ -254,7 +254,6 @@ func DefaultRegistry(workDir string) *Registry {
 	r.MustRegister(NewGitBranchTool(workDir))
 	r.MustRegister(NewGitPRTool(workDir))
 
-
 	// Coordination tool
 	r.MustRegister(NewCoordinateTool())
 
@@ -465,6 +464,7 @@ func DefaultLazyRegistry(workDir string) *LazyRegistry {
 
 	// Shell and execution
 	r.RegisterFactory("bash", func() Tool { return NewBashTool(workDir) }, nil)
+	r.RegisterFactory("run_tests", func() Tool { return NewRunTestsTool(workDir) }, nil)
 	r.RegisterFactory("task", func() Tool { return NewTaskTool() }, nil)
 	r.RegisterFactory("task_output", func() Tool { return NewTaskOutputTool() }, nil)
 	r.RegisterFactory("task_stop", func() Tool { return NewTaskStopTool() }, nil)

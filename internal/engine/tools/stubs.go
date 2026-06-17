@@ -46,14 +46,15 @@ func (c *CheckpointJournal) Record(call *genai.FunctionCall, result ToolResult) 
 
 // --- Stub constructors for tools not extracted ---
 
-func NewUndoPlanTool(deps ...interface{}) Tool   { return nil }
-func NewRedoPlanTool(deps ...interface{}) Tool    { return nil }
-func NewRefactorTool(deps ...interface{}) Tool    { return nil }
-func NewCodeGraphTool(deps ...interface{}) Tool   { return nil }
-func NewRunTestsTool(deps ...interface{}) Tool    { return nil }
-func NewSSHTool(deps ...interface{}) Tool         { return nil }
+func NewUndoPlanTool(deps ...interface{}) Tool  { return nil }
+func NewRedoPlanTool(deps ...interface{}) Tool  { return nil }
+func NewRefactorTool(deps ...interface{}) Tool  { return nil }
+func NewCodeGraphTool(deps ...interface{}) Tool { return nil }
+
+// NewRunTestsTool is implemented in run_tests.go
+func NewSSHTool(deps ...interface{}) Tool             { return nil }
 func GetAllDeclarations() []genai.FunctionDeclaration { return nil }
-func FormatWarnings(w interface{}) string         { return "" }
+func FormatWarnings(w interface{}) string             { return "" }
 
 // SemanticValidatorRegistry is a stub for semantic validators.
 type SemanticValidatorRegistry struct{}

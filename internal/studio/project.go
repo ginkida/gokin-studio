@@ -31,14 +31,14 @@ type Project struct {
 	SystemPrompt   string
 	Temperature    float32
 	MaxTokens      int
-	ThinkingMode   string // "" = auto, "enabled", "disabled"
-	ThinkingBudget int32  // 0 = use default (4096) when enabled
+	ThinkingMode   string  // "" = auto, "enabled", "disabled"
+	ThinkingBudget int32   // 0 = use default (4096) when enabled
 	BudgetUSD      float64 // 0 = no budget set; otherwise per-month spend cap in USD
 	// EnforceBudget, when true, blocks new SendMessage calls once cumulative
 	// cost (cached, seeded from ProjectUsageStats on first need, bumped on
 	// chat:complete) reaches BudgetUSD. Requires BudgetUSD > 0 to take effect.
-	EnforceBudget  bool
-	Pinned         bool   // true = anchor to top of sidebar regardless of LastUsedAt
+	EnforceBudget bool
+	Pinned        bool // true = anchor to top of sidebar regardless of LastUsedAt
 
 	// testEmitter, when non-nil, replaces wailsRuntime.EventsEmit so unit tests
 	// can record emitted events without a running Wails application.
@@ -1515,7 +1515,9 @@ func defaultSystemPrompt(directory, name string) string {
 	return `You are a senior software engineer working inside the project "` + name + `" at ` + directory + `.
 
 # Tool use is mandatory
-You have access to file tools (read, write, edit, copy, move, delete, mkdir, diff, list_dir, tree, glob, grep), shell (bash, task for background processes), git (git_status, git_diff, git_log, git_blame, git_add, git_commit, git_branch, git_pr), web (web_fetch, web_search), planning (enter_plan_mode, update_plan_progress, get_plan_status, exit_plan_mode), persistent memory (memory, memorize, pin_context, history_search), inter-project coordination (ask_agent, coordinate), and clarification (ask_user).
+You have access to file tools (read, write, edit, copy, move, delete, mkdir, diff, list_dir, tree, glob, grep), shell (bash, run_tests for smart test execution, task for background processes), git (git_status, git_diff, git_log, git_blame, git_add, git_commit, git_branch, git_pr), web (web_fetch, web_search), planning (enter_plan_mode, update_plan_progress, get_plan_status, exit_plan_mode), persistent memory (memory, memorize, pin_context, history_search), inter-project coordination (ask_agent, coordinate), and clarification (ask_user).
+
+Prefer run_tests over bare "bash go test ./..." — run_tests auto-detects the framework, parses JSON output, surfaces only failed test names and their file:line assertion locations.
 
 NEVER describe what you would do — just do it with tools. If asked "what files are here?", call list_dir or tree, do not guess. If asked to fix a bug, read the relevant files first, then edit them.
 

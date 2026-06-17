@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ginkida/gokin-studio/internal/engine/memory"
 	"github.com/ginkida/gokin-studio/internal/engine/plan"
@@ -3922,5 +3923,87 @@ func TestBashFailureSummary_ContainsActionableHint(t *testing.T) {
 	// go test is a validation command — should give rerun hint
 	if !strings.Contains(summary, "rerun") {
 		t.Error("expected 'rerun' hint in validation failure summary")
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// run_tests tool — framework detection and result parsing
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestRunTests_DetectGoFramework(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module example.com/test\ngo 1.21\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	fw := detectTestFramework(tmpDir)
+	if fw != "go" {
+		t.Errorf("expected 'go', got %q", fw)
+	}
+}
+
+func TestRunTests_DetectNoFramework(t *testing.T) {
+	tmpDir := t.TempDir()
+	fw := detectTestFramework(tmpDir)
+	if fw != "" {
+		t.Errorf("expected empty string for unknown dir, got %q", fw)
+	}
+}
+
+func TestRunTests_ParseGoTestResultsPass(t *testing.T) {
+	// Simulate a passing Go test JSON stream
+	jsonOutput := `{"Action":"pass","Package":"example.com/foo","Test":"TestFoo","Elapsed":0.001}
+{"Action":"pass","Package":"example.com/foo","Elapsed":0.001}`
+	result := parseGoTestResults(jsonOutput, nil, 500*time.Millisecond)
+	if !strings.Contains(result, "PASS") {
+		t.Errorf("expected 'PASS' in result, got: %s", result)
+	}
+	if strings.Contains(result, "FAIL") {
+		t.Errorf("unexpected 'FAIL' in passing result: %s", result)
+	}
+}
+
+func TestRunTests_ParseGoTestResultsFail(t *testing.T) {
+	jsonOutput := `{"Action":"output","Package":"example.com/foo","Test":"TestBar","Output":"    foo_test.go:42: got 1, want 2\n"}
+{"Action":"fail","Package":"example.com/foo","Test":"TestBar","Elapsed":0.002}
+{"Action":"fail","Package":"example.com/foo","Elapsed":0.002}`
+	result := parseGoTestResults(jsonOutput, fmt.Errorf("exit 1"), 200*time.Millisecond)
+	if !strings.Contains(result, "FAIL") {
+		t.Errorf("expected 'FAIL' in result, got: %s", result)
+	}
+	if !strings.Contains(result, "TestBar") {
+		t.Errorf("expected 'TestBar' in result, got: %s", result)
+	}
+	// failure location extracted from "foo_test.go:42:"
+	if !strings.Contains(result, "foo_test.go:42") {
+		t.Errorf("expected file:line 'foo_test.go:42' in failure locations, got: %s", result)
+	}
+}
+
+func TestRunTests_FallbackGenericOnNonJSON(t *testing.T) {
+	// Non-JSON output should fall through to generic parser
+	result := parseGoTestResults("some plain text output\nnot json at all", nil, 100*time.Millisecond)
+	if !strings.Contains(result, "PASS") && !strings.Contains(result, "some plain text") {
+		t.Errorf("expected fallback to generic output, got: %s", result)
+	}
+}
+
+func TestRunTests_BuildGoCommand(t *testing.T) {
+	cmd, args := buildTestCommand("go", "/tmp", "TestFoo", false, false)
+	if cmd != "go" {
+		t.Errorf("expected 'go', got %q", cmd)
+	}
+	if !strings.Contains(strings.Join(args, " "), "-json") {
+		t.Errorf("expected -json flag, got: %v", args)
+	}
+	if !strings.Contains(strings.Join(args, " "), "TestFoo") {
+		t.Errorf("expected filter 'TestFoo', got: %v", args)
+	}
+}
+
+func TestRunTests_BuildGoCommandWithCoverage(t *testing.T) {
+	_, args := buildTestCommand("go", "/tmp", "", false, true)
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-coverprofile") {
+		t.Errorf("expected -coverprofile with coverage=true, got: %v", args)
 	}
 }
