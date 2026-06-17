@@ -317,25 +317,21 @@ func (t *EditTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 		}
 
 		if count > 1 && !replaceAll {
-			// Find line numbers of matches for a more helpful error
 			lines := strings.Split(content, "\n")
-			var lineNums []string
+			// Collect the first line of each match (1-based) for the context renderer.
+			var hits []int
 			pos := 0
 			for i, line := range lines {
 				lineEnd := pos + len(line)
 				for _, match := range matches {
 					if match[0] >= pos && match[0] < lineEnd {
-						lineNums = append(lineNums, fmt.Sprintf("%d", i+1))
+						hits = append(hits, i+1)
 						break
 					}
 				}
-				pos = lineEnd + 1 // +1 for newline
+				pos = lineEnd + 1
 			}
-			lineInfo := ""
-			if len(lineNums) > 0 {
-				lineInfo = fmt.Sprintf(" (lines: %s)", strings.Join(lineNums, ", "))
-			}
-			return NewErrorResult(fmt.Sprintf("regex pattern matches %d times in %s%s. Set replace_all=true to replace all.", count, filePath, lineInfo)), nil
+			return NewErrorResult(formatAmbiguousEditMessage(filePath, lines, hits, count, true)), nil
 		}
 
 		// Perform regex replacement
@@ -411,12 +407,7 @@ func (t *EditTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 
 		if count > 1 && !replaceAll {
 			lines := strings.Split(content, "\n")
-			var hits []int
-			for i, line := range lines {
-				if strings.Contains(line, oldStr) {
-					hits = append(hits, i+1) // 1-based
-				}
-			}
+			hits := findStringOccurrenceLines(lines, oldStr)
 			return NewErrorResult(formatAmbiguousEditMessage(filePath, lines, hits, count, false)), nil
 		}
 
@@ -1090,6 +1081,34 @@ func tryFuzzyReplace(content, old, new string, replaceAll bool) (string, string,
 	}
 
 	return "", "", fmt.Errorf("no fuzzy strategy matched")
+}
+
+// findStringOccurrenceLines returns the 1-based line numbers of every line
+// (or multi-line start) that contains substr in the given lines slice.
+// Multi-line substrings (containing "\n") are handled by reconstructing
+// the content string and walking it with strings.Index.
+func findStringOccurrenceLines(lines []string, substr string) []int {
+	if strings.Contains(substr, "\n") {
+		content := strings.Join(lines, "\n")
+		var hits []int
+		offset := 0
+		for {
+			idx := strings.Index(content[offset:], substr)
+			if idx < 0 {
+				return hits
+			}
+			abs := offset + idx
+			hits = append(hits, strings.Count(content[:abs], "\n")+1)
+			offset = abs + len(substr)
+		}
+	}
+	var hits []int
+	for i, line := range lines {
+		if strings.Contains(line, substr) {
+			hits = append(hits, i+1)
+		}
+	}
+	return hits
 }
 
 // ambiguousMatchContextLines is how many surrounding lines to show per match
