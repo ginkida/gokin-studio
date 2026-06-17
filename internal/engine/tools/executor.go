@@ -1576,7 +1576,14 @@ func (e *Executor) doExecuteTool(ctx context.Context, call *genai.FunctionCall) 
 		}
 	}
 
-	// Step 10.5: Auto-format (stub — formatter not extracted)
+	// Step 10.5: Auto-format — run language formatter on write/edit if configured
+	if e.formatter != nil && result.Success {
+		if call.Name == "write" || call.Name == "edit" {
+			if fp, _ := call.Args["file_path"].(string); fp != "" {
+				_ = e.formatter.Format(ctx, fp)
+			}
+		}
+	}
 
 	// Step 10.7: Emit inline diff for edit operations
 	if e.handler != nil && e.handler.OnInlineDiff != nil && result.Success {

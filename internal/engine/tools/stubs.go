@@ -12,12 +12,6 @@ import (
 	"google.golang.org/genai"
 )
 
-// Formatter is a stub for the auto-formatter (not extracted).
-type Formatter struct{}
-
-// Format is a no-op stub.
-func (f *Formatter) Format(path string) error { return nil }
-
 // deltaCheckResult is a stub for delta-check results.
 type deltaCheckResult struct {
 	Passed  bool
