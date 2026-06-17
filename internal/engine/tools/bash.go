@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -640,7 +641,10 @@ func (c *cappedBuffer) String() string {
 func startCommandErrorResult(execCtx context.Context, err error) ToolResult {
 	switch {
 	case errors.Is(err, context.DeadlineExceeded) || errors.Is(execCtx.Err(), context.DeadlineExceeded):
-		return NewErrorResult("command did not start: the tool timeout elapsed before execution began")
+		// "check that the command exists and is executable" is actively misleading here —
+		// git/ls/cat exist fine; the context expired BEFORE the subprocess launched.
+		// Common trigger: tools.timeout serialized as 0s or user pressed Esc.
+		return NewErrorResult("command did not start: the tool timeout elapsed before execution began (the tool timeout may be misconfigured — check tools.timeout)")
 	case errors.Is(err, context.Canceled) || errors.Is(execCtx.Err(), context.Canceled):
 		return NewErrorResult("command did not start: cancelled before execution began")
 	default:
@@ -723,7 +727,7 @@ func (t *BashTool) executeForeground(ctx context.Context, command string, stdinC
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
-					logging.Error("panic in bash stdout reader", "error", r)
+					logging.Error("panic in bash stdout reader", "error", r, "stack", string(debug.Stack()))
 				}
 			}()
 			defer readerWg.Done()
@@ -753,7 +757,7 @@ func (t *BashTool) executeForeground(ctx context.Context, command string, stdinC
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
-					logging.Error("panic in bash stderr reader", "error", r)
+					logging.Error("panic in bash stderr reader", "error", r, "stack", string(debug.Stack()))
 				}
 			}()
 			defer readerWg.Done()
@@ -777,7 +781,7 @@ func (t *BashTool) executeForeground(ctx context.Context, command string, stdinC
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
-					logging.Error("panic in bash streaming flush", "error", r)
+					logging.Error("panic in bash streaming flush", "error", r, "stack", string(debug.Stack()))
 				}
 			}()
 			defer close(streamDone)
@@ -808,7 +812,7 @@ func (t *BashTool) executeForeground(ctx context.Context, command string, stdinC
 			defer close(cmdDone) // Guarantees close on any exit path (including panic)
 			defer func() {
 				if r := recover(); r != nil {
-					logging.Error("panic in bash cmd.Wait", "error", r)
+					logging.Error("panic in bash cmd.Wait", "error", r, "stack", string(debug.Stack()))
 				}
 			}()
 			cmdErr = cmd.Wait()
