@@ -96,6 +96,41 @@ func (r *Registry) GeminiTools() []*genai.Tool {
 	}
 }
 
+// PlanModeControlToolNames are the interactive plan-mode control tools. They
+// are a SUBSET of ToolSetPlanning (which also includes task/task_output/task_stop
+// background-agent tools), so they are listed explicitly — gating the whole
+// ToolSetPlanning would wrongly drop non-plan task tools. Exported so callers
+// can combine them with other exclusion sets (e.g. plan-off + memory-off).
+var PlanModeControlToolNames = map[string]bool{
+	"enter_plan_mode":      true,
+	"exit_plan_mode":       true,
+	"update_plan_progress": true,
+	"get_plan_status":      true,
+}
+
+// GeminiToolsExcluding returns the full tool envelope minus the named tools.
+// Used to drop feature-gated tools the model must not call because the feature
+// is off in config — offering a disabled tool makes the model call it and hit a
+// confusing "unavailable" error.
+func (r *Registry) GeminiToolsExcluding(exclude map[string]bool) []*genai.Tool {
+	all := r.Declarations()
+	kept := make([]*genai.FunctionDeclaration, 0, len(all))
+	for _, d := range all {
+		if d == nil || exclude[d.Name] {
+			continue
+		}
+		kept = append(kept, d)
+	}
+	return []*genai.Tool{{FunctionDeclarations: kept}}
+}
+
+// GeminiToolsExcludingPlanMode drops the interactive plan-mode control tools
+// (the model cannot enter_plan_mode and strand itself read-only with no
+// interactive plan approval, e.g. in headless/eval runs).
+func (r *Registry) GeminiToolsExcludingPlanMode() []*genai.Tool {
+	return r.GeminiToolsExcluding(PlanModeControlToolNames)
+}
+
 // ToolSet defines a named group of tools.
 type ToolSet string
 

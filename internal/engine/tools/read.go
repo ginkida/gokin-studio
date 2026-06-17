@@ -18,6 +18,9 @@ import (
 )
 
 const (
+	// DefaultReadLimit is the default line budget for a normal (non-chunked)
+	// read. Referenced by callers that need to know the pagination boundary.
+	DefaultReadLimit = 2000
 	// DefaultChunkSize is the default number of lines to read per chunk.
 	DefaultChunkSize = 1000
 	// LargeFileSizeMB is the threshold for considering a file "large".
@@ -501,7 +504,7 @@ func (t *ReadTool) readNotebook(filePath string) (ToolResult, error) {
 // readText reads a regular text file with line numbers.
 func (t *ReadTool) readText(ctx context.Context, filePath string, args map[string]any) (ToolResult, error) {
 	offset := GetIntDefault(args, "offset", 1)
-	limit := GetIntDefault(args, "limit", 2000)
+	limit := GetIntDefault(args, "limit", DefaultReadLimit)
 
 	// Ensure offset is at least 1
 	if offset < 1 {
