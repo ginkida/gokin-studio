@@ -383,6 +383,11 @@ func (t *EditTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 				}
 
 				status := fmt.Sprintf("Edited (fuzzy: %s): %s", strategy, filePath)
+				if newStr != "" {
+					if idx := strings.Index(newContent, newStr); idx >= 0 {
+						status += editedRegionSnippet(newContent, 1+strings.Count(newContent[:idx], "\n"))
+					}
+				}
 				return NewSuccessResult(status), nil
 			}
 
@@ -457,6 +462,9 @@ func (t *EditTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 		status = fmt.Sprintf("Replaced %d occurrence(s) in %s", count, filePath)
 	} else {
 		status = fmt.Sprintf("Replaced 1 occurrence in %s", filePath)
+		if idx := strings.Index(content, oldStr); idx >= 0 {
+			status += editedRegionSnippet(newContent, 1+strings.Count(content[:idx], "\n"))
+		}
 	}
 
 	// Emit FilePeek
@@ -659,7 +667,9 @@ func (t *EditTool) executeLineEdit(ctx context.Context, filePath string, lineSta
 	EmitFilePeek(ctx, filePath, "Editing", newContent, "edit")
 
 	replacedCount := lineEnd - lineStart + 1
-	return NewSuccessResult(fmt.Sprintf("Replaced lines %d-%d (%d lines) in %s", lineStart, lineEnd, replacedCount, filePath)), nil
+	status := fmt.Sprintf("Replaced lines %d-%d (%d lines) in %s", lineStart, lineEnd, replacedCount, filePath)
+	status += editedRegionSnippet(newContent, lineStart)
+	return NewSuccessResult(status), nil
 }
 
 // executeInsertAfterLine inserts new text after the specified line without deleting anything.
@@ -739,7 +749,9 @@ func (t *EditTool) executeInsertAfterLine(ctx context.Context, filePath string, 
 	// Emit FilePeek
 	EmitFilePeek(ctx, filePath, "Inserting", newContent, "edit")
 
-	return NewSuccessResult(fmt.Sprintf("Inserted %d lines after line %d in %s", len(newLines), afterLine, filePath)), nil
+	status := fmt.Sprintf("Inserted %d lines after line %d in %s", len(newLines), afterLine, filePath)
+	status += editedRegionSnippet(newContent, afterLine+1)
+	return NewSuccessResult(status), nil
 }
 
 // extractFileContext formats file content with line numbers for error context.
@@ -1083,4 +1095,60 @@ func tryFuzzyReplace(content, old, new string, replaceAll bool) (string, string,
 	}
 
 	return "", "", fmt.Errorf("no fuzzy strategy matched")
+}
+
+// ambiguousMatchContextLines is how many surrounding lines to show per match
+// in the ambiguity error returned to the model.
+const ambiguousMatchContextLines = 2
+
+// renderLineContext extracts `before+1+after` lines around 1-based
+// `lineNum`, each prefixed with its line number and a marker ("→") on
+// the target line. Used by the ambiguity error to give the model
+// enough context to pick precisely.
+func renderLineContext(lines []string, lineNum, around int) string {
+	if lineNum < 1 || lineNum > len(lines) {
+		return ""
+	}
+	start := max(lineNum-around, 1)
+	end := min(lineNum+around, len(lines))
+	var sb strings.Builder
+	for i := start; i <= end; i++ {
+		marker := "  "
+		if i == lineNum {
+			marker = "→ "
+		}
+		fmt.Fprintf(&sb, "%s%d: %s\n", marker, i, lines[i-1])
+	}
+	return sb.String()
+}
+
+// editedRegionSnippet renders the freshly-written region of the file with line
+// numbers, appended to every edit success result. Purpose: kill the
+// read→edit→re-read-to-verify cycle — the classic weak-model loop. With the
+// updated region in the result, a verification read is provably unnecessary,
+// and the model can confirm correctness (or spot a mis-edit) without another
+// tool call.
+func editedRegionSnippet(newContent string, line int) string {
+	const (
+		snippetContextLines = 4
+		snippetMaxLineRunes = 200
+	)
+	lines := strings.Split(newContent, "\n")
+	if len(lines) == 0 {
+		return ""
+	}
+	line = min(max(line, 1), len(lines))
+	start := max(1, line-snippetContextLines)
+	end := min(len(lines), line+snippetContextLines)
+
+	var b strings.Builder
+	b.WriteString("\n\nUpdated region (already written to disk — no verification read needed):\n")
+	for i := start; i <= end; i++ {
+		text := lines[i-1]
+		if runes := []rune(text); len(runes) > snippetMaxLineRunes {
+			text = string(runes[:snippetMaxLineRunes]) + "…"
+		}
+		fmt.Fprintf(&b, "%5d\t%s\n", i, text)
+	}
+	return b.String()
 }
