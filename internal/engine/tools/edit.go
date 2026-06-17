@@ -988,14 +988,9 @@ func tryFuzzyReplace(content, old, new string, replaceAll bool) (string, string,
 
 	for _, strategy := range fuzzyStrategies {
 		normalizedOld := strategy.normalize(old)
-		// If normalization doesn't change old, this strategy won't help
-		if normalizedOld == old {
-			continue
-		}
-
 		normalizedContent := strategy.normalize(content)
-		// If normalization doesn't change content either, skip
-		if normalizedContent == content {
+		// Skip only if normalization changes neither string — then it can't help.
+		if normalizedOld == old && normalizedContent == content {
 			continue
 		}
 
