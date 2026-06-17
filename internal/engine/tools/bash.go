@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -141,9 +142,7 @@ func (s *BashSession) Env() map[string]string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cp := make(map[string]string, len(s.env))
-	for k, v := range s.env {
-		cp[k] = v
-	}
+	maps.Copy(cp, s.env)
 	return cp
 }
 
@@ -875,15 +874,13 @@ func (t *BashTool) executeForeground(ctx context.Context, command string, stdinC
 	var cmdErrMu sync.Mutex
 	cmdDone := make(chan struct{})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		waitErr := cmd.Wait()
 		cmdErrMu.Lock()
 		cmdErr = waitErr
 		cmdErrMu.Unlock()
 		close(cmdDone)
-	}()
+	})
 
 	// Track if we timed out to provide proper error message
 	timedOut := false
@@ -959,10 +956,10 @@ func mergeBashOutput(stdoutStr, stderrStr string) string {
 	const maxLen = 30000
 	const headSize = 10000
 	const tailSize = 20000
-	if len(result) > maxLen {
-		head := result[:headSize]
-		tail := result[len(result)-tailSize:]
-		omitted := result[headSize : len(result)-tailSize]
+	if runes := []rune(result); len(runes) > maxLen {
+		head := string(runes[:headSize])
+		tail := string(runes[len(runes)-tailSize:])
+		omitted := string(runes[headSize : len(runes)-tailSize])
 		omittedLines := strings.Count(omitted, "\n")
 		result = head +
 			fmt.Sprintf("\n\n... [%d lines, %d chars omitted] ...\n\n", omittedLines, len(omitted)) +
