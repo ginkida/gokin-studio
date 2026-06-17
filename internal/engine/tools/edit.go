@@ -16,6 +16,18 @@ import (
 
 const editContextMaxChars = 5000
 
+// existingPerm returns the permission bits of the file at path, or 0644 as a
+// safe default when the file is unreadable or doesn't exist. Used so edits to
+// executable scripts (0755) or other specially-permed files preserve the mode
+// that was there before — writing with a hardcoded 0644 would silently strip
+// the execute bit.
+func existingPerm(path string) os.FileMode {
+	if info, err := os.Stat(path); err == nil {
+		return info.Mode().Perm()
+	}
+	return 0644
+}
+
 // EditTool performs search/replace operations in files.
 type EditTool struct {
 	undoManager   *undo.Manager
@@ -367,7 +379,7 @@ func (t *EditTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 
 				// Write back atomically
 				newContentBytes := []byte(newContent)
-				if err := AtomicWrite(filePath, newContentBytes, 0644); err != nil {
+				if err := AtomicWrite(filePath, newContentBytes, existingPerm(filePath)); err != nil {
 					return NewErrorResult(fmt.Sprintf("error writing file: %s", err)), nil
 				}
 				if t.undoManager != nil {
@@ -435,7 +447,7 @@ func (t *EditTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 
 	// Write back atomically to prevent data corruption on interruption
 	newContentBytes := []byte(newContent)
-	if err := AtomicWrite(filePath, newContentBytes, 0644); err != nil {
+	if err := AtomicWrite(filePath, newContentBytes, existingPerm(filePath)); err != nil {
 		return NewErrorResult(fmt.Sprintf("error writing file: %s", err)), nil
 	}
 
@@ -548,7 +560,7 @@ func (t *EditTool) executeMultiEdit(ctx context.Context, filePath string, edits 
 
 	// Write atomically
 	newContentBytes := []byte(content)
-	if err := AtomicWrite(filePath, newContentBytes, 0644); err != nil {
+	if err := AtomicWrite(filePath, newContentBytes, existingPerm(filePath)); err != nil {
 		return NewErrorResult(fmt.Sprintf("error writing file: %s", err)), nil
 	}
 
@@ -638,7 +650,7 @@ func (t *EditTool) executeLineEdit(ctx context.Context, filePath string, lineSta
 
 	// Write atomically
 	newContentBytes := []byte(newContent)
-	if err := AtomicWrite(filePath, newContentBytes, 0644); err != nil {
+	if err := AtomicWrite(filePath, newContentBytes, existingPerm(filePath)); err != nil {
 		return NewErrorResult(fmt.Sprintf("error writing file: %s", err)), nil
 	}
 
@@ -725,7 +737,7 @@ func (t *EditTool) executeInsertAfterLine(ctx context.Context, filePath string, 
 
 	// Write atomically
 	newContentBytes := []byte(newContent)
-	if err := AtomicWrite(filePath, newContentBytes, 0644); err != nil {
+	if err := AtomicWrite(filePath, newContentBytes, existingPerm(filePath)); err != nil {
 		return NewErrorResult(fmt.Sprintf("error writing file: %s", err)), nil
 	}
 
