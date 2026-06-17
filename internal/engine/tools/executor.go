@@ -624,10 +624,11 @@ func (e *Executor) executeLoop(ctx context.Context, history []*genai.Content) ([
 	maxIterations := e.calculateMaxIterations(history)
 
 	var finalText string
-	var toolsUsed []string          // Track which tools were used for smart fallback
-	var lastToolResult ToolResult   // Track the last tool result for context
-	var recentToolPatterns []string // Track tool name patterns per iteration for stagnation detection
-	const stagnationLimit = 5       // Consecutive identical tool patterns before aborting
+	var toolsUsed []string                            // Track which tools were used for smart fallback
+	var lastToolResult ToolResult                     // Track the last tool result for context
+	var recentToolPatterns []string                   // Track tool name patterns per iteration for stagnation detection
+	const stagnationLimit = 5                         // Consecutive identical tool patterns before aborting
+	coverage := newExecutorCoverageTracker(e.workDir) // Per-target drift-loop guard
 	streamRetries := 0
 	partialStreamRetries := 0
 	retryPolicy := client.DefaultStreamRetryPolicy()
@@ -764,9 +765,40 @@ func (e *Executor) executeLoop(ctx context.Context, history []*genai.Content) ([
 				}
 			}
 
-			results, err := e.executeTools(ctx, resp.FunctionCalls)
-			if err != nil {
-				return history, "", fmt.Errorf("tool execution error: %w", err)
+			// Per-target drift-loop guard: catches models that perturb args each
+			// call (drifting read offset, rotating grep pattern) to escape the
+			// exact-fingerprint stagnation check above.
+			var coverageResults []*genai.FunctionResponse
+			if offender := coverage.observeBatch(resp.FunctionCalls); offender != nil {
+				if coverage.trips < maxCoverageRecoveryAttempts {
+					coverage.trips++
+					logging.Warn("executor re-coverage loop: sending recovery hint",
+						"tool", offender.name,
+						"target", offender.target,
+						"redundant", offender.redundant,
+						"trip", coverage.trips)
+					coverageResults = e.buildCoverageRecoveryResults(resp.FunctionCalls, offender)
+					coverage.resetWindow()
+				} else {
+					logging.Warn("executor re-coverage loop: recovery budget exhausted, aborting",
+						"tool", offender.name,
+						"target", offender.target,
+						"redundant", offender.redundant,
+						"trips", coverage.trips)
+					return history, "", fmt.Errorf(
+						"executor re-coverage loop: %s re-covered %q %d times with shifting arguments after %d recovery hints",
+						offender.name, offender.target, offender.redundant, coverage.trips)
+				}
+			}
+
+			var results []*genai.FunctionResponse
+			if coverageResults != nil {
+				results = coverageResults
+			} else {
+				results, err = e.executeTools(ctx, resp.FunctionCalls)
+				if err != nil {
+					return history, "", fmt.Errorf("tool execution error: %w", err)
+				}
 			}
 
 			// Track last result for smart fallback
