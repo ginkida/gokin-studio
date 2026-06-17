@@ -135,7 +135,7 @@ var toolSetDefinitions = map[ToolSet][]string{
 	},
 	ToolSetPlanning: {
 		"enter_plan_mode", "update_plan_progress", "get_plan_status",
-		"exit_plan_mode", "undo_plan", "redo_plan",
+		"exit_plan_mode",
 		"task", "task_output", "task_stop",
 	},
 	ToolSetAgent: {
@@ -145,18 +145,19 @@ var toolSetDefinitions = map[ToolSet][]string{
 		"web_fetch", "web_search",
 	},
 	ToolSetAdvanced: {
-		"batch", "refactor", "check_impact",
+		"batch", "check_impact",
 		"verify_code", "run_tests", "review_changes",
+		"go_to_definition", "find_references",
 	},
 	ToolSetSemantic: {
-		"semantic_search", "code_graph",
+		"go_to_definition", "find_references",
 	},
 	ToolSetMemory: {
 		"memory", "memorize", "pin_context", "history_search",
 	},
 	ToolSetFileOps: {
 		"copy", "move", "delete", "mkdir",
-		"env", "kill_shell", "ssh",
+		"env", "kill_shell",
 	},
 	ToolSetOllamaCore: {
 		"read", "write", "edit", "bash", "glob", "grep",
@@ -268,6 +269,10 @@ func DefaultRegistry(workDir string) *Registry {
 	r.MustRegister(NewVerifyCodeTool(workDir))
 	r.MustRegister(NewReviewChangesTool(workDir))
 	r.MustRegister(NewCheckImpactTool(workDir))
+
+	// Semantic code navigation tools (gopls-backed with AST fallback)
+	r.MustRegister(NewGoToDefinitionTool(workDir))
+	r.MustRegister(NewFindReferencesTool(workDir))
 
 	return r
 }
@@ -530,6 +535,15 @@ func DefaultLazyRegistry(workDir string) *LazyRegistry {
 	// Custom improvements
 	r.RegisterFactory("pin_context", func() Tool { return NewPinContextTool(nil) }, nil)
 	r.RegisterFactory("history_search", func() Tool { return NewHistorySearchTool(nil) }, nil)
+
+	// Code verification / self-review tools
+	r.RegisterFactory("verify_code", func() Tool { return NewVerifyCodeTool(workDir) }, nil)
+	r.RegisterFactory("review_changes", func() Tool { return NewReviewChangesTool(workDir) }, nil)
+	r.RegisterFactory("check_impact", func() Tool { return NewCheckImpactTool(workDir) }, nil)
+
+	// Semantic code navigation tools
+	r.RegisterFactory("go_to_definition", func() Tool { return NewGoToDefinitionTool(workDir) }, nil)
+	r.RegisterFactory("find_references", func() Tool { return NewFindReferencesTool(workDir) }, nil)
 
 	return r
 }
