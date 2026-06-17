@@ -1577,6 +1577,19 @@ func (e *Executor) doExecuteTool(ctx context.Context, call *genai.FunctionCall) 
 		}
 	}
 
+	// Step 10.4.5: Context enrichment — append project context hints after write/edit
+	// so the model can spot inconsistencies (mismatched go-version, missing function,
+	// etc.) immediately without an extra Read round-trip.
+	if e.contextEnricher != nil && result.Success {
+		if call.Name == "write" || call.Name == "edit" {
+			if fp, _ := call.Args["file_path"].(string); fp != "" {
+				if hint := e.contextEnricher.Enrich(fp); hint != "" {
+					result.Content = strings.TrimRight(result.Content, "\n") + "\n\n" + hint
+				}
+			}
+		}
+	}
+
 	// Step 10.5: Auto-format — run language formatter on write/edit if configured
 	if e.formatter != nil && result.Success {
 		if call.Name == "write" || call.Name == "edit" {

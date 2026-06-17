@@ -47,9 +47,6 @@ func FormatWarnings(w interface{}) string             { return "" }
 // SemanticValidatorRegistry is a stub for semantic validators.
 type SemanticValidatorRegistry struct{}
 
-// ContextEnricher is a stub for context enrichment.
-type ContextEnricher struct{}
-
 // ImpactGateResult is a stub for impact gate evaluation.
 type ImpactGateResult struct {
 	Summary string
