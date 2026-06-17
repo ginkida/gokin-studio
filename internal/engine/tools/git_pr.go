@@ -81,6 +81,11 @@ func (t *GitPRTool) Validate(args map[string]any) error {
 		if pr == "" {
 			return NewValidationError("pr_number", "is required for "+action)
 		}
+		for _, c := range pr {
+			if c < '0' || c > '9' {
+				return NewValidationError("pr_number", "must be a numeric PR number")
+			}
+		}
 	case "list":
 		// no extra params
 	}
@@ -273,9 +278,9 @@ func (t *GitPRTool) generatePRDescription(ctx context.Context, base string) (str
 		}
 	}
 
-	// Truncate title
-	if len(title) > 70 {
-		title = title[:67] + "..."
+	// Truncate title (rune-safe for non-ASCII branch/PR titles)
+	if runes := []rune(title); len(runes) > 70 {
+		title = string(runes[:67]) + "..."
 	}
 
 	// Generate body
@@ -291,7 +296,7 @@ func (t *GitPRTool) generatePRDescription(ctx context.Context, base string) (str
 	for _, commit := range commits {
 		parts := strings.SplitN(commit, " ", 2)
 		if len(parts) >= 2 {
-			body.WriteString(fmt.Sprintf("- %s\n", parts[1]))
+			fmt.Fprintf(&body, "- %s\n", parts[1])
 		}
 	}
 
@@ -315,8 +320,8 @@ func (t *GitPRTool) detectDefaultBranch(ctx context.Context) string {
 	if err == nil {
 		branch := strings.TrimSpace(string(output))
 		// Strip "origin/" prefix
-		if idx := strings.Index(branch, "/"); idx >= 0 {
-			return branch[idx+1:]
+		if _, after, ok := strings.Cut(branch, "/"); ok {
+			return after
 		}
 		return branch
 	}

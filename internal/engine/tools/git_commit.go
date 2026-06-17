@@ -118,6 +118,12 @@ func (t *GitCommitTool) Execute(ctx context.Context, args map[string]any) (ToolR
 		if strings.Contains(outStr, "no changes added") {
 			return NewErrorResult("no changes added to commit (use git_add first or set all=true)"), nil
 		}
+		if strings.Contains(outStr, "unmerged files") || strings.Contains(outStr, "during a merge") {
+			return NewErrorResult("cannot commit: unmerged files exist. Resolve conflicts first, then git_add the resolved files."), nil
+		}
+		if strings.Contains(outStr, "rebase in progress") {
+			return NewErrorResult("cannot commit: a rebase is in progress. Use bash to run 'git rebase --continue' or 'git rebase --abort' first."), nil
+		}
 		return NewErrorResult(fmt.Sprintf("git commit failed: %s\n%s", err, outStr)), nil
 	}
 
@@ -172,8 +178,8 @@ func (t *GitCommitTool) generateCommitMessage(ctx context.Context, includeUnstag
 	}
 
 	diffStr := string(detailOutput)
-	if len(diffStr) > 4000 {
-		diffStr = diffStr[:4000] + "\n... (truncated)"
+	if runes := []rune(diffStr); len(runes) > 4000 {
+		diffStr = string(runes[:4000]) + "\n... (truncated)"
 	}
 
 	// Analyze the changes
@@ -297,10 +303,10 @@ func DetectScope(files []string) string {
 	for _, f := range files {
 		parts := strings.Split(f, "/")
 		if len(parts) >= 2 {
-			// Use the most specific package dir
+			// Use the most specific package dir; skip bare "internal" — go up one level
 			pkg := parts[len(parts)-2]
 			if pkg == "internal" && len(parts) >= 3 {
-				pkg = parts[len(parts)-2]
+				pkg = parts[len(parts)-3]
 			}
 			packages[pkg]++
 		}

@@ -129,10 +129,117 @@ func (t *GitDiffTool) Execute(ctx context.Context, args map[string]any) (ToolRes
 		return NewSuccessResult("No differences found."), nil
 	}
 
-	// Truncate if output is too large
-	if len(result) > 50000 {
-		result = result[:50000] + "\n\n... (output truncated)"
+	// Truncate if output is too large (rune-safe)
+	const maxLen = 50000
+	if runes := []rune(result); len(runes) > maxLen {
+		result = string(runes[:maxLen]) + "\n\n... (diff truncated — use specific file paths to narrow the diff)"
+	}
+
+	// Build actionable summary for --name-status mode
+	if nameStatus {
+		var builder strings.Builder
+		builder.WriteString(actionableGitDiffSummary(result))
+		builder.WriteString("\n")
+		builder.WriteString(result)
+		return NewSuccessResult(builder.String()), nil
 	}
 
 	return NewSuccessResult(result), nil
+}
+
+// actionableGitDiffSummary parses --name-status diff output and provides a
+// structured summary with change counts and "Next:" hint.
+func actionableGitDiffSummary(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	lines := strings.Split(strings.TrimSpace(raw), "\n")
+	var added, modified, deleted, renamed []string
+	seen := map[string]bool{}
+
+	for _, line := range lines {
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) < 2 {
+			continue
+		}
+		status := strings.TrimSpace(parts[0])
+		file := parts[len(parts)-1]
+		file = strings.TrimSpace(file)
+
+		switch {
+		case strings.HasPrefix(status, "A"):
+			if !seen[file] {
+				added = append(added, file)
+				seen[file] = true
+			}
+		case strings.HasPrefix(status, "D"):
+			if !seen[file] {
+				deleted = append(deleted, file)
+				seen[file] = true
+			}
+		case strings.HasPrefix(status, "R") || strings.HasPrefix(status, "C"):
+			if !seen[file] {
+				renamed = append(renamed, file)
+				seen[file] = true
+			}
+		default:
+			if !seen[file] {
+				modified = append(modified, file)
+				seen[file] = true
+			}
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString("Actionable summary:\n")
+	total := len(added) + len(modified) + len(deleted) + len(renamed)
+
+	if total == 0 {
+		b.WriteString("- No file-level changes detected.\n")
+		b.WriteString("- Next: review the raw diff output below.\n")
+		return b.String()
+	}
+
+	parts := make([]string, 0, 4)
+	if len(added) > 0 {
+		parts = append(parts, fmt.Sprintf("%d added", len(added)))
+	}
+	if len(modified) > 0 {
+		parts = append(parts, fmt.Sprintf("%d modified", len(modified)))
+	}
+	if len(deleted) > 0 {
+		parts = append(parts, fmt.Sprintf("%d deleted", len(deleted)))
+	}
+	if len(renamed) > 0 {
+		parts = append(parts, fmt.Sprintf("%d renamed", len(renamed)))
+	}
+	fmt.Fprintf(&b, "- %d file(s) changed (%s):\n", total, strings.Join(parts, ", "))
+
+	printDiffCategory(&b, "  Added", added, 5)
+	printDiffCategory(&b, "  Modified", modified, 5)
+	printDiffCategory(&b, "  Deleted", deleted, 5)
+	printDiffCategory(&b, "  Renamed", renamed, 5)
+
+	b.WriteString("- Next: ")
+	switch {
+	case len(added) > 0 || len(modified) > 0:
+		b.WriteString("read changed files to understand the scope of changes, then act on the findings.\n")
+	case len(deleted) > 0:
+		b.WriteString("verify the deleted files are intentionally removed, then commit.\n")
+	default:
+		b.WriteString("review the diff, then commit or continue working.\n")
+	}
+	b.WriteString("\n")
+	return b.String()
+}
+
+func printDiffCategory(b *strings.Builder, label string, files []string, limit int) {
+	if len(files) == 0 {
+		return
+	}
+	if len(files) <= limit {
+		fmt.Fprintf(b, "%s: %s\n", label, strings.Join(files, ", "))
+	} else {
+		fmt.Fprintf(b, "%s (%d): %s, ...\n", label, len(files), strings.Join(files[:limit], ", "))
+	}
 }

@@ -77,10 +77,7 @@ func (t *GitLogTool) Validate(args map[string]any) error {
 }
 
 func (t *GitLogTool) Execute(ctx context.Context, args map[string]any) (ToolResult, error) {
-	count := GetIntDefault(args, "count", 10)
-	if count > 100 {
-		count = 100
-	}
+	count := min(GetIntDefault(args, "count", 10), 100)
 
 	file := GetStringDefault(args, "file", "")
 	oneline := GetBoolDefault(args, "oneline", true)
@@ -133,6 +130,10 @@ func (t *GitLogTool) Execute(ctx context.Context, args map[string]any) (ToolResu
 	result := strings.TrimSpace(string(output))
 	if result == "" {
 		return NewSuccessResult("No commits found matching the criteria."), nil
+	}
+
+	if runes := []rune(result); len(runes) > 30000 {
+		result = string(runes[:30000]) + "\n\n... (log truncated — use count or after/before to narrow)"
 	}
 
 	return NewSuccessResult(result), nil
