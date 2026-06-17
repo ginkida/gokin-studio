@@ -165,9 +165,9 @@ type Executor struct {
 	permissions       *permission.Manager
 	hooks             *hooks.Manager
 	// auditLogger removed (audit package not extracted)
-	sessionID         string
-	fallback          FallbackConfig
-	clientMu          sync.RWMutex // Protects client field
+	sessionID string
+	fallback  FallbackConfig
+	clientMu  sync.RWMutex // Protects client field
 
 	// Enhanced safety features
 	safetyValidator  SafetyValidator
@@ -1408,12 +1408,13 @@ func (e *Executor) doExecuteTool(ctx context.Context, call *genai.FunctionCall) 
 					limit = int(v)
 				}
 				if filePath != "" {
-					isDup, origRec, _ := e.readTracker.CheckAndRecord(filePath, offset, limit, len(cached.Content))
-					if isDup && origRec != nil {
-						cached.Content = fmt.Sprintf(
-							"[File already read at turn %d, content unchanged (%d chars). Path: %s]",
-							origRec.TurnIndex, origRec.ContentLen, filePath)
-						return cached
+					isDup, origRec, _, dupCount := e.readTracker.CheckAndRecord(filePath, offset, limit, len(cached.Content))
+					if isDup {
+						if stub, ok := dedupReadStub(origRec, filePath, dupCount); ok {
+							cached.Content = stub
+							return cached
+						}
+						// dupCount==2: let the full content through so the model recovers.
 					}
 				}
 			}
@@ -1635,11 +1636,12 @@ func (e *Executor) doExecuteTool(ctx context.Context, call *genai.FunctionCall) 
 				limit = int(v)
 			}
 			if filePath != "" {
-				isDup, origRec, _ := e.readTracker.CheckAndRecord(filePath, offset, limit, len(result.Content))
-				if isDup && origRec != nil {
-					result.Content = fmt.Sprintf(
-						"[File already read at turn %d, content unchanged (%d chars). Path: %s]",
-						origRec.TurnIndex, origRec.ContentLen, filePath)
+				isDup, origRec, _, dupCount := e.readTracker.CheckAndRecord(filePath, offset, limit, len(result.Content))
+				if isDup {
+					if stub, ok := dedupReadStub(origRec, filePath, dupCount); ok {
+						result.Content = stub
+					}
+					// dupCount==2: let the full content through so the model recovers.
 				}
 			}
 		}

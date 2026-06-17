@@ -4222,3 +4222,104 @@ func TestTrimOutputKeepEnds(t *testing.T) {
 		t.Error("trimOutputKeepEnds missing elided notice")
 	}
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// FileReadTracker — DupCount / dedupReadStub / RecentlyReadFiles / HasBeenRead
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestFileReadTracker_DupCountAndStub(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "a.go")
+	if err := os.WriteFile(f, []byte("hello"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	tr := NewFileReadTracker()
+
+	// First read — not a dup
+	isDup, _, _, _ := tr.CheckAndRecord(f, 1, 100, 5)
+	if isDup {
+		t.Fatal("first read should not be dup")
+	}
+
+	// Second read (dupCount=1) — stub returned
+	isDup, origRec, _, dupCount := tr.CheckAndRecord(f, 1, 100, 5)
+	if !isDup {
+		t.Fatal("second read should be dup")
+	}
+	if dupCount != 1 {
+		t.Errorf("expected dupCount=1, got %d", dupCount)
+	}
+	stub, ok := dedupReadStub(origRec, f, dupCount)
+	if !ok {
+		t.Fatal("dedupReadStub(dupCount=1) should return ok=true")
+	}
+	if stub == "" {
+		t.Fatal("stub should be non-empty")
+	}
+
+	// Third read (dupCount=2) — self-heal: full content should flow through
+	isDup, origRec2, _, dupCount2 := tr.CheckAndRecord(f, 1, 100, 5)
+	if !isDup {
+		t.Fatal("third read should still be dup")
+	}
+	if dupCount2 != 2 {
+		t.Errorf("expected dupCount=2, got %d", dupCount2)
+	}
+	_, ok2 := dedupReadStub(origRec2, f, dupCount2)
+	if ok2 {
+		t.Fatal("dedupReadStub(dupCount=2) should return ok=false (self-healing: send full content)")
+	}
+
+	// Fourth read (dupCount=3) — back to stub
+	isDup, origRec3, _, dupCount3 := tr.CheckAndRecord(f, 1, 100, 5)
+	if !isDup {
+		t.Fatal("fourth read should be dup")
+	}
+	_, ok3 := dedupReadStub(origRec3, f, dupCount3)
+	if !ok3 {
+		t.Fatal("dedupReadStub(dupCount=3) should return ok=true again")
+	}
+}
+
+func TestFileReadTracker_HasBeenRead(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "b.go")
+	if err := os.WriteFile(f, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	tr := NewFileReadTracker()
+	if tr.HasBeenRead(f) {
+		t.Fatal("should not have been read yet")
+	}
+	tr.CheckAndRecord(f, 1, 100, 1)
+	if !tr.HasBeenRead(f) {
+		t.Fatal("should have been read after CheckAndRecord")
+	}
+	tr.InvalidateFile(f)
+	if tr.HasBeenRead(f) {
+		t.Fatal("should not have been read after invalidation")
+	}
+}
+
+func TestFileReadTracker_RecentlyReadFiles(t *testing.T) {
+	dir := t.TempDir()
+	files := []string{"c.go", "d.go", "e.go"}
+	for _, name := range files {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(name), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tr := NewFileReadTracker()
+	for _, name := range files {
+		tr.CheckAndRecord(filepath.Join(dir, name), 1, 100, len(name))
+	}
+	recent := tr.RecentlyReadFiles(2)
+	if len(recent) != 2 {
+		t.Fatalf("expected 2, got %d", len(recent))
+	}
+	// Most recently recorded should be first
+	if !strings.HasSuffix(recent[0], "e.go") {
+		t.Errorf("expected e.go first, got %s", recent[0])
+	}
+}
