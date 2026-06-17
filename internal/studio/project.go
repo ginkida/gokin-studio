@@ -1041,19 +1041,20 @@ outer:
 
 				tool, ok := reg.Get(fc.Name)
 				if !ok {
+					errMsg := tools.FormatUnknownToolError(fc.Name, reg.Names())
 					funcParts = append(funcParts, &genai.Part{
 						FunctionResponse: &genai.FunctionResponse{
 							ID:       fc.ID,
 							Name:     fc.Name,
-							Response: map[string]any{"error": "unknown tool: " + fc.Name},
+							Response: map[string]any{"error": errMsg},
 						},
 					})
 					p.emitEvent(wailsCtx, EventChatToolResult, ChatToolResultEvent{
 						ProjectID: p.ID, SessionID: sid, Tool: fc.Name, Success: false,
-						Content: "unknown tool: " + fc.Name,
+						Content: errMsg,
 					})
 					notSuccess := false
-					replay.Append(ReplayEvent{Type: "tool_result", Tool: fc.Name, Success: &notSuccess, Text: "unknown tool: " + fc.Name})
+					replay.Append(ReplayEvent{Type: "tool_result", Tool: fc.Name, Success: &notSuccess, Text: errMsg})
 					continue
 				}
 

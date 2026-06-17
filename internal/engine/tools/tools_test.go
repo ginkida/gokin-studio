@@ -4075,3 +4075,58 @@ func TestReadTool_PathValidationSuggestsWorkDirFiles(t *testing.T) {
 		t.Errorf("expected workdir suggestion for 'server.go', got:\nError: %s\nContent: %s", result.Error, result.Content)
 	}
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// FormatUnknownToolError / suggestToolNames
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestFormatUnknownToolError_Suggestion(t *testing.T) {
+	available := []string{"edit", "read", "bash", "write", "git_status"}
+	msg := FormatUnknownToolError("editt", available)
+	if !strings.Contains(msg, "edit") {
+		t.Errorf("expected suggestion 'edit' in message, got: %s", msg)
+	}
+}
+
+func TestFormatUnknownToolError_NoSuggestion(t *testing.T) {
+	available := []string{"edit", "read", "bash"}
+	msg := FormatUnknownToolError("xyz123completelydifferent", available)
+	if strings.Contains(msg, "Did you mean") {
+		t.Errorf("expected no suggestion, got: %s", msg)
+	}
+	if !strings.Contains(msg, "unknown tool") {
+		t.Errorf("expected 'unknown tool' in message, got: %s", msg)
+	}
+}
+
+func TestSuggestToolNames_PrefixMatch(t *testing.T) {
+	available := []string{"git_status", "git_diff", "git_commit", "bash"}
+	suggestions := suggestToolNames("git_sta", available, 3)
+	if len(suggestions) == 0 {
+		t.Fatal("expected at least one suggestion with 'git_sta' prefix")
+	}
+	if suggestions[0] != "git_status" {
+		t.Errorf("expected 'git_status' as top suggestion, got %s", suggestions[0])
+	}
+}
+
+func TestLevenshtein_Basic(t *testing.T) {
+	tests := []struct {
+		a, b string
+		want int
+	}{
+		{"", "", 0},
+		{"a", "", 1},
+		{"", "a", 1},
+		{"edit", "edit", 0},
+		{"edit", "editt", 1},  // one insertion
+		{"read", "reed", 1},   // one substitution
+		{"bash", "batch", 2},  // two operations
+	}
+	for _, tc := range tests {
+		got := levenshtein(tc.a, tc.b)
+		if got != tc.want {
+			t.Errorf("levenshtein(%q, %q) = %d; want %d", tc.a, tc.b, got, tc.want)
+		}
+	}
+}
