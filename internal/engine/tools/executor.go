@@ -215,6 +215,7 @@ type Executor struct {
 	deltaCheckMu          sync.Mutex
 	deltaCheckBlocked     bool
 	deltaCheckBlockReason string
+	deltaCheckGracedCalls int // calls through barrier after a failed check (see deltaCheckBarrierGraceLimit)
 	deltaCheckLastHash    string
 	deltaCheckLastResult  *deltaCheckResult
 	deltaBaselineCaptured bool
@@ -1581,6 +1582,20 @@ func (e *Executor) doExecuteTool(ctx context.Context, call *genai.FunctionCall) 
 		if call.Name == "write" || call.Name == "edit" {
 			if fp, _ := call.Args["file_path"].(string); fp != "" {
 				_ = e.formatter.Format(ctx, fp)
+			}
+		}
+	}
+
+	// Step 10.6: Run delta-check after successful mutations to catch broken builds early.
+	// Appends the failure summary to Content so the model sees the build error immediately.
+	if result.Success {
+		if dcResult := e.runDeltaCheckAfterMutation(ctx, call); dcResult != nil {
+			logDeltaCheckFailure(*dcResult)
+			if !dcResult.Passed && dcResult.Summary != "" {
+				result.Content = strings.TrimRight(result.Content, "\n") + "\n\n⚠ " + dcResult.Summary
+				if dcResult.Details != "" {
+					result.Content += "\n" + trimOutputKeepEnds(dcResult.Details, 2000)
+				}
 			}
 		}
 	}
