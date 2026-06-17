@@ -170,6 +170,10 @@ func (t *GrepTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 	globPattern := GetStringDefault(args, "glob", "")
 	caseInsensitive := GetBoolDefault(args, "case_insensitive", false)
 	contextLines := GetIntDefault(args, "context_lines", 0)
+	const maxContextLines = 5
+	if contextLines > maxContextLines {
+		contextLines = maxContextLines
+	}
 	invertMatch := GetBoolDefault(args, "invert", false)
 	countOnly := GetBoolDefault(args, "count_only", false)
 
@@ -270,6 +274,7 @@ func (t *GrepTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 	// Count-only mode
 	if countOnly {
 		var results strings.Builder
+		perFile := map[string]int{}
 		totalCount := 0
 		fileCount := 0
 		for _, fm := range fileMatches {
@@ -279,21 +284,23 @@ func (t *GrepTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 			}
 			count := len(fm.matches)
 			if count > 0 {
-				results.WriteString(fmt.Sprintf("%s: %d\n", relPath, count))
+				fmt.Fprintf(&results, "%s: %d\n", relPath, count)
 				totalCount += count
 				fileCount++
+				perFile[relPath] = count
 			}
 		}
 		if totalCount == 0 {
 			return NewSuccessResult("No matches found."), nil
 		}
-		summary := fmt.Sprintf("Total: %d match(es) in %d file(s):\n\n", totalCount, fileCount)
+		summary := fmt.Sprintf("Total: %d match(es) in %d file(s):\n%s\n", totalCount, fileCount, actionableGrepSummary(perFile, true))
 		return NewSuccessResult(summary + results.String()), nil
 	}
 
 	// Build results and cache data
 	var results strings.Builder
 	var cacheMatches []cache.GrepMatch
+	perFile := map[string]int{}
 	matchCount := 0
 	fileCount := 0
 
@@ -313,17 +320,21 @@ func (t *GrepTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 			t.predictor.RecordAccess(fm.path, "grep", "")
 		}
 
+		beforeFileMatchCount := matchCount
 		for _, match := range fm.matches {
 			if matchCount >= maxMatches {
 				break
 			}
-			results.WriteString(fmt.Sprintf("%s:%d: %s\n", relPath, match.lineNum, match.line))
+			fmt.Fprintf(&results, "%s:%d: %s\n", relPath, match.lineNum, match.line)
 			cacheMatches = append(cacheMatches, cache.GrepMatch{
 				FilePath: fm.path,
 				LineNum:  match.lineNum,
 				Line:     match.line,
 			})
 			matchCount++
+		}
+		if delta := matchCount - beforeFileMatchCount; delta > 0 {
+			perFile[relPath] = delta
 		}
 	}
 
@@ -347,7 +358,7 @@ func (t *GrepTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 	if matchCount >= maxMatches {
 		summary = fmt.Sprintf("%s %d+ match(es) in %d file(s) (capped at %d — refine pattern for complete results):\n\n", label, matchCount, fileCount, maxMatches)
 	}
-	return NewSuccessResult(summary + results.String()), nil
+	return NewSuccessResult(summary + actionableGrepSummary(perFile, false) + "\n" + results.String()), nil
 }
 
 // invertMatches returns lines that do NOT match the regex for each file.
@@ -374,8 +385,8 @@ func (t *GrepTool) invertMatches(ctx context.Context, files []string, re *regexp
 			lineNum++
 			line := scanner.Text()
 			if !re.MatchString(line) {
-				if len(line) > 500 {
-					line = line[:500] + "..."
+				if runes := []rune(line); len(runes) > 500 {
+					line = string(runes[:500]) + "..."
 				}
 				matches = append(matches, grepMatch{lineNum: lineNum, line: line})
 			}
@@ -387,9 +398,7 @@ func (t *GrepTool) invertMatches(ctx context.Context, files []string, re *regexp
 		}
 	}
 
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].path < results[j].path
-	})
+	sortFileMatchesByRelevance(results)
 
 	return results
 }
@@ -443,10 +452,8 @@ searchLoop:
 
 	wg.Wait()
 
-	// Sort results by file path for consistent output
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].path < results[j].path
-	})
+	// Rank by relevance: first-party source > tests > generated > vendor.
+	sortFileMatchesByRelevance(results)
 
 	return results
 }
@@ -529,10 +536,7 @@ func (t *GrepTool) searchFile(filePath string, re *regexp.Regexp, contextLines i
 	for lineNum, line := range allLines {
 		if re.MatchString(line) {
 			// Add context lines before
-			start := lineNum - contextLines
-			if start < 0 {
-				start = 0
-			}
+			start := max(lineNum-contextLines, 0)
 
 			// Add context lines after
 			end := lineNum + contextLines
@@ -548,9 +552,9 @@ func (t *GrepTool) searchFile(filePath string, re *regexp.Regexp, contextLines i
 				matchedLines[i] = true
 
 				contextLine := allLines[i]
-				// Truncate long lines
-				if len(contextLine) > 500 {
-					contextLine = contextLine[:500] + "..."
+				// Truncate long lines (rune-safe)
+				if runes := []rune(contextLine); len(runes) > 500 {
+					contextLine = string(runes[:500]) + "..."
 				}
 				matches = append(matches, grepMatch{
 					lineNum: i + 1, // 1-indexed
@@ -598,7 +602,7 @@ func isBinaryFile(path string) bool {
 	if err != nil && err != io.EOF {
 		return false
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if buf[i] == 0 {
 			return true
 		}
@@ -704,4 +708,44 @@ func (t *GrepTool) ExecuteStreaming(ctx context.Context, args map[string]any) (*
 	}()
 
 	return result, nil
+}
+
+// actionableGrepSummary returns a "top files by match density + Next:" hint
+// for inclusion in grep output headers.
+func actionableGrepSummary(perFile map[string]int, countOnly bool) string {
+	if len(perFile) == 0 {
+		return ""
+	}
+	type fileCount struct {
+		path  string
+		count int
+	}
+	files := make([]fileCount, 0, len(perFile))
+	for path, count := range perFile {
+		files = append(files, fileCount{path: path, count: count})
+	}
+	sort.Slice(files, func(i, j int) bool {
+		if files[i].count != files[j].count {
+			return files[i].count > files[j].count
+		}
+		return files[i].path < files[j].path
+	})
+
+	limit := min(3, len(files))
+	var b strings.Builder
+	b.WriteString("Actionable summary:\n")
+	b.WriteString("- Most relevant files by match density: ")
+	for i := range limit {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "%s (%d)", files[i].path, files[i].count)
+	}
+	b.WriteString("\n")
+	if countOnly {
+		b.WriteString("- Next: run grep without count_only or read the top file(s) before editing.\n\n")
+	} else {
+		b.WriteString("- Next: read the most relevant file(s) with targeted offsets before editing; do not edit from grep snippets alone.\n\n")
+	}
+	return b.String()
 }
