@@ -3,6 +3,7 @@ package tools
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -632,6 +633,22 @@ func (c *cappedBuffer) String() string {
 	return c.buf.String() + fmt.Sprintf("\n... [output truncated: %d more bytes] ...", c.dropped)
 }
 
+// startCommandErrorResult turns a cmd.Start() failure into an honest result.
+// When an already-expired or cancelled context is the real cause, the generic
+// "failed to start command" message is actively misleading — git/ls/etc. exist
+// fine, the run simply never got to start. Classify those explicitly so neither
+// the user nor the model chases a phantom "bad command" problem.
+func startCommandErrorResult(execCtx context.Context, err error) ToolResult {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded) || errors.Is(execCtx.Err(), context.DeadlineExceeded):
+		return NewErrorResult("command did not start: the tool timeout elapsed before execution began")
+	case errors.Is(err, context.Canceled) || errors.Is(execCtx.Err(), context.Canceled):
+		return NewErrorResult("command did not start: cancelled before execution began")
+	default:
+		return NewErrorResult(fmt.Sprintf("could not run command: %s (check that the command exists and is executable)", err))
+	}
+}
+
 func (t *BashTool) executeForeground(ctx context.Context, command string, stdinContent string) (ToolResult, error) {
 	// Create context with explicit timeout to prevent indefinite hangs
 	execCtx := ctx
@@ -693,7 +710,7 @@ func (t *BashTool) executeForeground(ctx context.Context, command string, stdinC
 
 		// Start command
 		if err := cmd.Start(); err != nil {
-			return NewErrorResult(fmt.Sprintf("failed to start command: %s", err)), nil
+			return startCommandErrorResult(execCtx, err), nil
 		}
 
 		// Read stdout and stderr in goroutines
@@ -848,7 +865,7 @@ func (t *BashTool) executeForeground(ctx context.Context, command string, stdinC
 	// Start command
 	err := cmd.Start()
 	if err != nil {
-		return NewErrorResult(fmt.Sprintf("failed to start command: %s", err)), nil
+		return startCommandErrorResult(execCtx, err), nil
 	}
 
 	// Use WaitGroup to safely track command completion and avoid race condition

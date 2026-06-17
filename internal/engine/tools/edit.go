@@ -287,10 +287,7 @@ func (t *EditTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 	}
 
 	// Detect binary files by checking for null bytes in the first 512 bytes
-	checkLen := len(data)
-	if checkLen > 512 {
-		checkLen = 512
-	}
+	checkLen := min(len(data), 512)
 	for _, b := range data[:checkLen] {
 		if b == 0 {
 			return NewErrorResult(fmt.Sprintf("cannot edit binary file: %s", filePath)), nil
@@ -694,10 +691,7 @@ func (t *EditTool) executeInsertAfterLine(ctx context.Context, filePath string, 
 	}
 
 	// Detect binary files
-	checkLen := len(data)
-	if checkLen > 512 {
-		checkLen = 512
-	}
+	checkLen := min(len(data), 512)
 	for _, b := range data[:checkLen] {
 		if b == 0 {
 			return NewErrorResult(fmt.Sprintf("cannot edit binary file: %s", filePath)), nil
@@ -760,7 +754,7 @@ func extractFileContext(content string, maxChars int) string {
 	for i, line := range lines {
 		s := fmt.Sprintf("%6d\t%s\n", i+1, line)
 		if b.Len()+len(s) > maxChars {
-			b.WriteString(fmt.Sprintf("... (showing %d of %d lines)", i, len(lines)))
+			fmt.Fprintf(&b, "... (showing %d of %d lines)", i, len(lines))
 			break
 		}
 		b.WriteString(s)
