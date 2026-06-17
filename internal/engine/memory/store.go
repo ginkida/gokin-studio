@@ -188,7 +188,7 @@ func normalizeMemoryText(s string) string {
 
 func tokenSetFromText(s string) map[string]struct{} {
 	set := make(map[string]struct{})
-	for _, w := range strings.Fields(normalizeMemoryText(s)) {
+	for w := range strings.FieldsSeq(normalizeMemoryText(s)) {
 		if len(w) < 3 {
 			continue
 		}
@@ -718,7 +718,7 @@ func (s *Store) GetReport() string {
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("**Stored Memories** (%d total)\n\n", len(entries)))
+	fmt.Fprintf(&sb, "**Stored Memories** (%d total)\n\n", len(entries))
 
 	// Group by scope
 	var project, global, session []*Entry
@@ -737,18 +737,18 @@ func (s *Store) GetReport() string {
 		if len(items) == 0 {
 			return
 		}
-		sb.WriteString(fmt.Sprintf("### %s (%d)\n", title, len(items)))
+		fmt.Fprintf(&sb, "### %s (%d)\n", title, len(items))
 		for _, e := range items {
 			age := time.Since(e.Timestamp)
 			ageStr := formatAge(age)
 			content := e.Content
-			if len(content) > 80 {
-				content = content[:77] + "..."
+			if runes := []rune(content); len(runes) > 80 {
+				content = string(runes[:77]) + "..."
 			}
 			if e.Key != "" {
-				sb.WriteString(fmt.Sprintf("- **%s**: %s (%s)\n", e.Key, content, ageStr))
+				fmt.Fprintf(&sb, "- **%s**: %s (%s)\n", e.Key, content, ageStr)
 			} else {
-				sb.WriteString(fmt.Sprintf("- %s (%s)\n", content, ageStr))
+				fmt.Fprintf(&sb, "- %s (%s)\n", content, ageStr)
 			}
 		}
 		sb.WriteString("\n")
@@ -897,16 +897,16 @@ func (s *Store) GetForContext(projectOnly bool) string {
 
 	for _, tc := range types {
 		if items, ok := byType[tc.t]; ok && len(items) > 0 {
-			builder.WriteString(fmt.Sprintf("### %s\n", tc.label))
+			fmt.Fprintf(&builder, "### %s\n", tc.label)
 			for _, entry := range items {
 				content := strings.TrimSpace(entry.Content)
-				if len(content) > 220 {
-					content = content[:220] + "..."
+				if runes := []rune(content); len(runes) > 220 {
+					content = string(runes[:220]) + "..."
 				}
 				if entry.Key != "" {
-					builder.WriteString(fmt.Sprintf("- **%s**: %s\n", entry.Key, content))
+					fmt.Fprintf(&builder, "- **%s**: %s\n", entry.Key, content)
 				} else {
-					builder.WriteString(fmt.Sprintf("- %s\n", content))
+					fmt.Fprintf(&builder, "- %s\n", content)
 				}
 			}
 			builder.WriteString("\n")
@@ -1237,7 +1237,7 @@ func (s *Store) pruneOldest() {
 
 	// Remove oldest entries from the appropriate store
 	toRemove := totalCount - s.maxEntries
-	for i := 0; i < toRemove; i++ {
+	for i := range toRemove {
 		entry := all[i]
 		delete(s.entries, entry.ID)
 		delete(s.globalEntries, entry.ID)
