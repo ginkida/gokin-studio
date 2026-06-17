@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 
 	"github.com/bmatcuk/doublestar/v4"
 	"google.golang.org/genai"
 
+	"github.com/ginkida/gokin-studio/internal/engine/logging"
 	"github.com/ginkida/gokin-studio/internal/engine/security"
 	"github.com/ginkida/gokin-studio/internal/engine/undo"
 )
@@ -348,7 +350,12 @@ func (t *BatchTool) replaceInFile(path, search, replacement string, dryRun bool)
 	newContent := strings.ReplaceAll(content, search, replacement)
 	newData := []byte(newContent)
 
-	if err := AtomicWrite(path, newData, 0644); err != nil {
+	// Preserve original file permissions; fall back to 0644 for new files.
+	perm := os.FileMode(0644)
+	if info, stErr := os.Stat(path); stErr == nil {
+		perm = info.Mode().Perm()
+	}
+	if err := AtomicWrite(path, newData, perm); err != nil {
 		return err
 	}
 
@@ -506,6 +513,17 @@ func (t *BatchTool) executeParallel(ctx context.Context, files []string, operati
 		go func(p string) {
 			defer wg.Done()
 			defer func() { <-semaphore }() // Release
+			defer func() {
+				if r := recover(); r != nil {
+					logging.Error("batch operation panic",
+						"path", p,
+						"panic", r,
+						"stack", string(debug.Stack()))
+					mu.Lock()
+					result.Failed[p] = fmt.Sprintf("internal panic: %v", r)
+					mu.Unlock()
+				}
+			}()
 
 			// Check if context is already cancelled or should stop
 			mu.Lock()

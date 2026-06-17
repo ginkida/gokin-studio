@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"time"
@@ -379,6 +380,14 @@ func (t *WebFetchTool) ExecuteStreaming(ctx context.Context, args map[string]any
 
 	go func() {
 		defer complete()
+		defer func() {
+			if r := recover(); r != nil {
+				logging.Error("panic in web_fetch streaming goroutine",
+					"panic", r,
+					"stack", string(debug.Stack()))
+				errChan <- fmt.Errorf("internal panic: %v", r)
+			}
+		}()
 
 		toolResult, err := t.Execute(ctx, args)
 		if err != nil {
