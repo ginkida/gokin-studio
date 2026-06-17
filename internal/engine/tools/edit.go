@@ -410,19 +410,14 @@ func (t *EditTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 		}
 
 		if count > 1 && !replaceAll {
-			// Find line numbers of occurrences for a more helpful error
 			lines := strings.Split(content, "\n")
-			var lineNums []string
+			var hits []int
 			for i, line := range lines {
 				if strings.Contains(line, oldStr) {
-					lineNums = append(lineNums, fmt.Sprintf("%d", i+1))
+					hits = append(hits, i+1) // 1-based
 				}
 			}
-			lineInfo := ""
-			if len(lineNums) > 0 {
-				lineInfo = fmt.Sprintf(" (lines: %s)", strings.Join(lineNums, ", "))
-			}
-			return NewErrorResult(fmt.Sprintf("old_string appears %d times in %s%s. Provide more surrounding context to make it unique, or set replace_all=true.", count, filePath, lineInfo)), nil
+			return NewErrorResult(formatAmbiguousEditMessage(filePath, lines, hits, count, false)), nil
 		}
 
 		// Perform replacement
@@ -462,8 +457,8 @@ func (t *EditTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 		status = fmt.Sprintf("Replaced %d occurrence(s) in %s", count, filePath)
 	} else {
 		status = fmt.Sprintf("Replaced 1 occurrence in %s", filePath)
-		if idx := strings.Index(content, oldStr); idx >= 0 {
-			status += editedRegionSnippet(newContent, 1+strings.Count(content[:idx], "\n"))
+		if before, _, found := strings.Cut(content, oldStr); found {
+			status += editedRegionSnippet(newContent, 1+strings.Count(before, "\n"))
 		}
 	}
 
@@ -1100,6 +1095,47 @@ func tryFuzzyReplace(content, old, new string, replaceAll bool) (string, string,
 // ambiguousMatchContextLines is how many surrounding lines to show per match
 // in the ambiguity error returned to the model.
 const ambiguousMatchContextLines = 2
+
+// formatAmbiguousEditMessage builds the final error string for ambiguous
+// string-mode and regex-mode edits. Shows per-match line numbers plus
+// surrounding context lines so the model can craft a more specific old_string
+// or switch to line-range mode on the first hit.
+func formatAmbiguousEditMessage(filePath string, lines []string, hits []int, count int, regex bool) string {
+	kind := "old_string"
+	if regex {
+		kind = "regex pattern"
+	}
+	if len(hits) == 0 {
+		return fmt.Sprintf(
+			"%s matches %d times in %s. Provide more surrounding context to make the match unique, or set replace_all=true.",
+			kind, count, filePath,
+		)
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%s matches %d times in %s — ambiguous. Matches at lines: ", kind, count, filePath)
+	numStrs := make([]string, 0, len(hits))
+	for _, h := range hits {
+		numStrs = append(numStrs, fmt.Sprintf("%d", h))
+	}
+	sb.WriteString(strings.Join(numStrs, ", "))
+	sb.WriteString("\n\n")
+
+	renderLimit := min(len(hits), 5)
+	for i := range renderLimit {
+		sb.WriteString(renderLineContext(lines, hits[i], ambiguousMatchContextLines))
+		sb.WriteString("\n")
+	}
+	if len(hits) > renderLimit {
+		fmt.Fprintf(&sb, "(showing first %d of %d matches)\n\n", renderLimit, len(hits))
+	}
+
+	sb.WriteString("Next action (pick one):\n")
+	sb.WriteString("  A) Re-issue edit with more surrounding context in old_string so it uniquely matches one site.\n")
+	fmt.Fprintf(&sb, "  B) Switch to line-range mode: {file_path, line_start: %d, line_end: ..., new_string: ...}.\n", hits[0])
+	sb.WriteString("  C) If every occurrence should change, set replace_all=true.\n")
+	return sb.String()
+}
 
 // renderLineContext extracts `before+1+after` lines around 1-based
 // `lineNum`, each prefixed with its line number and a marker ("→") on

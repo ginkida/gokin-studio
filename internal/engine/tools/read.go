@@ -567,10 +567,16 @@ func (t *ReadTool) readText(ctx context.Context, filePath string, args map[strin
 			content = "(empty file)"
 		}
 	} else if hasMoreAfterLimit {
-		// Append a truthful pagination hint so the model knows to keep reading.
-		endLine := offset + linesRead - 1
-		content += fmt.Sprintf("\n[File truncated at line %d. Use offset=%d to continue reading.]\n",
-			endLine, endLine+1)
+		// Append a rich pagination hint: show the line range that was returned,
+		// the total line count, and the next offset. The total count lets the
+		// model gauge how far it is through the file without another stat call.
+		nextOffset := offset + linesRead
+		totalLines := lineNum // at minimum we know lines up to where we stopped
+		if total, err := countLines(filePath); err == nil && total > totalLines {
+			totalLines = total
+		}
+		content += fmt.Sprintf("\n[Truncated: showed lines %d-%d (%d of %d total). Use offset=%d to continue.]\n",
+			offset, offset+linesRead-1, linesRead, totalLines, nextOffset)
 	}
 
 	// Record access pattern for predictive loading

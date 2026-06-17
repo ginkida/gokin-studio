@@ -328,3 +328,152 @@ func shouldInjectTodoNudge(model string, toolsUsed []string) bool {
 	}
 	return hasMutation
 }
+
+// intentNudgeMinPlanChars is the threshold for considering the assistant's
+// pre-tool text "enough of a plan". 30 chars is one short sentence — low bar,
+// but anything below it is almost certainly empty or a filler "Ok." / "Sure.".
+const intentNudgeMinPlanChars = 30
+
+// intentNudgeMessage is the system reminder queued when the model skips the
+// plan phase. Wording mirrors the Kimi/DeepSeek operating-rules addendum.
+const intentNudgeMessage = "Plan-then-act reminder: your last response jumped to tool calls without a one-line plan. Before your next set of tool calls, write a single line starting with 'Plan:' that states the concrete objective (3-7 words), so the user can tell what you're about to do. Skip the plan only for a single trivial read/grep with no follow-up."
+
+// shouldInjectIntentNudge fires when:
+//   - no tools have executed yet in this turn (first real response)
+//   - the model produced tool calls (nothing to plan for otherwise)
+//   - the response text + thinking is under the threshold (no plan written)
+//   - the model family is nudge-eligible (Kimi or DeepSeek — strong-tier
+//     models self-narrate and don't need the nudge)
+func shouldInjectIntentNudge(toolsExecuted int, model string, resp *client.Response) bool {
+	if toolsExecuted > 0 || resp == nil {
+		return false
+	}
+	if len(resp.FunctionCalls) == 0 {
+		return false
+	}
+	if !isNudgeEligibleFamily(model) {
+		return false
+	}
+	// Count both visible text and thinking trace — thinking counts as
+	// "plan visible to runtime" even when it's not shown in UI.
+	planLen := len(strings.TrimSpace(resp.Text)) + len(strings.TrimSpace(resp.Thinking))
+	return planLen < intentNudgeMinPlanChars
+}
+
+// shouldInjectKimiWorkingMemory fires when the model should get a "don't
+// re-explore, synthesise" reminder. Name retained for log-marker stability;
+// eligibility extends to any nudge-eligible family (Kimi and DeepSeek).
+func shouldInjectKimiWorkingMemory(model string, calls []*genai.FunctionCall, results []*genai.FunctionResponse) bool {
+	if !isNudgeEligibleFamily(model) {
+		return false
+	}
+	if len(calls) == 0 || len(results) == 0 {
+		return false
+	}
+	if len(calls) > 1 {
+		return true
+	}
+	call := calls[0]
+	if call == nil {
+		return false
+	}
+	if isKimiExplorationTool(call.Name) {
+		return true
+	}
+	return workingMemoryResponseSize(results[0]) >= 700
+}
+
+// buildKimiToolErrorRecoveryNotification returns a concrete recovery hint when
+// a nudge-eligible model hits a read-before-edit, delta-check, or fuzzy-match
+// error. Name retained for log-marker stability; eligibility extended to DeepSeek.
+func buildKimiToolErrorRecoveryNotification(model string, results []*genai.FunctionResponse) string {
+	if !isNudgeEligibleFamily(model) {
+		return ""
+	}
+	for _, result := range results {
+		if result == nil {
+			continue
+		}
+		success, _ := result.Response["success"].(bool)
+		if success {
+			continue
+		}
+		errMsg, _ := result.Response["error"].(string)
+		lower := strings.ToLower(strings.TrimSpace(errMsg))
+		if lower == "" {
+			continue
+		}
+		switch {
+		case strings.Contains(lower, "read-before-edit"):
+			return "[Kimi recovery] read-before-edit blocked the mutation. Next call must be read(file_path=...) for the exact file, then retry one edit using exact surrounding context. Do not issue another mutation first."
+		case strings.Contains(lower, "delta-check guard") || strings.Contains(lower, "delta-check failed"):
+			return "[Kimi recovery] delta-check failed after a mutation. Fix the reported build/typecheck/lint error before any unrelated edit, then rerun the same verification."
+		case strings.Contains(lower, "old_string not found") ||
+			(strings.Contains(lower, "ambiguous") && strings.Contains(lower, "old_string")) ||
+			strings.Contains(lower, "fuzzy match"):
+			return "[Kimi recovery] edit matching failed. Re-read the target region if needed, then retry with 3-5 exact surrounding lines in old_string or use line_start/line_end when the tool suggested it."
+		}
+	}
+	return ""
+}
+
+func isKimiExplorationTool(toolName string) bool {
+	switch toolName {
+	case "read", "grep", "glob", "list_dir", "tree":
+		return true
+	default:
+		return false
+	}
+}
+
+func workingMemoryResponseSize(result *genai.FunctionResponse) int {
+	if result == nil {
+		return 0
+	}
+	content, _ := result.Response["content"].(string)
+	errMsg, _ := result.Response["error"].(string)
+	return len(content) + len(errMsg)
+}
+
+// appendNotificationToFunctionResults appends a system notification to the
+// last function result in the slice. It appends to the "error" field when the
+// result represents a failure (non-empty error), otherwise to "content". This
+// makes the notification visible alongside the most recent tool output without
+// requiring an extra user turn, which Kimi/DeepSeek family models need for
+// in-context recovery guidance.
+func appendNotificationToFunctionResults(results []*genai.FunctionResponse, notification string) {
+	notification = strings.TrimSpace(notification)
+	if len(results) == 0 || notification == "" {
+		return
+	}
+
+	result := results[len(results)-1]
+	if result == nil {
+		return
+	}
+	if result.Response == nil {
+		result.Response = map[string]any{}
+	}
+
+	if errMsg, ok := result.Response["error"].(string); ok && strings.TrimSpace(errMsg) != "" {
+		result.Response["error"] = appendTextBlock(errMsg, notification)
+		return
+	}
+	if content, ok := result.Response["content"].(string); ok && strings.TrimSpace(content) != "" {
+		result.Response["content"] = appendTextBlock(notification, content)
+		return
+	}
+	result.Response["content"] = notification
+}
+
+func appendTextBlock(base, addition string) string {
+	base = strings.TrimRight(base, "\n")
+	addition = strings.TrimSpace(addition)
+	if base == "" {
+		return addition
+	}
+	if addition == "" {
+		return base
+	}
+	return base + "\n\n" + addition
+}
