@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -175,10 +176,11 @@ func (t *WebFetchTool) Execute(ctx context.Context, args map[string]any) (ToolRe
 		}
 	}
 
-	// Truncate if too long
+	// Truncate if too long. Use rune-aware slicing so a multibyte UTF-8
+	// character is never split at the cut point (would produce invalid UTF-8).
 	const maxLen = 50000
-	if len(content) > maxLen {
-		content = content[:maxLen] + "\n\n... (content truncated)"
+	if runes := []rune(content); len(runes) > maxLen {
+		content = string(runes[:maxLen]) + "\n\n... (page content truncated at 50,000 chars)"
 	}
 
 	return NewSuccessResultWithData(content, map[string]any{
@@ -287,7 +289,7 @@ func (t *WebFetchTool) htmlToMarkdown(htmlContent string, selector string) (stri
 				// Add link
 				for _, attr := range n.Attr {
 					if attr.Key == "href" && attr.Val != "" && !strings.HasPrefix(attr.Val, "#") && !strings.HasPrefix(attr.Val, "javascript:") {
-						content.WriteString(fmt.Sprintf(" (%s)", attr.Val))
+						fmt.Fprintf(&content, " (%s)", attr.Val)
 						break
 					}
 				}
@@ -346,13 +348,8 @@ func (t *WebFetchTool) matchesSelector(n *html.Node, selector string) bool {
 	if strings.HasPrefix(selector, ".") {
 		className := selector[1:]
 		for _, attr := range n.Attr {
-			if attr.Key == "class" {
-				classes := strings.Fields(attr.Val)
-				for _, c := range classes {
-					if c == className {
-						return true
-					}
-				}
+			if attr.Key == "class" && slices.Contains(strings.Fields(attr.Val), className) {
+				return true
 			}
 		}
 		return false
@@ -394,18 +391,16 @@ func (t *WebFetchTool) ExecuteStreaming(ctx context.Context, args map[string]any
 			return
 		}
 
-		// Stream content in 2KB chunks
-		content := toolResult.Content
-		const chunkSize = 2048
-		for i := 0; i < len(content); i += chunkSize {
-			end := i + chunkSize
-			if end > len(content) {
-				end = len(content)
-			}
+		// Stream content in ~2KB rune-safe chunks so multi-byte UTF-8
+		// characters are never split at chunk boundaries.
+		runes := []rune(toolResult.Content)
+		const chunkRunes = 2048
+		for i := 0; i < len(runes); i += chunkRunes {
+			end := min(i+chunkRunes, len(runes))
 			select {
 			case <-ctx.Done():
 				return
-			case chunks <- content[i:end]:
+			case chunks <- string(runes[i:end]):
 			}
 		}
 	}()
