@@ -189,7 +189,7 @@ func (t *MemoryTool) remember(args map[string]any) (ToolResult, error) {
 		entry.WithKey(key)
 	}
 	if ttlMinutes > 0 {
-		entry.WithTTL(time.Duration(ttlMinutes) * time.Minute)
+		entry.WithTTL(time.Duration(clampTTLMinutes(ttlMinutes)) * time.Minute)
 	}
 
 	// Parse tags
@@ -454,10 +454,31 @@ func (t *MemoryTool) feedback(args map[string]any) (ToolResult, error) {
 	return NewSuccessResult(fmt.Sprintf("Recorded memory feedback (%s): %s", outcome, targetID)), nil
 }
 
-// truncate truncates a string to the specified length.
+// maxMemoryTTLMinutes caps a memory TTL at ~1 year. Without a bound, a large
+// ttl_minutes (e.g. 999999999) overflows time.Duration(n)*time.Minute past
+// int64, wrapping to a NEGATIVE duration — the entry would expire instantly
+// instead of "effectively never".
+const maxMemoryTTLMinutes = 525600 // 365 days
+
+// clampTTLMinutes bounds a model-supplied TTL to [0, maxMemoryTTLMinutes].
+func clampTTLMinutes(m int) int {
+	if m < 0 {
+		return 0
+	}
+	if m > maxMemoryTTLMinutes {
+		return maxMemoryTTLMinutes
+	}
+	return m
+}
+
+// truncate truncates a string to the specified length (rune-safe).
 func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
+	runes := []rune(s)
+	if maxLen <= 0 || len(runes) <= maxLen {
 		return s
 	}
-	return s[:maxLen-3] + "..."
+	if maxLen <= 3 {
+		return string(runes[:maxLen]) // no room for ellipsis; avoids maxLen-3 underflow
+	}
+	return string(runes[:maxLen-3]) + "..."
 }
