@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"google.golang.org/genai"
 )
@@ -120,6 +121,76 @@ func TestCheckpointJournal_EntriesIsCopy(t *testing.T) {
 	internal := j.Entries()
 	if internal[0].ToolName == "MUTATED" {
 		t.Fatal("Entries() returned a reference, not a copy — mutation leaked")
+	}
+}
+
+func TestCheckpointJournalMultipleEntries(t *testing.T) {
+	j := NewCheckpointJournal()
+	for i := 0; i < 50; i++ {
+		call := makeFC("call-"+string(rune('A'+i%26)), "write",
+			map[string]any{"file_path": "/tmp/test" + string(rune('A'+i%26)) + ".go"})
+		j.Record(call, makeResult("ok"))
+	}
+	if j.Len() != 50 {
+		t.Errorf("Len() = %d, want 50", j.Len())
+	}
+}
+
+func TestCheckpointJournalRecordSerialized(t *testing.T) {
+	j := NewCheckpointJournal()
+	sig := checkpointSignature("write", map[string]any{"file_path": "/tmp/restored.go"})
+	j.RecordSerialized("call-restored", "write", map[string]any{"file_path": "/tmp/restored.go"}, "File written", sig, time.Now())
+
+	if j.Len() != 1 {
+		t.Fatalf("Len() = %d, want 1", j.Len())
+	}
+	// Find by call ID.
+	call := makeFC("call-restored", "write", map[string]any{"file_path": "/tmp/restored.go"})
+	result, reason, ok := j.Lookup(call)
+	if !ok {
+		t.Fatal("should find restored checkpoint by call ID")
+	}
+	if reason != "checkpoint_call_id" {
+		t.Errorf("reason = %q, want checkpoint_call_id", reason)
+	}
+	if result.Content != "File written" {
+		t.Errorf("restored result = %q, want File written", result.Content)
+	}
+	// Find by signature (different call ID).
+	call2 := makeFC("", "write", map[string]any{"file_path": "/tmp/restored.go"})
+	_, reason2, ok2 := j.Lookup(call2)
+	if !ok2 {
+		t.Fatal("should find restored checkpoint by signature")
+	}
+	if reason2 != "checkpoint_signature" {
+		t.Errorf("reason = %q, want checkpoint_signature", reason2)
+	}
+
+	// Empty resultContent falls back to "[restored from session]".
+	j2 := NewCheckpointJournal()
+	j2.RecordSerialized("c2", "read", map[string]any{"file_path": "/tmp/x.go"}, "", "", time.Now())
+	r2, _, _ := j2.Lookup(makeFC("c2", "read", nil))
+	if r2.Content != "[restored from session]" {
+		t.Errorf("empty content fallback = %q", r2.Content)
+	}
+}
+
+func TestCheckpointSignature(t *testing.T) {
+	sig1 := checkpointSignature("write", map[string]any{"path": "/tmp/a.go"})
+	sig2 := checkpointSignature("write", map[string]any{"path": "/tmp/a.go"})
+	sig3 := checkpointSignature("write", map[string]any{"path": "/tmp/b.go"})
+	sig4 := checkpointSignature("edit", map[string]any{"path": "/tmp/a.go"})
+	if sig1 != sig2 {
+		t.Error("same tool+args should have same signature")
+	}
+	if sig1 == sig3 {
+		t.Error("different args should have different signature")
+	}
+	if sig1 == sig4 {
+		t.Error("different tool should have different signature")
+	}
+	if empty := checkpointSignature("", nil); empty != "" {
+		t.Error("empty tool name should return empty signature")
 	}
 }
 

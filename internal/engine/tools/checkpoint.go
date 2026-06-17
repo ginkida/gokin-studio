@@ -51,6 +51,18 @@ func (j *CheckpointJournal) Record(call *genai.FunctionCall, result ToolResult) 
 	j.recordLocked(call.ID, call.Name, call.Args, result, sig, time.Now())
 }
 
+// RecordSerialized adds a pre-serialized checkpoint entry to the journal.
+// Used when restoring from persisted session state.
+func (j *CheckpointJournal) RecordSerialized(callID, toolName string, args map[string]any, resultContent, signature string, ts time.Time) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	content := resultContent
+	if content == "" {
+		content = "[restored from session]"
+	}
+	j.recordLocked(callID, toolName, args, ToolResult{Content: content}, signature, ts)
+}
+
 // recordLocked appends a checkpoint entry. Caller must hold j.mu.
 func (j *CheckpointJournal) recordLocked(callID, toolName string, args map[string]any, result ToolResult, signature string, ts time.Time) {
 	idx := len(j.entries)
