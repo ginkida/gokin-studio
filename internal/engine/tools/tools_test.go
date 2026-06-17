@@ -4547,3 +4547,43 @@ func TestRenderReviewNewFileBlock_CapsAtMaxLines(t *testing.T) {
 		t.Errorf("expected truncation notice, got: %q", block)
 	}
 }
+
+// ----- check_impact.go tests -----
+
+func TestCheckImpactTool_SymbolRequired(t *testing.T) {
+	tool := NewCheckImpactTool(t.TempDir())
+	err := tool.Validate(map[string]any{})
+	if err == nil {
+		t.Fatal("expected validation error for missing symbol")
+	}
+}
+
+func TestCheckImpactTool_FindsSymbol(t *testing.T) {
+	tmpDir := t.TempDir()
+	// Create a file that uses a known symbol.
+	src := `package main
+
+func MySymbol() {}
+func caller() { MySymbol() }
+`
+	if err := os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Initialize a git repo so gitignore logic works.
+	cmd := exec.Command("git", "init", tmpDir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+
+	tool := NewCheckImpactTool(tmpDir)
+	result, err := tool.Execute(context.Background(), map[string]any{"symbol": "MySymbol"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Success {
+		t.Fatalf("expected success, got error: %q", result.Error)
+	}
+	if !strings.Contains(result.Content, "MySymbol") {
+		t.Errorf("expected symbol in report, got: %q", result.Content)
+	}
+}

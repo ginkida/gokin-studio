@@ -267,6 +267,7 @@ func DefaultRegistry(workDir string) *Registry {
 	r.MustRegister(NewRunTestsTool(workDir))
 	r.MustRegister(NewVerifyCodeTool(workDir))
 	r.MustRegister(NewReviewChangesTool(workDir))
+	r.MustRegister(NewCheckImpactTool(workDir))
 
 	return r
 }
