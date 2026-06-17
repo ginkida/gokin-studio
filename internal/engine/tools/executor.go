@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -1310,7 +1311,7 @@ func (e *Executor) doExecuteTool(ctx context.Context, call *genai.FunctionCall) 
 			if e.handler != nil && e.handler.OnWarning != nil {
 				e.handler.OnWarning(fmt.Sprintf("Recovered result for '%s' from checkpoint (%s).", call.Name, reason))
 			}
-			return *cached
+			return cached
 		}
 	}
 
@@ -1741,8 +1742,21 @@ func (e *Executor) doExecuteTool(ctx context.Context, call *genai.FunctionCall) 
 		}
 	}
 
-	// Steps 12.9, 12.9b, 12.9c: delta-check, semantic validators, context enrichment
-	// (not extracted — these are advanced features from gokin-last)
+	// Step 12.9b: Semantic validators (go_quality, security, shell, test_quality).
+	// Appends human-readable warnings to the tool result so the model can
+	// self-correct immediately rather than discovering the issue on the next build.
+	if result.Success && shouldRunDeltaCheckCall(call) && e.semanticValidators != nil {
+		for _, fp := range extractFilePaths(call) {
+			content, readErr := os.ReadFile(fp)
+			if readErr != nil {
+				continue
+			}
+			warnings := e.semanticValidators.RunAll(ctx, fp, content, e.workDir)
+			if formatted := FormatWarnings(warnings); formatted != "" {
+				result.Content += "\n\n" + formatted
+			}
+		}
+	}
 
 	// Step 12.9d: Track mutated files for self-review injection.
 	if result.Success && isWriteOperation(call.Name) && e.selfReviewThreshold > 0 {

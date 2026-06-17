@@ -169,7 +169,7 @@ func (t *WriteTool) Execute(ctx context.Context, args map[string]any) (ToolResul
 	// Show diff preview and wait for approval if enabled
 	// Skip diff approval when running in delegated plan execution (context flag)
 	if t.diffEnabled && t.diffHandler != nil && !ShouldSkipDiff(ctx) {
-		approved, err := t.diffHandler.PromptDiff(ctx, filePath, string(oldContent), finalContent, "write", isNew)
+		approved, err := maybePromptDiff(ctx, t.diffHandler, filePath, string(oldContent), finalContent, "write", isNew)
 		if err != nil {
 			return NewErrorResult(fmt.Sprintf("diff preview error: %s", err)), nil
 		}

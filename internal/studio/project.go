@@ -82,6 +82,11 @@ type Project struct {
 	costSeeded         bool
 	costMu             sync.Mutex
 
+	// semanticValidators checks written/edited files for logical issues after
+	// each successful write tool call (go_quality, security, shell, test_quality).
+	// Warnings are appended to the tool result so the model can self-correct.
+	semanticValidators *tools.SemanticValidatorRegistry
+
 	// Per-session file trackers for post-compaction continuation hints.
 	// keyed by sessionID; allocated on demand in SendMessage.
 	readTrackers  map[string]*tools.FileReadTracker
@@ -383,6 +388,17 @@ func (p *Project) initMemoryAndPlan(reg *tools.Registry) {
 				tst.SetManager(p.taskManager)
 			}
 		}
+	}
+
+	// Build the semantic validator registry once per project. Validators run
+	// after every successful write/edit call and append warnings to the tool
+	// result so the model can self-correct without a separate build step.
+	if p.semanticValidators == nil {
+		svr := tools.NewSemanticValidatorRegistry()
+		for _, v := range tools.DefaultSemanticValidators() {
+			svr.Register(v)
+		}
+		p.semanticValidators = svr
 	}
 
 	// Wire pin_context so the agent can attach a persistent note to the system
@@ -1148,6 +1164,21 @@ outer:
 
 				result, toolErr := safeToolExecute(toolCtx, tool, fc.Args)
 				success := toolErr == nil && result.Success
+
+				// Run semantic validators after successful write operations so the
+				// model sees warnings inline (go_quality, security, shell, test_quality).
+				if success && toolErr == nil && p.semanticValidators != nil && tools.IsWriteTool(fc.Name) {
+					for _, fp := range tools.ExtractFilePaths(fc.Args) {
+						if data, readErr := os.ReadFile(fp); readErr == nil {
+							if warns := p.semanticValidators.RunAll(toolCtx, fp, data, p.Directory); len(warns) > 0 {
+								if formatted := tools.FormatWarnings(warns); formatted != "" {
+									result.Content += "\n\n" + formatted
+								}
+							}
+						}
+					}
+				}
+
 				// On failure, COMBINE the captured output with the error rather
 				// than replacing it. A failing `go build`/`go test` returns its
 				// compiler/test diagnostics in result.Content (incl. stderr) and

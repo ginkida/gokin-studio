@@ -1,6 +1,35 @@
 package tools
 
-import "google.golang.org/genai"
+import (
+	"time"
+
+	"google.golang.org/genai"
+)
+
+// parallelSerializationSuccessThreshold is the success rate under which a
+// tool is considered unreliable enough to serialize the whole group it's in.
+const parallelSerializationSuccessThreshold = 0.5
+
+// shouldSerializeGroup reports whether a parallel group should be downgraded
+// to sequential execution based on observed per-tool reliability.
+// statsLookup is called once per unique tool name in the group; tools with
+// not-enough-samples (ok=false) don't count against reliability.
+func shouldSerializeGroup(calls []*genai.FunctionCall, statsLookup func(string) (time.Duration, float64, bool)) bool {
+	if statsLookup == nil || len(calls) <= 1 {
+		return false
+	}
+	seen := make(map[string]bool, len(calls))
+	for _, c := range calls {
+		if seen[c.Name] {
+			continue
+		}
+		seen[c.Name] = true
+		if _, rate, ok := statsLookup(c.Name); ok && rate < parallelSerializationSuccessThreshold {
+			return true
+		}
+	}
+	return false
+}
 
 // toolDependencyClassifier determines which tools can run in parallel.
 type toolDependencyClassifier struct {
@@ -15,18 +44,42 @@ type toolGroup struct {
 
 var defaultClassifier = &toolDependencyClassifier{
 	writeTools: map[string]bool{
-		"write":      true,
-		"edit":       true,
-		"bash":       true,
-		"delete":     true,
-		"move":       true,
-		"copy":       true,
-		"mkdir":      true,
-		"git_commit": true,
-		"git_add":    true,
-		"ssh":        true,
-		"run_tests":  true,
+		"write":       true,
+		"edit":        true,
+		"bash":        true,
+		"delete":      true,
+		"move":        true,
+		"copy":        true,
+		"mkdir":       true,
+		"git_commit":  true,
+		"git_add":     true,
+		"ssh":         true,
+		"run_tests":   true,
+		"batch":       true,
+		"refactor":    true,
+		"atomicwrite": true,
 	},
+}
+
+// IsWriteTool reports whether a tool modifies state and must run SEQUENTIALLY
+// (never in parallel with reads or other writes). This is the single source of
+// truth for write-vs-read classification across the executor and any external
+// callers — prevents drift where sub-systems each maintain their own list.
+func IsWriteTool(name string) bool {
+	return defaultClassifier.writeTools[name]
+}
+
+// ExtractFilePaths returns the file paths referenced by a tool call based on
+// well-known argument keys. Used by callers that need to run post-write
+// validation (e.g. semantic validators) without touching the genai type.
+func ExtractFilePaths(args map[string]any) []string {
+	var paths []string
+	for _, key := range []string{"file_path", "path", "source", "destination", "new_path"} {
+		if p, ok := args[key].(string); ok && p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths
 }
 
 // classifyDependencies groups tool calls by read/write dependency.

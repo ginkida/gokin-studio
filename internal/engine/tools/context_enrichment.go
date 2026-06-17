@@ -115,7 +115,7 @@ func readFileSummaryLines(path string, n int) string {
 	return strings.Join(result, " | ")
 }
 
-var goVersionInWorkflowRe = regexp.MustCompile(`go-version:\s*['"]?([0-9]+\.[0-9]+[0-9.]*)['"]?`)
+var goVersionInWorkflowEnricherRe = regexp.MustCompile(`go-version:\s*['"]?([0-9]+\.[0-9]+[0-9.]*)['"]?`)
 
 func (e *ContextEnricher) enrichWorkflow(filePath string) string {
 	var hints []string
@@ -143,7 +143,7 @@ func (e *ContextEnricher) enrichWorkflow(filePath string) string {
 		if err != nil {
 			continue
 		}
-		if m := goVersionInWorkflowRe.FindStringSubmatch(string(data)); m != nil {
+		if m := goVersionInWorkflowEnricherRe.FindStringSubmatch(string(data)); m != nil {
 			hints = append(hints, fmt.Sprintf("%s uses go-version: %s", name, m[1]))
 		}
 	}

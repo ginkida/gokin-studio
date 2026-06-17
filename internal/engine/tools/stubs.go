@@ -1,36 +1,11 @@
-// stubs.go — Stub types for features not extracted from gokin-last.
-// These allow executor.go and factory.go to compile without the full
-// implementations (validators, checkpoint, context enrichment, etc.).
+// stubs.go — Stub constructors for tools that are not yet ported.
 package tools
 
 import (
 	"context"
-	"sync"
 
 	"google.golang.org/genai"
 )
-
-// CheckpointJournal is a stub for checkpoint journaling.
-type CheckpointJournal struct {
-	mu      sync.Mutex
-	entries []interface{}
-}
-
-// NewCheckpointJournal creates an empty checkpoint journal.
-func NewCheckpointJournal() *CheckpointJournal {
-	return &CheckpointJournal{}
-}
-
-// Clear is a no-op stub.
-func (c *CheckpointJournal) Clear() {}
-
-// Lookup returns cached result if available (stub — always returns not-found).
-func (c *CheckpointJournal) Lookup(call *genai.FunctionCall) (*ToolResult, string, bool) {
-	return nil, "", false
-}
-
-// Record saves a tool result for checkpoint recovery (stub — no-op).
-func (c *CheckpointJournal) Record(call *genai.FunctionCall, result ToolResult) {}
 
 // --- Stub constructors for tools not extracted ---
 
@@ -39,13 +14,8 @@ func NewRedoPlanTool(deps ...interface{}) Tool  { return nil }
 func NewRefactorTool(deps ...interface{}) Tool  { return nil }
 func NewCodeGraphTool(deps ...interface{}) Tool { return nil }
 
-// NewRunTestsTool is implemented in run_tests.go
 func NewSSHTool(deps ...interface{}) Tool             { return nil }
 func GetAllDeclarations() []genai.FunctionDeclaration { return nil }
-func FormatWarnings(w interface{}) string             { return "" }
-
-// SemanticValidatorRegistry is a stub for semantic validators.
-type SemanticValidatorRegistry struct{}
 
 // ImpactGateResult is a stub for impact gate evaluation.
 type ImpactGateResult struct {
