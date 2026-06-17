@@ -4007,3 +4007,71 @@ func TestRunTests_BuildGoCommandWithCoverage(t *testing.T) {
 		t.Errorf("expected -coverprofile with coverage=true, got: %v", args)
 	}
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// read tool — path suggestion helpers
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestSuggestFilesInWorkDir_Finds(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "other.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	suggestions := suggestFilesInWorkDir(tmpDir, "main.go")
+	if len(suggestions) == 0 {
+		t.Fatal("expected at least one suggestion for 'main.go'")
+	}
+	if !strings.Contains(suggestions[0], "main.go") {
+		t.Errorf("expected suggestion to contain 'main.go', got %v", suggestions)
+	}
+}
+
+func TestSuggestFilesInWorkDir_EmptyOnMiss(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "app.ts"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Search for a completely unrelated name
+	suggestions := suggestFilesInWorkDir(tmpDir, "completelydifferentname.rb")
+	if len(suggestions) != 0 {
+		t.Errorf("expected no suggestions, got %v", suggestions)
+	}
+}
+
+func TestSuggestFilesInWorkDir_TooShortNameSkipped(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "x"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Single-char basename should return nothing (noise guard)
+	suggestions := suggestFilesInWorkDir(tmpDir, "x")
+	if len(suggestions) != 0 {
+		t.Errorf("expected no suggestions for 1-char name, got %v", suggestions)
+	}
+}
+
+func TestReadTool_PathValidationSuggestsWorkDirFiles(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "server.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewReadTool(tmpDir)
+	result, err := tool.Execute(context.Background(), map[string]any{
+		"file_path": "/nonexistent/outside/server.go",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Success {
+		t.Fatal("expected failure for outside-workdir path")
+	}
+	// Error message should suggest the matching file in the workdir
+	combined := result.Error + result.Content
+	if !strings.Contains(combined, "server.go") {
+		t.Errorf("expected workdir suggestion for 'server.go', got:\nError: %s\nContent: %s", result.Error, result.Content)
+	}
+}

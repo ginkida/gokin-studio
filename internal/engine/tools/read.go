@@ -295,7 +295,15 @@ func (t *ReadTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 
 	validPath, err := t.pathValidator.ValidateFile(filePath)
 	if err != nil {
-		return NewErrorResult(fmt.Sprintf("path validation failed: %s", err)), nil
+		// Path-validation usually fires when a model fabricates an
+		// absolute path outside the workdir. Suggest same-basename files
+		// under the workdir so it can recover with one corrected read.
+		errMsg := fmt.Sprintf("path validation failed: %s\n(working directory: %s)",
+			err, t.workDir)
+		if suggestions := suggestFilesInWorkDir(t.workDir, filepath.Base(filePath)); len(suggestions) > 0 {
+			errMsg += "\n\nFiles with matching basename in the workdir:\n" + strings.Join(suggestions, "\n")
+		}
+		return NewErrorResult(errMsg), nil
 	}
 	filePath = validPath
 
@@ -306,10 +314,16 @@ func (t *ReadTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 			errMsg := fmt.Sprintf("file not found: %s", filePath)
 			if suggestions := suggestSimilarFiles(filePath); len(suggestions) > 0 {
 				errMsg += "\n\nDid you mean:\n" + strings.Join(suggestions, "\n")
+			} else if suggestions := suggestFilesInWorkDir(t.workDir, filepath.Base(filePath)); len(suggestions) > 0 {
+				errMsg += "\n\nFiles with matching basename in the workdir:\n" + strings.Join(suggestions, "\n")
 			}
 			return NewErrorResult(errMsg), nil
 		}
-		return NewErrorResult(fmt.Sprintf("error accessing file: %s", err)), nil
+		errMsg := fmt.Sprintf("error accessing file: %s", err)
+		if suggestions := suggestFilesInWorkDir(t.workDir, filepath.Base(filePath)); len(suggestions) > 0 {
+			errMsg += "\n\nNearby files:\n" + strings.Join(suggestions, "\n")
+		}
+		return NewErrorResult(errMsg), nil
 	}
 
 	if info.IsDir() {
@@ -585,6 +599,56 @@ func suggestSimilarFiles(path string) []string {
 			break
 		}
 	}
+	return suggestions
+}
+
+// suggestFilesInWorkDir walks the workdir looking for files whose basename
+// matches `base` (case-insensitive, substring). Used as a fallback when the
+// path is outside the project directory — the typical "wrong dir, right name"
+// model failure mode. Bounded walk: at most 5000 entries, skips build dirs.
+func suggestFilesInWorkDir(workDir, base string) []string {
+	if workDir == "" || base == "" {
+		return nil
+	}
+	baseLower := strings.ToLower(base)
+	nameOnly := strings.TrimSuffix(baseLower, filepath.Ext(baseLower))
+	if len(nameOnly) < 2 {
+		return nil
+	}
+
+	const suggestScanLimit = 5000
+	visited := 0
+	var suggestions []string
+
+	skipDirs := map[string]bool{
+		".git": true, "node_modules": true, "vendor": true,
+		"build": true, "dist": true, "target": true,
+		".venv": true, "venv": true, "__pycache__": true,
+	}
+
+	_ = filepath.WalkDir(workDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if visited >= suggestScanLimit || len(suggestions) >= 5 {
+			return filepath.SkipAll
+		}
+		visited++
+		if d.IsDir() {
+			if skipDirs[d.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		entryLower := strings.ToLower(d.Name())
+		entryNameOnly := strings.TrimSuffix(entryLower, filepath.Ext(entryLower))
+		if entryLower == baseLower ||
+			strings.Contains(entryLower, nameOnly) ||
+			strings.Contains(nameOnly, entryNameOnly) {
+			suggestions = append(suggestions, "  - "+path)
+		}
+		return nil
+	})
 	return suggestions
 }
 

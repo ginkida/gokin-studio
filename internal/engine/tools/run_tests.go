@@ -342,7 +342,7 @@ func parseGoTestResults(output string, execErr error, duration time.Duration) st
 			})
 			result.WriteString("\nFailure locations:\n")
 			for _, lc := range sortedLocs {
-				fmt.Fprintf(&result, "  %s (%d failure(s))\n", lc.loc, lc.count)
+				fmt.Fprintf(&result, "  📍 %s (%d failure(s))\n", lc.loc, lc.count)
 			}
 		}
 	}
@@ -351,7 +351,7 @@ func parseGoTestResults(output string, execErr error, duration time.Duration) st
 	if len(failures) > 0 {
 		result.WriteString("\nFailed tests:\n")
 		for _, f := range failures {
-			fmt.Fprintf(&result, "  x %s\n", f)
+			fmt.Fprintf(&result, "  ✗ %s\n", f)
 			if lines, ok := failOutput[f]; ok {
 				// Show the meaningful output lines in their original order,
 				// capped. Head+tail split preserves both panic messages (lead)
