@@ -39,15 +39,22 @@ func (t *TodoTool) Description() string {
 }
 
 func (t *TodoTool) Declaration() *genai.FunctionDeclaration {
+	return TodoToolDeclaration()
+}
+
+// TodoToolDeclaration returns the canonical FunctionDeclaration for the todo tool.
+// Separated from the receiver method so nudge/orchestration code can reference it
+// without constructing a TodoTool.
+func TodoToolDeclaration() *genai.FunctionDeclaration {
 	return &genai.FunctionDeclaration{
-		Name:        t.Name(),
-		Description: t.Description(),
+		Name:        "todo",
+		Description: "Manages a live task list for multi-step work. Call before editing on non-trivial tasks, keep the full list current, and keep exactly one item in_progress at a time.",
 		Parameters: &genai.Schema{
 			Type: genai.TypeObject,
 			Properties: map[string]*genai.Schema{
 				"todos": {
 					Type:        genai.TypeArray,
-					Description: "The complete updated list of todos",
+					Description: "The complete updated list of todos. Every call replaces the full list; do not send deltas. Exactly one item should be in_progress while work remains.",
 					Items: &genai.Schema{
 						Type: genai.TypeObject,
 						Properties: map[string]*genai.Schema{
@@ -57,7 +64,7 @@ func (t *TodoTool) Declaration() *genai.FunctionDeclaration {
 							},
 							"status": {
 								Type:        genai.TypeString,
-								Description: "Task status: pending, in_progress, or completed",
+								Description: "Task status: pending, in_progress, or completed. Use exactly one in_progress item while work remains.",
 								Enum:        []string{"pending", "in_progress", "completed"},
 							},
 							"active_form": {
@@ -200,8 +207,8 @@ func (t *TodoTool) generateSummary() string {
 	}
 
 	var builder strings.Builder
-	builder.WriteString(fmt.Sprintf("Todo list updated: %d pending, %d in progress, %d completed\n\n",
-		pending, inProgress, completed))
+	fmt.Fprintf(&builder, "Todo list updated: %d pending, %d in progress, %d completed\n\n",
+		pending, inProgress, completed)
 
 	for i, item := range t.items {
 		var icon string
@@ -213,7 +220,7 @@ func (t *TodoTool) generateSummary() string {
 		case "completed":
 			icon = "[✓]"
 		}
-		builder.WriteString(fmt.Sprintf("%d. %s %s\n", i+1, icon, item.Content))
+		fmt.Fprintf(&builder, "%d. %s %s\n", i+1, icon, item.Content)
 	}
 
 	return builder.String()

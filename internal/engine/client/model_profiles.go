@@ -57,6 +57,8 @@ var knownModelProfiles = map[string]ModelProfile{
 	"claude-haiku":  {Family: "anthropic", ContextWindow: 200000, SupportsTools: true, IsSmall: true},
 
 	// DeepSeek family
+	"deepseek-v4-pro":   {Family: "deepseek", ContextWindow: 128000, SupportsTools: true, IsCoding: true},
+	"deepseek-v4-flash": {Family: "deepseek", ContextWindow: 128000, SupportsTools: true, IsCoding: true},
 	"deepseek-r1":       {Family: "deepseek", ContextWindow: 128000, SupportsTools: true, IsCoding: true},
 	"deepseek-chat":     {Family: "deepseek", ContextWindow: 64000, SupportsTools: true, IsCoding: true},
 	"deepseek-reasoner": {Family: "deepseek", ContextWindow: 64000, SupportsTools: true, IsCoding: true},

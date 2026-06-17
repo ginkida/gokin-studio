@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // SafetyLevel represents the safety classification of a tool
@@ -513,23 +514,41 @@ func (v *DefaultSafetyValidator) GetMetadata(toolName string) (*ToolMetadata, bo
 }
 
 // Helper functions
+// Rune-aware so multibyte paths (Cyrillic, CJK) don't get sliced mid-codepoint.
 func shortenPath(path string, maxLen int) string {
-	if len(path) <= maxLen {
+	if utf8.RuneCountInString(path) <= maxLen {
 		return path
 	}
-	// Try to keep filename visible
 	parts := strings.Split(path, "/")
 	filename := parts[len(parts)-1]
-	availableLen := maxLen - len(filename) - 4 // 4 for "..."
+	filenameRunes := utf8.RuneCountInString(filename)
+	availableLen := maxLen - filenameRunes - 4 // 4 for "..."
 	if availableLen < 5 {
 		return "..." + filename
 	}
-	return path[:availableLen] + "..." + filename
+	pathRunes := []rune(path)
+	return string(pathRunes[:availableLen]) + "..." + filename
 }
 
 func truncateString(s string, maxLen int) string {
-	if len(s) <= maxLen {
+	runes := []rune(s)
+	if maxLen <= 0 || len(runes) <= maxLen {
 		return s
 	}
-	return s[:maxLen-3] + "..."
+	if maxLen <= 3 {
+		return string(runes[:maxLen]) // no room for ellipsis; avoids maxLen-3 underflow
+	}
+	return string(runes[:maxLen-3]) + "..."
+}
+
+// toolDisplayName converts a snake_case tool name to a human-readable title.
+// e.g. "git_status" → "Git Status", "read" → "Read".
+func toolDisplayName(toolName string) string {
+	words := strings.Fields(strings.ReplaceAll(toolName, "_", " "))
+	for i, w := range words {
+		if w != "" {
+			words[i] = strings.ToUpper(w[:1]) + w[1:]
+		}
+	}
+	return strings.Join(words, " ")
 }
