@@ -5,6 +5,8 @@ package tools
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 
 	"google.golang.org/genai"
@@ -87,7 +89,40 @@ func CloneRegistryForWorkDir(reg ToolRegistry, workDir string) ToolRegistry {
 
 func shouldRunDeltaCheckCall(_ *genai.FunctionCall) bool { return false }
 func logDeltaCheckFailure(_ *deltaCheckResult)           {}
-func trimDeltaOutput(s string) string                    { return s }
+
+// trimDeltaOutput caps content at maxChars runes, keeping the head. Returns
+// a truncation notice when trimmed. Ported from gokin delta_check.go.
+func trimDeltaOutput(content string, maxChars int) string {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return ""
+	}
+	runes := []rune(content)
+	if maxChars <= 0 || len(runes) <= maxChars {
+		return content
+	}
+	return string(runes[:maxChars]) + "\n... (truncated)"
+}
+
+// trimOutputKeepEnds caps content at maxChars runes but keeps both the head
+// (1/3) and the tail (2/3). Build/lint toolchains (node, python) print the
+// fatal error LAST, so a head-only trim cuts off the reason. Ported from
+// gokin delta_check.go.
+func trimOutputKeepEnds(content string, maxChars int) string {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return ""
+	}
+	runes := []rune(content)
+	if maxChars <= 0 || len(runes) <= maxChars {
+		return content
+	}
+	head := maxChars / 3
+	tail := maxChars - head
+	return string(runes[:head]) +
+		fmt.Sprintf("\n... (%d chars elided) ...\n", len(runes)-maxChars) +
+		string(runes[len(runes)-tail:])
+}
 
 func (e *Executor) enforceDeltaCheckBarrier(_ context.Context, _ *genai.FunctionCall) (string, bool) {
 	return "", false

@@ -4130,3 +4130,95 @@ func TestLevenshtein_Basic(t *testing.T) {
 		}
 	}
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// VerifyCodeTool — project-type detection (no external tools required)
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestVerifyCodeTool_DetectsGo(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module test\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewVerifyCodeTool(dir)
+	pType, tDir := tool.detectProjectTarget(dir)
+	if pType != "go" {
+		t.Errorf("expected 'go', got %q", pType)
+	}
+	if tDir != dir {
+		t.Errorf("expected target dir %q, got %q", dir, tDir)
+	}
+}
+
+func TestVerifyCodeTool_DetectsRust(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "Cargo.toml"), []byte("[package]\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewVerifyCodeTool(dir)
+	pType, _ := tool.detectProjectTarget(dir)
+	if pType != "rust" {
+		t.Errorf("expected 'rust', got %q", pType)
+	}
+}
+
+func TestVerifyCodeTool_DetectsNode(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte("{}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewVerifyCodeTool(dir)
+	pType, _ := tool.detectProjectTarget(dir)
+	if pType != "node" {
+		t.Errorf("expected 'node', got %q", pType)
+	}
+}
+
+func TestVerifyCodeTool_DetectsPython(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "requirements.txt"), []byte("requests\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewVerifyCodeTool(dir)
+	pType, _ := tool.detectProjectTarget(dir)
+	if pType != "python" {
+		t.Errorf("expected 'python', got %q", pType)
+	}
+}
+
+func TestVerifyCodeTool_UnknownProjectType(t *testing.T) {
+	dir := t.TempDir()
+	tool := NewVerifyCodeTool(dir)
+	pType, _ := tool.detectProjectTarget(dir)
+	if pType != "" {
+		t.Errorf("expected empty type for unknown project, got %q", pType)
+	}
+}
+
+func TestTrimDeltaOutput(t *testing.T) {
+	long := strings.Repeat("a", 200)
+	got := trimDeltaOutput(long, 100)
+	if len([]rune(got)) > 120 { // 100 + some trailing notice
+		t.Errorf("trimDeltaOutput didn't trim: len=%d", len(got))
+	}
+	if !strings.Contains(got, "truncated") {
+		t.Error("trimDeltaOutput missing truncation notice")
+	}
+}
+
+func TestTrimOutputKeepEnds(t *testing.T) {
+	// 600 runes -> trim to 200; check head AND tail present
+	head := strings.Repeat("H", 300)
+	tail := strings.Repeat("T", 300)
+	input := head + tail
+	got := trimOutputKeepEnds(input, 200)
+	if !strings.Contains(got, "HHH") {
+		t.Error("trimOutputKeepEnds missing head")
+	}
+	if !strings.Contains(got, "TTT") {
+		t.Error("trimOutputKeepEnds missing tail")
+	}
+	if !strings.Contains(got, "elided") {
+		t.Error("trimOutputKeepEnds missing elided notice")
+	}
+}

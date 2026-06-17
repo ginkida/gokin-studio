@@ -263,6 +263,10 @@ func DefaultRegistry(workDir string) *Registry {
 	// Agent Scratchpad tool (Phase 7)
 	r.MustRegister(NewUpdateScratchpadTool(nil))
 
+	// Testing and verification tools
+	r.MustRegister(NewRunTestsTool(workDir))
+	r.MustRegister(NewVerifyCodeTool(workDir))
+
 	return r
 }
 
