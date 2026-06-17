@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/ginkida/gokin-studio/internal/engine/fileutil"
 	"github.com/ginkida/gokin-studio/internal/engine/logging"
 )
 
@@ -85,6 +86,24 @@ func (s *Store) markDirty() {
 	s.dirty = true
 	s.cacheVersion++
 	s.contextCache = nil
+}
+
+// copyEntry returns a deep copy of e. The public getters (Search/List/ListAll/
+// Get/GetByID) hand entries to callers (e.g. the memory tool) that read them
+// AFTER the store's RLock is released, while writers (RecordAccess,
+// reinforcement, archive) mutate the live entries under the lock — sharing the
+// live pointer is a data race. Entry's only reference field is Tags; everything
+// else is a value type, so a shallow struct copy + a copied Tags slice detaches
+// the snapshot completely.
+func copyEntry(e *Entry) *Entry {
+	if e == nil {
+		return nil
+	}
+	cp := *e
+	if e.Tags != nil {
+		cp.Tags = append([]string(nil), e.Tags...)
+	}
+	return &cp
 }
 
 // Auto-tagging regex patterns.
@@ -312,13 +331,13 @@ func (s *Store) Get(key string) (*Entry, bool) {
 		if entry.IsExpired(now) {
 			return nil, false
 		}
-		return entry, true
+		return copyEntry(entry), true
 	}
 	entry, ok := s.globalEntries[id]
 	if ok && entry.IsExpired(now) {
 		return nil, false
 	}
-	return entry, ok
+	return copyEntry(entry), ok
 }
 
 // GetByID retrieves an entry by ID.
@@ -331,13 +350,13 @@ func (s *Store) GetByID(id string) (*Entry, bool) {
 		if entry.IsExpired(now) {
 			return nil, false
 		}
-		return entry, true
+		return copyEntry(entry), true
 	}
 	entry, ok := s.globalEntries[id]
 	if ok && entry.IsExpired(now) {
 		return nil, false
 	}
-	return entry, ok
+	return copyEntry(entry), ok
 }
 
 // RecordAccess marks an entry as accessed to improve ranking based on usage.
@@ -578,10 +597,10 @@ func (s *Store) Search(query SearchQuery) []*Entry {
 		return scored[i].entry.Timestamp.After(scored[j].entry.Timestamp)
 	})
 
-	// Extract entries from scored results
+	// Extract entries from scored results (deep-copied — see copyEntry).
 	results := make([]*Entry, len(scored))
 	for i, se := range scored {
-		results[i] = se.entry
+		results[i] = copyEntry(se.entry)
 	}
 
 	// Apply limit
@@ -675,13 +694,13 @@ func (s *Store) ListAll() []*Entry {
 		if entry.IsExpired(now) {
 			continue
 		}
-		results = append(results, entry)
+		results = append(results, copyEntry(entry))
 	}
 	for _, entry := range s.globalEntries {
 		if entry.IsExpired(now) {
 			continue
 		}
-		results = append(results, entry)
+		results = append(results, copyEntry(entry))
 	}
 
 	sort.Slice(results, func(i, j int) bool {
@@ -951,22 +970,30 @@ func (s *Store) globalArchivePath() string {
 	return filepath.Join(s.configDir, "memory", "global.archive.json")
 }
 
-// load loads entries from disk.
+// load loads entries from disk. Each of the four files is loaded
+// INDEPENDENTLY: a single corrupt/truncated file must not wipe the other three
+// (previously any one parse error returned early and NewStore reset ALL maps —
+// so one bad file silently erased every memory). On a parse error we quarantine
+// the bad file (rename aside) so it can't be silently overwritten by the next
+// save and so we don't re-hit the error every startup, then continue with that
+// map empty. Always returns nil — partial recovery beats total loss.
 func (s *Store) load() error {
-	// Load project entries
-	if err := s.loadFile(s.storagePath(), s.entries); err != nil {
-		return err
+	files := []struct {
+		path   string
+		target map[string]*Entry
+	}{
+		{s.storagePath(), s.entries},
+		{s.globalStoragePath(), s.globalEntries},
+		{s.archiveStoragePath(), s.archived},
+		{s.globalArchivePath(), s.globalArchive},
 	}
-	// Load global entries
-	if err := s.loadFile(s.globalStoragePath(), s.globalEntries); err != nil {
-		return err
-	}
-	// Load archived entries
-	if err := s.loadFile(s.archiveStoragePath(), s.archived); err != nil {
-		return err
-	}
-	if err := s.loadFile(s.globalArchivePath(), s.globalArchive); err != nil {
-		return err
+	for _, f := range files {
+		if err := s.loadFile(f.path, f.target); err != nil {
+			logging.Warn("memory: failed to load file, quarantining and continuing", "path", f.path, "error", err)
+			s.quarantineFile(f.path)
+			// loadFile errors at json.Unmarshal (before populating target), so
+			// the map is still empty — nothing to roll back.
+		}
 	}
 
 	// Update byKey index
@@ -1002,6 +1029,21 @@ func (s *Store) loadFile(path string, target map[string]*Entry) error {
 		target[entry.ID] = entry
 	}
 	return nil
+}
+
+// quarantineFile renames a corrupt memory file aside (path.corrupt-<nanos>) so
+// the next save can't silently overwrite data that may be recoverable by hand,
+// and so the parse error isn't re-hit on every startup. Best-effort.
+func (s *Store) quarantineFile(path string) {
+	if _, err := os.Stat(path); err != nil {
+		return // nothing to quarantine
+	}
+	dest := fmt.Sprintf("%s.corrupt-%d", path, time.Now().UnixNano())
+	if err := os.Rename(path, dest); err != nil {
+		logging.Warn("memory: failed to quarantine corrupt file", "path", path, "error", err)
+		return
+	}
+	logging.Warn("memory: quarantined corrupt file", "from", path, "to", dest)
 }
 
 // findSemanticDuplicateLocked returns an existing active entry that is a semantic
@@ -1166,7 +1208,10 @@ func (s *Store) saveFile(path string, entries []*Entry) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	// Atomic write (temp + fsync + rename): a crash or full disk mid-write must
+	// not leave a truncated/corrupt JSON file that would fail to parse — and
+	// would (pre-fix) wipe ALL persisted memory on the next startup.
+	return fileutil.AtomicWrite(path, data, 0644)
 }
 
 // pruneOldest removes the oldest entries to stay within limit.

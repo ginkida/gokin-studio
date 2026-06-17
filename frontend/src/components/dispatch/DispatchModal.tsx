@@ -19,6 +19,7 @@ function dispatchBlockerFor(provider: string, directoryOK: boolean | undefined, 
     glm: 'glmKey',
     minimax: 'minimaxKey',
     kimi: 'kimiKey',
+    deepseek: 'deepseekKey',
   }
   const keyField = keyFields[provider]
   if (keyField && !settings[keyField]) return 'no API key in settings'

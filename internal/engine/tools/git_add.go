@@ -87,6 +87,9 @@ func (t *GitAddTool) Execute(ctx context.Context, args map[string]any) (ToolResu
 			return NewErrorResult("no paths specified"), nil
 		}
 
+		// End-of-options separator so a path beginning with '-' (e.g. "-rf",
+		// "--no-verify") is treated as a pathspec, not a git flag.
+		cmdArgs = append(cmdArgs, "--")
 		for _, p := range pathsRaw {
 			if path, ok := p.(string); ok && path != "" {
 				cmdArgs = append(cmdArgs, path)

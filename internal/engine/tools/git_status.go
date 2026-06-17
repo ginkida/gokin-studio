@@ -7,17 +7,21 @@ import (
 	"strings"
 
 	"google.golang.org/genai"
+
+	"github.com/ginkida/gokin-studio/internal/engine/security"
 )
 
 // GitStatusTool shows git repository status.
 type GitStatusTool struct {
-	workDir string
+	workDir       string
+	pathValidator *security.PathValidator
 }
 
 // NewGitStatusTool creates a new GitStatusTool instance.
 func NewGitStatusTool(workDir string) *GitStatusTool {
 	return &GitStatusTool{
-		workDir: workDir,
+		workDir:       workDir,
+		pathValidator: security.NewPathValidator([]string{workDir}, false),
 	}
 }
 
@@ -57,6 +61,16 @@ func (t *GitStatusTool) Validate(args map[string]any) error {
 func (t *GitStatusTool) Execute(ctx context.Context, args map[string]any) (ToolResult, error) {
 	path := GetStringDefault(args, "path", t.workDir)
 	short := GetBoolDefault(args, "short", false)
+
+	// Confine the caller-supplied path to the project sandbox so the agent
+	// can't probe git repositories outside the project (info disclosure).
+	if t.pathValidator != nil {
+		validPath, err := t.pathValidator.Validate(path)
+		if err != nil {
+			return NewErrorResult(fmt.Sprintf("path validation failed: %s", err)), nil
+		}
+		path = validPath
+	}
 
 	// Build git status command
 	cmdArgs := []string{"status"}

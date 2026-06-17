@@ -32,6 +32,20 @@ func NewWebFetchTool() *WebFetchTool {
 		logging.Warn("failed to create secure HTTP client, using default", "error", err)
 	}
 
+	// Re-run SSRF validation on every redirect target and cap the redirect
+	// count. Without this, an allowed public URL could 30x-redirect to an
+	// internal/private address (cloud metadata endpoint, localhost service),
+	// defeating the up-front check on the initial URL.
+	secureClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return fmt.Errorf("stopped after 10 redirects")
+		}
+		if res := security.ValidateURLForSSRF(req.URL.String()); !res.Valid {
+			return fmt.Errorf("SSRF protection: redirect to %s blocked: %s", req.URL.Host, res.Reason)
+		}
+		return nil
+	}
+
 	return &WebFetchTool{
 		client:  secureClient,
 		maxSize: 1024 * 1024, // 1MB max
@@ -95,6 +109,19 @@ func (t *WebFetchTool) Validate(args map[string]any) error {
 func (t *WebFetchTool) Execute(ctx context.Context, args map[string]any) (ToolResult, error) {
 	urlStr, _ := GetString(args, "url")
 	selector, _ := GetString(args, "selector")
+
+	// SSRF protection MUST run here, not only in Validate(): the studio agent
+	// loop dispatches straight to Execute, so the Validate-only check was dead
+	// code. Reject URLs targeting internal/private networks up front; redirects
+	// are re-validated by the client's CheckRedirect hook.
+	if parsed, perr := url.Parse(urlStr); perr != nil {
+		return NewErrorResult(fmt.Sprintf("invalid URL: %s", perr)), nil
+	} else if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return NewErrorResult("only http and https URLs are supported"), nil
+	}
+	if res := security.ValidateURLForSSRF(urlStr); !res.Valid {
+		return NewErrorResult(fmt.Sprintf("SSRF protection: %s", res.Reason)), nil
+	}
 
 	// Create request
 	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)

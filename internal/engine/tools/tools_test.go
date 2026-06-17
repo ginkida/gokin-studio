@@ -1890,7 +1890,7 @@ func TestFilterBashOutput_AnsiOnlyLineBecomesEmpty(t *testing.T) {
 	// the resulting empty line should be counted as filtered (not added to result).
 	lines := []string{
 		"Starting build here for testing purposes",
-		"\x1b[0m",  // pure ANSI → empty after clean
+		"\x1b[0m", // pure ANSI → empty after clean
 		"Build step one completed successfully now",
 		"Build step two completed successfully now",
 		"go: downloading github.com/foo/bar v1.2.3",
@@ -3579,5 +3579,234 @@ func TestCoordinate_ExecuteSimpleWithDependsOn(t *testing.T) {
 	}
 	if !strings.Contains(result.Content, "Depends on") {
 		t.Errorf("expected 'Depends on' in result, got: %s", result.Content)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Reliability fixes — regression guards (iter 1070+)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// cappedBuffer ─ bounds output, reports dropped bytes, no marker when clean
+
+func TestCappedBuffer_NoDrop(t *testing.T) {
+	cb := newCappedBuffer(100)
+	n, err := cb.Write([]byte("hello"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n != 5 {
+		t.Fatalf("expected Write to report n=5, got %d", n)
+	}
+	s := cb.String()
+	if s != "hello" {
+		t.Errorf("expected 'hello', got %q", s)
+	}
+	if strings.Contains(s, "truncated") {
+		t.Error("unexpected truncation marker when nothing was dropped")
+	}
+}
+
+func TestCappedBuffer_DropsOverLimit(t *testing.T) {
+	cb := newCappedBuffer(10)
+	n, err := cb.Write([]byte("0123456789ABCDE")) // 15 bytes, 5 over cap
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n != 15 {
+		t.Errorf("Write must report full len even when truncated; got %d", n)
+	}
+	s := cb.String()
+	if !strings.HasPrefix(s, "0123456789") {
+		t.Errorf("expected stored prefix '0123456789', got %q", s)
+	}
+	if !strings.Contains(s, "truncated") {
+		t.Errorf("expected truncation marker in %q", s)
+	}
+	if !strings.Contains(s, "5") {
+		t.Errorf("expected dropped byte count '5' in %q", s)
+	}
+}
+
+func TestCappedBuffer_WriteAfterFull(t *testing.T) {
+	cb := newCappedBuffer(5)
+	cb.Write([]byte("12345"))        // fills the buffer
+	n, err := cb.Write([]byte("XY")) // entirely dropped
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("Write must report full len; got %d", n)
+	}
+	s := cb.String()
+	if strings.Contains(s, "X") || strings.Contains(s, "Y") {
+		t.Errorf("dropped bytes must not appear in output: %q", s)
+	}
+	if !strings.Contains(s, "truncated") {
+		t.Errorf("expected truncation marker: %q", s)
+	}
+}
+
+// BashTool.Execute ─ security validation runs inside Execute, not only Validate
+
+func TestBashTool_ExecuteBlocksDangerousCommand(t *testing.T) {
+	tmpDir := t.TempDir()
+	tool := NewBashTool(tmpDir)
+	result, err := tool.Execute(context.Background(), map[string]any{
+		"command": "rm -rf /",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Success {
+		t.Error("expected failure for dangerous command rm -rf /")
+	}
+	if !strings.Contains(result.Error, "blocked") {
+		t.Errorf("expected 'blocked' in error, got: %s", result.Error)
+	}
+}
+
+// HistorySearchTool ─ invalid regex returns clean error instead of panic
+
+func TestHistorySearch_InvalidRegexReturnsError(t *testing.T) {
+	tool := NewHistorySearchTool(nil)
+	result, err := tool.Execute(context.Background(), map[string]any{
+		"pattern": "[",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Success {
+		t.Error("expected failure for invalid regex pattern '['")
+	}
+	if !strings.Contains(result.Error, "invalid regex") {
+		t.Errorf("expected 'invalid regex' in error, got: %s", result.Error)
+	}
+}
+
+// WebFetchTool ─ SSRF protection fires in Execute, not only in Validate
+
+func TestWebFetchTool_BlocksLocalhostSSRF(t *testing.T) {
+	tool := NewWebFetchTool()
+	result, err := tool.Execute(context.Background(), map[string]any{
+		"url": "http://localhost:8080/secret",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Success {
+		t.Error("expected failure for localhost URL")
+	}
+	if !strings.Contains(result.Error, "SSRF") && !strings.Contains(result.Error, "blocked") {
+		t.Errorf("expected SSRF protection message, got: %s", result.Error)
+	}
+}
+
+func TestWebFetchTool_BlocksAWSMetadata(t *testing.T) {
+	tool := NewWebFetchTool()
+	result, err := tool.Execute(context.Background(), map[string]any{
+		"url": "http://169.254.169.254/latest/meta-data/",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Success {
+		t.Error("expected failure for AWS IMDSv1 metadata endpoint")
+	}
+	if !strings.Contains(result.Error, "SSRF") && !strings.Contains(result.Error, "blocked") {
+		t.Errorf("expected SSRF protection message, got: %s", result.Error)
+	}
+}
+
+// BatchTool ─ path traversal blocked for all targets
+
+func TestBatchTool_BlocksPathTraversal(t *testing.T) {
+	tmpDir := t.TempDir()
+	tool := NewBatchTool(tmpDir)
+	result, err := tool.Execute(context.Background(), map[string]any{
+		"operation":  "replace",
+		"files":      []any{"../../../etc/passwd"},
+		"old_string": "root",
+		"new_string": "pwned",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Success {
+		t.Error("expected failure for path traversal attempt")
+	}
+	if !strings.Contains(result.Error, "path validation") && !strings.Contains(result.Error, "outside") {
+		t.Errorf("expected path validation error, got: %s", result.Error)
+	}
+}
+
+// EditTool ─ multi-edit rejects non-unique old_string (was silently applied to first match)
+
+func TestEditTool_MultiEdit_DuplicateOldStringRejected(t *testing.T) {
+	tmpDir := t.TempDir()
+	// Resolve symlinks so the path validator (which rejects symlink paths on
+	// macOS where /var → /private/var) accepts the working directory.
+	realTmpDir, err := filepath.EvalSymlinks(tmpDir)
+	if err != nil {
+		t.Fatalf("failed to resolve tmpDir symlink: %v", err)
+	}
+	tmpDir = realTmpDir
+	filePath := filepath.Join(tmpDir, "dup.txt")
+	if err := os.WriteFile(filePath, []byte("foo\nbar\nfoo\n"), 0644); err != nil {
+		t.Fatalf("failed to write test file: %v", err)
+	}
+	tool := NewEditTool(tmpDir)
+	result, err := tool.Execute(context.Background(), map[string]any{
+		"file_path": filePath,
+		"edits": []any{
+			map[string]any{
+				"old_string": "foo",
+				"new_string": "qux",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Success {
+		t.Error("expected failure when old_string is not unique in multi-edit")
+	}
+	// Error must mention the occurrence count (2) and context guidance
+	if !strings.Contains(result.Error, "2") {
+		t.Errorf("expected occurrence count '2' in error, got: %s", result.Error)
+	}
+}
+
+// memory.Store ─ Get/GetByID return deep copies; mutating them must not affect the store
+
+func TestMemoryStore_GetReturnsCopy(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := memory.NewStore(tmpDir, tmpDir, 100)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	e := memory.NewEntry("test content", memory.MemoryProject)
+	e.Tags = []string{"original"}
+	e.Key = "mykey"
+	if addErr := store.Add(e); addErr != nil {
+		t.Fatalf("failed to add entry: %v", addErr)
+	}
+
+	got, ok := store.Get("mykey")
+	if !ok {
+		t.Fatal("expected entry to be found")
+	}
+	// Mutate the returned copy — must NOT affect the live store entry
+	got.Tags = append(got.Tags, "mutated")
+	got.Content = "mutated content"
+
+	got2, ok := store.Get("mykey")
+	if !ok {
+		t.Fatal("expected entry to still be found after mutation of returned copy")
+	}
+	if got2.Content != "test content" {
+		t.Errorf("store Content was mutated by caller; got %q", got2.Content)
+	}
+	if len(got2.Tags) != 1 || got2.Tags[0] != "original" {
+		t.Errorf("store Tags were mutated by caller; got %v", got2.Tags)
 	}
 }

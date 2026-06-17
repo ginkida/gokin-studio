@@ -204,6 +204,10 @@ function AppContent() {
       const pid = useProjectStore.getState().activeProjectId
       if (!pid) return
       ListChatSessions(pid).then((list) => {
+        // Stale-response guard: if the user switched projects while this async
+        // call was in flight, drop the result rather than write project A's
+        // tabs into project B's tab bar.
+        if (useProjectStore.getState().activeProjectId !== pid) return
         if (list && list.length > 0) {
           setSessions(list.map((s: any) => ({ id: s.id, name: s.name, parentName: s.parentName, pinned: !!s.pinned })))
         }

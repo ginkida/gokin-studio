@@ -78,7 +78,14 @@ func (t *HistorySearchTool) Validate(args map[string]any) error {
 
 func (t *HistorySearchTool) Execute(ctx context.Context, args map[string]any) (ToolResult, error) {
 	patternStr, _ := GetString(args, "pattern")
-	re := regexp.MustCompile("(?i)" + patternStr)
+	// regexp.Compile, not MustCompile: the studio agent loop dispatches straight
+	// to Execute without calling Validate, so an invalid pattern would panic the
+	// whole turn (recovered, but surfaced as a confusing "Internal error").
+	// Return a clean, actionable error instead.
+	re, err := regexp.Compile("(?i)" + patternStr)
+	if err != nil {
+		return NewErrorResult(fmt.Sprintf("invalid regex: %v", err)), nil
+	}
 
 	// Prefer a per-session getter injected via context (set by project.go's
 	// SendMessage) over the stored field, which would be shared across sessions.

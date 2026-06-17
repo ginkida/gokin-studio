@@ -316,14 +316,29 @@ func (t *ReadTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 		return NewErrorResult(fmt.Sprintf("%s is a directory, not a file", filePath)), nil
 	}
 
-	// Route based on file extension
+	// Route based on file extension. The binary/structured readers load the
+	// WHOLE file into memory (and base64-encode images), so cap the size first
+	// — a multi-hundred-MB PDF/notebook/image would otherwise OOM the app.
+	const (
+		readPDFNotebookMaxBytes = 50 * 1024 * 1024 // 50 MB
+		readImageMaxBytes       = 20 * 1024 * 1024 // 20 MB (≈ provider vision limits)
+	)
 	ext := strings.ToLower(filepath.Ext(filePath))
 	switch ext {
 	case ".pdf":
+		if info.Size() > readPDFNotebookMaxBytes {
+			return NewErrorResult(fmt.Sprintf("PDF too large to read (%d bytes, max %d)", info.Size(), readPDFNotebookMaxBytes)), nil
+		}
 		return t.readPDF(filePath)
 	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico", ".tiff", ".tif":
+		if info.Size() > readImageMaxBytes {
+			return NewErrorResult(fmt.Sprintf("image too large to read (%d bytes, max %d)", info.Size(), readImageMaxBytes)), nil
+		}
 		return t.readImage(filePath)
 	case ".ipynb":
+		if info.Size() > readPDFNotebookMaxBytes {
+			return NewErrorResult(fmt.Sprintf("notebook too large to read (%d bytes, max %d)", info.Size(), readPDFNotebookMaxBytes)), nil
+		}
 		return t.readNotebook(filePath)
 	default:
 		// Detect binary files by extension or null bytes in first 512 bytes
@@ -341,7 +356,7 @@ func (t *ReadTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 }
 
 // readLargeFile reads a large file using chunked streaming.
-func (t *ReadTool) readLargeFile(ctx context.Context, filePath string, args map[string]any) (ToolResult, error) {
+func (t *ReadTool) readLargeFile(_ context.Context, filePath string, args map[string]any) (ToolResult, error) {
 	offset := GetIntDefault(args, "offset", 1)
 	limit := GetIntDefault(args, "limit", DefaultChunkSize)
 

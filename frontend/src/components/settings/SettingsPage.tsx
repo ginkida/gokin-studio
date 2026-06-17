@@ -467,7 +467,7 @@ export function SettingsPage() {
     // green "Connected" badge would otherwise lie about the new (untested)
     // key. The provider ID is derivable from the key's name.
     const keyToProvider: Record<string, string> = {
-      glmKey: 'glm', miniMaxKey: 'minimax', kimiKey: 'kimi', deepseekKey: 'deepseek', ollamaUrl: 'ollama',
+      glmKey: 'glm', minimaxKey: 'minimax', kimiKey: 'kimi', deepseekKey: 'deepseek', ollamaUrl: 'ollama',
     }
     const provider = keyToProvider[key as string]
     if (provider && healthResults[provider]) {

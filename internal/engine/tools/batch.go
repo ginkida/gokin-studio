@@ -11,6 +11,7 @@ import (
 	"github.com/bmatcuk/doublestar/v4"
 	"google.golang.org/genai"
 
+	"github.com/ginkida/gokin-studio/internal/engine/security"
 	"github.com/ginkida/gokin-studio/internal/engine/undo"
 )
 
@@ -23,13 +24,27 @@ type BatchTool struct {
 	workDir          string
 	progressCallback BatchProgressCallback
 	failureThreshold float64 // Stop if failure rate exceeds this (0.0 to 1.0, 0 = disabled)
+	// pathValidator confines every target (replace/rename/delete) to the
+	// project directory. batch mutates files via os.Remove / AtomicWrite just
+	// like edit/write/delete, so it MUST enforce the same sandbox — without it
+	// an absolute or ../ path in `files`/`pattern` would let the agent destroy
+	// arbitrary files outside the project.
+	pathValidator *security.PathValidator
 }
 
 // NewBatchTool creates a new BatchTool instance.
 func NewBatchTool(workDir string) *BatchTool {
 	return &BatchTool{
-		workDir: workDir,
+		workDir:       workDir,
+		pathValidator: security.NewPathValidator([]string{workDir}, false),
 	}
+}
+
+// SetAllowedDirs sets additional allowed directories for path validation,
+// mirroring WriteTool/DeleteTool.
+func (t *BatchTool) SetAllowedDirs(dirs []string) {
+	allDirs := append([]string{t.workDir}, dirs...)
+	t.pathValidator = security.NewPathValidator(allDirs, false)
 }
 
 // SetUndoManager sets the undo manager for tracking changes.
@@ -193,6 +208,29 @@ func (t *BatchTool) Execute(ctx context.Context, args map[string]any) (ToolResul
 		return NewErrorResult("no files matched the pattern or list"), nil
 	}
 
+	// Confine every target to the project sandbox BEFORE any mutation. This is
+	// the guard the other mutation tools (write/edit/delete) enforce; batch
+	// historically skipped it, so an absolute or ../ path in `files`, or an
+	// escaping glob `pattern`, could replace/delete files anywhere the process
+	// can write. Fail closed: reject the whole call if any target escapes or is
+	// a blocked write path (e.g. inside .git), and resolve each to its
+	// validated absolute path.
+	if t.pathValidator == nil {
+		return NewErrorResult("security error: path validator not initialized"), nil
+	}
+	validated := make([]string, 0, len(files))
+	for _, f := range files {
+		vp, verr := t.pathValidator.Validate(f)
+		if verr != nil {
+			return NewErrorResult(fmt.Sprintf("path validation failed for %q: %s (batch only operates inside the project directory)", f, verr)), nil
+		}
+		if berr := security.IsBlockedWritePath(vp); berr != nil {
+			return NewErrorResult(fmt.Sprintf("%q: %s", f, berr)), nil
+		}
+		validated = append(validated, vp)
+	}
+	files = validated
+
 	// Execute operation
 	var result BatchResult
 	switch op {
@@ -324,7 +362,7 @@ func (t *BatchTool) replaceInFile(path, search, replacement string, dryRun bool)
 }
 
 // executeRename renames multiple files.
-func (t *BatchTool) executeRename(ctx context.Context, files []string, from, to string, dryRun, parallel bool) BatchResult {
+func (t *BatchTool) executeRename(ctx context.Context, files []string, from, to string, dryRun, _ bool) BatchResult {
 	result := BatchResult{
 		TotalFiles:  len(files),
 		Failed:      make(map[string]string),
@@ -385,7 +423,7 @@ func (t *BatchTool) executeRename(ctx context.Context, files []string, from, to 
 }
 
 // executeDelete deletes multiple files.
-func (t *BatchTool) executeDelete(ctx context.Context, files []string, dryRun, parallel bool) BatchResult {
+func (t *BatchTool) executeDelete(ctx context.Context, files []string, dryRun, _ bool) BatchResult {
 	result := BatchResult{
 		TotalFiles:  len(files),
 		Failed:      make(map[string]string),

@@ -361,6 +361,15 @@ func (t *BashTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 	command, _ := GetString(args, "command")
 	stdinContent, _ := GetString(args, "stdin")
 
+	// The dangerous-command blocklist (fork bombs, rm -rf /, reverse shells,
+	// curl|sh, ...) MUST run on every execution. The studio agent loop
+	// dispatches straight to Execute and never calls Validate, so relying on
+	// Validate alone leaves this guard dead in production. Running it here also
+	// covers the run_in_background path below. Belt-and-suspenders with Validate.
+	if res := security.ValidateCommand(command); !res.Valid {
+		return NewErrorResult(fmt.Sprintf("blocked: %s", res.Reason)), nil
+	}
+
 	if err := t.validateManagedWorkspaceCommand(command); err != nil {
 		return NewErrorResult(err.Error()), nil
 	}
@@ -576,6 +585,53 @@ func (t *BashTool) updateSessionAfterCommandLegacy(command string) {
 }
 
 // executeForeground runs a command and waits for completion.
+// bashMaxCaptureBytes caps how much stdout/stderr a foreground command may
+// accumulate in memory. Generous (most build/test output is well under this),
+// but prevents a chatty/runaway command (`yes`, `cat hugefile`) from ballooning
+// memory before the timeout fires. The final result is truncated far smaller
+// (mergeBashOutput), but the raw capture is what could OOM without a cap.
+const bashMaxCaptureBytes = 10 * 1024 * 1024 // 10 MB
+
+// cappedBuffer is an io.Writer that stores at most max bytes; once full, extra
+// bytes are counted but discarded so memory can't grow without bound. String()
+// appends a truncation marker when bytes were dropped. Safe for concurrent
+// Write/String (the streaming reader writes while the flush goroutine reads).
+type cappedBuffer struct {
+	mu      sync.Mutex
+	buf     bytes.Buffer
+	max     int
+	dropped int64
+}
+
+func newCappedBuffer(max int) *cappedBuffer { return &cappedBuffer{max: max} }
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if room := c.max - c.buf.Len(); room > 0 {
+		if len(p) <= room {
+			c.buf.Write(p)
+		} else {
+			c.buf.Write(p[:room])
+			c.dropped += int64(len(p) - room)
+		}
+	} else {
+		c.dropped += int64(len(p))
+	}
+	// Report a full write so the producer (os/exec copy, pipe reader) is never
+	// blocked or errored just because we chose to stop storing.
+	return len(p), nil
+}
+
+func (c *cappedBuffer) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.dropped == 0 {
+		return c.buf.String()
+	}
+	return c.buf.String() + fmt.Sprintf("\n... [output truncated: %d more bytes] ...", c.dropped)
+}
+
 func (t *BashTool) executeForeground(ctx context.Context, command string, stdinContent string) (ToolResult, error) {
 	// Create context with explicit timeout to prevent indefinite hangs
 	execCtx := ctx
@@ -621,8 +677,9 @@ func (t *BashTool) executeForeground(ctx context.Context, command string, stdinC
 	// Get progress callback for streaming output
 	onProgress := GetProgressCallback(ctx)
 
-	// Set up output capture with optional streaming
-	var stdout, stderr bytes.Buffer
+	// Set up output capture with optional streaming. Capped so a runaway
+	// command can't OOM the app before the timeout (see cappedBuffer).
+	stdout, stderr := newCappedBuffer(bashMaxCaptureBytes), newCappedBuffer(bashMaxCaptureBytes)
 	if onProgress != nil {
 		// Use pipes for streaming output
 		stdoutPipe, err := cmd.StdoutPipe()
@@ -776,11 +833,7 @@ func (t *BashTool) executeForeground(ctx context.Context, command string, stdinC
 			exitErr, ok := cmdErr.(*exec.ExitError)
 			if ok {
 				cleanErr, _ := extractPWDFromOutput(rawOutput)
-				return ToolResult{
-					Content: cleanErr,
-					Error:   fmt.Sprintf("command exited with code %d", exitErr.ExitCode()),
-					Success: false,
-				}, nil
+				return t.buildFailureResult(cleanErr, stderr.String(), exitErr.ExitCode()), nil
 			}
 			return NewErrorResult(fmt.Sprintf("command failed: %s", cmdErr)), nil
 		}
@@ -789,8 +842,8 @@ func (t *BashTool) executeForeground(ctx context.Context, command string, stdinC
 	}
 
 	// Non-streaming path: capture output directly
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 
 	// Start command
 	err := cmd.Start()
@@ -857,11 +910,7 @@ func (t *BashTool) executeForeground(ctx context.Context, command string, stdinC
 		exitErr, ok := finalErr.(*exec.ExitError)
 		if ok {
 			cleanErr, _ := extractPWDFromOutput(rawOutput)
-			return ToolResult{
-				Content: cleanErr,
-				Error:   fmt.Sprintf("command exited with code %d", exitErr.ExitCode()),
-				Success: false,
-			}, nil
+			return t.buildFailureResult(cleanErr, stderr.String(), exitErr.ExitCode()), nil
 		}
 		return NewErrorResult(fmt.Sprintf("command failed: %s", finalErr)), nil
 	}
@@ -869,8 +918,11 @@ func (t *BashTool) executeForeground(ctx context.Context, command string, stdinC
 	return t.buildResult(cleanOutput, stderr.String()), nil
 }
 
-// buildResult constructs a ToolResult from stdout and stderr output.
-func (t *BashTool) buildResult(stdoutStr, stderrStr string) ToolResult {
+// mergeBashOutput combines stdout + stderr, filters noise, and truncates to a
+// head/tail window. Shared by the success and failure result builders so that
+// stderr (where compilers and test runners write their diagnostics) is
+// preserved on a non-zero exit, not only on success.
+func mergeBashOutput(stdoutStr, stderrStr string) string {
 	var output strings.Builder
 
 	if len(stdoutStr) > 0 {
@@ -899,12 +951,28 @@ func (t *BashTool) buildResult(stdoutStr, stderrStr string) ToolResult {
 			fmt.Sprintf("\n\n... [%d lines, %d chars omitted] ...\n\n", omittedLines, len(omitted)) +
 			tail
 	}
+	return result
+}
 
+// buildResult constructs a success ToolResult from stdout and stderr output.
+func (t *BashTool) buildResult(stdoutStr, stderrStr string) ToolResult {
+	result := mergeBashOutput(stdoutStr, stderrStr)
 	if result == "" {
 		result = "ok" // Success with no output (git add, mkdir, mv, etc.)
 	}
-
 	return NewSuccessResult(result)
+}
+
+// buildFailureResult constructs a non-zero-exit ToolResult that PRESERVES
+// stderr in Content. Compilers/linters/test runners write their actionable
+// diagnostics to stderr; without this the agent saw only "command exited with
+// code N" and was stranded on every failing build/test.
+func (t *BashTool) buildFailureResult(stdoutStr, stderrStr string, exitCode int) ToolResult {
+	return ToolResult{
+		Content: mergeBashOutput(stdoutStr, stderrStr),
+		Error:   fmt.Sprintf("command exited with code %d", exitCode),
+		Success: false,
+	}
 }
 
 // executeSandboxed executes the command with sandbox isolation

@@ -112,8 +112,14 @@ export function useWailsEvents() {
         // Attach duration + usage + model info to the last assistant message
         // so it can show real numbers and which backend answered in its footer
         // instead of the char/4 estimate and nothing else.
+        //
+        // Re-read LIVE state here: the `store` snapshot above is stale after
+        // finalizeAssistant/finalizeUsage ran their set() updates. Using the
+        // stale snapshot's messages and writing them back would erase the
+        // just-finalized assistant message (and any concurrent edits).
         if (data.durationMs || finalUsage || data.model || data.provider) {
-          const msgs = store.messages[key] || []
+          const live = useChatStore.getState()
+          const msgs = live.messages[key] || []
           for (let i = msgs.length - 1; i >= 0; i--) {
             if (msgs[i].role === 'assistant') {
               const updated = [...msgs]
@@ -124,7 +130,7 @@ export function useWailsEvents() {
                 model: data.model || updated[i].model,
                 provider: data.provider || updated[i].provider,
               }
-              store.setMessages(key, updated)
+              live.setMessages(key, updated)
               break
             }
           }

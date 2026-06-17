@@ -1089,11 +1089,22 @@ outer:
 				})
 				result, toolErr := safeToolExecute(toolCtx, tool, fc.Args)
 				success := toolErr == nil && result.Success
+				// On failure, COMBINE the captured output with the error rather
+				// than replacing it. A failing `go build`/`go test` returns its
+				// compiler/test diagnostics in result.Content (incl. stderr) and
+				// a terse "command exited with code N" in result.Error; sending
+				// only the latter stranded the agent with nothing to fix. A
+				// panic/exec error (toolErr) has no useful content, so use it
+				// directly.
 				content := result.Content
 				if toolErr != nil {
 					content = toolErr.Error()
 				} else if result.Error != "" {
-					content = result.Error
+					if content != "" {
+						content = content + "\n" + result.Error
+					} else {
+						content = result.Error
+					}
 				}
 
 				p.emitEvent(wailsCtx, EventChatToolResult, ChatToolResultEvent{

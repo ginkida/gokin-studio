@@ -507,6 +507,15 @@ func (t *EditTool) executeMultiEdit(ctx context.Context, filePath string, edits 
 			return NewErrorResultWithContext(errMsg, fileCtx), nil
 		}
 
+		// Enforce the same uniqueness contract as the single-edit path: a
+		// non-unique old_string is ambiguous and must be rejected, not silently
+		// applied to the first match. The multi-edit schema exposes no per-edit
+		// replace_all, so there's never a legitimate "replace only the first of
+		// many" intent here — failing fast prevents corrupting the wrong line.
+		if count > 1 {
+			return NewErrorResult(fmt.Sprintf("edit[%d]: old_string appears %d times after previous edits; provide more surrounding context to make it unique", i, count)), nil
+		}
+
 		content = strings.Replace(content, oldStr, newStr, 1)
 		totalReplacements++
 	}
@@ -1009,19 +1018,52 @@ func tryFuzzyReplace(content, old, new string, replaceAll bool) (string, string,
 				strategy.name, len(matchStarts))
 		}
 
-		// Build result by replacing matched line ranges in the original content.
-		// Process matches in reverse order so earlier indices stay valid.
+		// Map normalized line indices back to ORIGINAL content line indices.
+		// For line-count-preserving strategies this is the identity, but
+		// BlankLines DROPS blank lines, so a normalized index does NOT equal
+		// the original index — splicing contentLines with normalized indices
+		// would corrupt the file at the wrong lines. Build an explicit map (or
+		// skip the strategy if it can't be established reliably).
+		normToOrig := make([]int, len(normalizedLines))
+		if len(normalizedLines) == len(contentLines) {
+			for i := range normToOrig {
+				normToOrig[i] = i
+			}
+		} else {
+			ni := 0
+			for origIdx, line := range contentLines {
+				if ni >= len(normalizedLines) {
+					break
+				}
+				// All strategies normalize per-line, so normalizing one
+				// original line reproduces its normalized form; lines the
+				// strategy drops (blank ones) won't match the next entry.
+				if strategy.normalize(line) == normalizedLines[ni] {
+					normToOrig[ni] = origIdx
+					ni++
+				}
+			}
+			if ni != len(normalizedLines) {
+				// Couldn't reliably map normalized→original lines; skip this
+				// strategy rather than risk corrupting the file.
+				continue
+			}
+		}
+
+		// Build result by replacing matched line ranges in the ORIGINAL
+		// content. Process matches in reverse order so earlier indices stay
+		// valid. The original range spans from the first matched line through
+		// the last (inclusive of any blank lines dropped between them).
 		resultLines := make([]string, len(contentLines))
 		copy(resultLines, contentLines)
 
 		for mi := len(matchStarts) - 1; mi >= 0; mi-- {
-			start := matchStarts[mi]
-			end := start + oldLineCount
-			// Replace the original lines [start:end) with new lines
+			origStart := normToOrig[matchStarts[mi]]
+			origEnd := normToOrig[matchStarts[mi]+oldLineCount-1] + 1 // exclusive
 			var newLines []string
-			newLines = append(newLines, resultLines[:start]...)
+			newLines = append(newLines, resultLines[:origStart]...)
 			newLines = append(newLines, normalizedNewLines...)
-			newLines = append(newLines, resultLines[end:]...)
+			newLines = append(newLines, resultLines[origEnd:]...)
 			resultLines = newLines
 		}
 
