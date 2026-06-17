@@ -476,6 +476,17 @@ func (t *EditTool) executeMultiEdit(ctx context.Context, filePath string, edits 
 		return NewErrorResult(err.Error()), nil
 	}
 
+	// Read-before-Edit safety check — same invariant as the single-edit path.
+	if rt, ok := ctx.Value(ReadTrackerCtxKey{}).(*FileReadTracker); ok && rt != nil {
+		if _, statErr := os.Stat(filePath); statErr == nil && !rt.HasBeenRead(filePath) {
+			return NewErrorResult(fmt.Sprintf(
+				"read-before-edit: call the read tool on %s first so you have the full surrounding context. "+
+					"Editing based on grep snippets regularly clobbers nearby code. After reading, retry the edit.",
+				filePath,
+			)), nil
+		}
+	}
+
 	// Read file
 	data, err := os.ReadFile(filePath)
 	if err != nil {
