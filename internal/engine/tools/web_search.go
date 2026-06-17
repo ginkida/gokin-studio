@@ -37,7 +37,8 @@ type WebSearchTool struct {
 
 // NewWebSearchTool creates a new web search tool.
 func NewWebSearchTool() *WebSearchTool {
-	// Create secure HTTP client with TLS 1.2+ enforcement
+	// Create secure HTTP client with TLS 1.2+ enforcement and SSRF redirect
+	// protection so search provider 302 responses can't bypass the URL check.
 	secureClient, err := security.CreateDefaultHTTPClient()
 	if err != nil {
 		secureClient = &http.Client{Timeout: 30 * time.Second}
@@ -45,7 +46,7 @@ func NewWebSearchTool() *WebSearchTool {
 	}
 
 	return &WebSearchTool{
-		client:     secureClient,
+		client:     security.WithSSRFRedirectProtection(secureClient),
 		provider:   SearchProviderSerpAPI,
 		maxResults: 10,
 	}
@@ -114,9 +115,7 @@ func (t *WebSearchTool) Execute(ctx context.Context, args map[string]any) (ToolR
 	query, _ := GetString(args, "query")
 	numResults := GetIntDefault(args, "num_results", 5)
 
-	if numResults > t.maxResults {
-		numResults = t.maxResults
-	}
+	numResults = min(numResults, t.maxResults)
 	if numResults < 1 {
 		numResults = 5
 	}
@@ -148,13 +147,13 @@ func (t *WebSearchTool) Execute(ctx context.Context, args map[string]any) (ToolR
 
 	// Format results
 	var output strings.Builder
-	output.WriteString(fmt.Sprintf("Search results for: %s\n\n", query))
+	fmt.Fprintf(&output, "Search results for: %s\n\n", query)
 
 	for i, r := range results {
-		output.WriteString(fmt.Sprintf("%d. **%s**\n", i+1, r.Title))
-		output.WriteString(fmt.Sprintf("   %s\n", r.URL))
+		fmt.Fprintf(&output, "%d. **%s**\n", i+1, r.Title)
+		fmt.Fprintf(&output, "   %s\n", r.URL)
 		if r.Snippet != "" {
-			output.WriteString(fmt.Sprintf("   %s\n", r.Snippet))
+			fmt.Fprintf(&output, "   %s\n", r.Snippet)
 		}
 		output.WriteString("\n")
 	}
@@ -211,7 +210,7 @@ func (t *WebSearchTool) searchSerpAPI(ctx context.Context, query string, numResu
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10)) // cap error body; it only feeds the message
 		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -280,7 +279,7 @@ func (t *WebSearchTool) searchGoogle(ctx context.Context, query string, numResul
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10)) // cap error body; it only feeds the message
 		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -397,7 +396,7 @@ func parseDuckDuckGoLite(r io.Reader, maxResults int) ([]SearchResult, error) {
 func htmlHasClass(n *html.Node, class string) bool {
 	for _, a := range n.Attr {
 		if a.Key == "class" {
-			for _, c := range strings.Fields(a.Val) {
+			for c := range strings.FieldsSeq(a.Val) {
 				if c == class {
 					return true
 				}
