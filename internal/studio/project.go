@@ -1050,6 +1050,10 @@ outer:
 
 		// Tool loop: keep executing tool rounds until the model returns a plain
 		// text response with no further tool calls (or until toolRound cap).
+		// recentToolPatterns records the stagnation key of each executed call
+		// in order; checkStagnation fires when the last stagnationLimit are
+		// identical (ported from gokin's executor loop guard).
+		var recentToolPatterns []string
 		for toolRound := 0; len(collected.FunctionCalls) > 0 && toolRound < 40; toolRound++ {
 			if ctx.Err() != nil {
 				break outer
@@ -1116,6 +1120,27 @@ outer:
 						ProjectID: p.ID, SessionID: sid, Tool: toolName, Text: step,
 					})
 				})
+				// Loop guard: detect stuck repetition before executing.
+				toolPattern := stagnationKey(fc.Name, fc.Args)
+				recentToolPatterns = append(recentToolPatterns, toolPattern)
+				if checkStagnation(recentToolPatterns, toolPattern) {
+					guardMsg := buildStagnationMessage(fc.Name, fc.Args, stagnationLimit)
+					funcParts = append(funcParts, &genai.Part{
+						FunctionResponse: &genai.FunctionResponse{
+							ID:       fc.ID,
+							Name:     fc.Name,
+							Response: map[string]any{"result": guardMsg},
+						},
+					})
+					p.emitEvent(wailsCtx, EventChatToolResult, ChatToolResultEvent{
+						ProjectID: p.ID, SessionID: sid, Tool: fc.Name, Success: false,
+						Content: guardMsg,
+					})
+					notSuccess := false
+					replay.Append(ReplayEvent{Type: "tool_result", Tool: fc.Name, Success: &notSuccess, Text: guardMsg})
+					continue
+				}
+
 				result, toolErr := safeToolExecute(toolCtx, tool, fc.Args)
 				success := toolErr == nil && result.Success
 				// On failure, COMBINE the captured output with the error rather
