@@ -833,7 +833,7 @@ func (t *BashTool) executeForeground(ctx context.Context, command string, stdinC
 			exitErr, ok := cmdErr.(*exec.ExitError)
 			if ok {
 				cleanErr, _ := extractPWDFromOutput(rawOutput)
-				return t.buildFailureResult(cleanErr, stderr.String(), exitErr.ExitCode()), nil
+				return t.buildExitResult(command, cleanErr, stderr.String(), exitErr.ExitCode()), nil
 			}
 			return NewErrorResult(fmt.Sprintf("command failed: %s", cmdErr)), nil
 		}
@@ -910,7 +910,7 @@ func (t *BashTool) executeForeground(ctx context.Context, command string, stdinC
 		exitErr, ok := finalErr.(*exec.ExitError)
 		if ok {
 			cleanErr, _ := extractPWDFromOutput(rawOutput)
-			return t.buildFailureResult(cleanErr, stderr.String(), exitErr.ExitCode()), nil
+			return t.buildExitResult(command, cleanErr, stderr.String(), exitErr.ExitCode()), nil
 		}
 		return NewErrorResult(fmt.Sprintf("command failed: %s", finalErr)), nil
 	}
@@ -963,16 +963,121 @@ func (t *BashTool) buildResult(stdoutStr, stderrStr string) ToolResult {
 	return NewSuccessResult(result)
 }
 
-// buildFailureResult constructs a non-zero-exit ToolResult that PRESERVES
-// stderr in Content. Compilers/linters/test runners write their actionable
-// diagnostics to stderr; without this the agent saw only "command exited with
-// code N" and was stranded on every failing build/test.
-func (t *BashTool) buildFailureResult(stdoutStr, stderrStr string, exitCode int) ToolResult {
+// buildExitResult turns a non-zero command exit into a ToolResult.
+// A benign non-zero exit (grep/rg/ag finding no matches, diff finding
+// differences — exit 1 with no stderr) is treated as success: the UI shows a
+// quiet collapsed line instead of a red error card. Genuine failures include
+// an "Actionable summary:" block so the model has context-aware next steps.
+func (t *BashTool) buildExitResult(command, stdoutStr, stderrStr string, exitCode int) ToolResult {
+	if benignNonZeroExit(command, exitCode, stderrStr) {
+		res := t.buildResult(stdoutStr, "")
+		if res.Content == "ok" || res.Content == "Command completed successfully (no output)." {
+			res.Content = benignEmptyLabel(command)
+		}
+		return res
+	}
+	combined := mergeBashOutput(stdoutStr, stderrStr)
+	summary := bashFailureSummary(command, exitCode, stdoutStr, stderrStr)
+	content := summary
+	if combined != "" {
+		content += "\n\n" + combined
+	}
 	return ToolResult{
-		Content: mergeBashOutput(stdoutStr, stderrStr),
+		Content: content,
 		Error:   fmt.Sprintf("command exited with code %d", exitCode),
 		Success: false,
 	}
+}
+
+// benignNonZeroExit reports whether a non-zero exit is an expected, non-error
+// outcome — grep/rg/ag finding no matches (exit 1) and diff/cmp finding
+// differences (exit 1). A real error from these writes to stderr and/or exits
+// >1, so we require exitCode==1 AND empty stderr.
+func benignNonZeroExit(command string, exitCode int, stderr string) bool {
+	if exitCode != 1 || strings.TrimSpace(stderr) != "" {
+		return false
+	}
+	prog, sub := exitDeterminingProgram(command)
+	if prog == "git" && sub == "grep" {
+		return true
+	}
+	switch prog {
+	case "grep", "egrep", "fgrep", "rg", "ag", "ack", "diff", "cmp":
+		return true
+	}
+	return false
+}
+
+// exitDeterminingProgram returns the (basename) program — and its first arg —
+// whose exit code the shell reports for `command`. Strips a leading
+// "cd <path> &&" prefix; handles pipelines by taking the LAST command.
+func exitDeterminingProgram(command string) (prog, sub string) {
+	c := strings.TrimSpace(command)
+	for strings.HasPrefix(c, "cd ") {
+		idx := strings.Index(c, "&&")
+		if idx < 0 {
+			break
+		}
+		c = strings.TrimSpace(c[idx+2:])
+	}
+	if idx := strings.LastIndex(c, " | "); idx >= 0 {
+		c = strings.TrimSpace(c[idx+3:])
+	}
+	fields := strings.Fields(c)
+	if len(fields) == 0 {
+		return "", ""
+	}
+	prog = filepath.Base(fields[0])
+	if len(fields) > 1 {
+		sub = fields[1]
+	}
+	return prog, sub
+}
+
+// benignEmptyLabel returns a tool-class-aware label for a benign exit with no
+// output — "(no matches)" for search tools, "(differs)" for diff/cmp.
+func benignEmptyLabel(command string) string {
+	if prog, _ := exitDeterminingProgram(command); prog == "diff" || prog == "cmp" {
+		return "(differs)"
+	}
+	return "(no matches)"
+}
+
+// bashFailureSummary builds an "Actionable summary:" block that gives the
+// model context-aware next-step guidance rather than a bare exit code.
+func bashFailureSummary(command string, exitCode int, stdout, stderr string) string {
+	var b strings.Builder
+	b.WriteString("Actionable summary:\n")
+	fmt.Fprintf(&b, "- Command failed with exit code %d: %s\n", exitCode, command)
+	if strings.TrimSpace(stderr) != "" {
+		b.WriteString("- Primary diagnostics are in STDERR below.\n")
+	} else if strings.TrimSpace(stdout) != "" {
+		b.WriteString("- Primary diagnostics are in stdout below.\n")
+	} else {
+		b.WriteString("- The command produced no diagnostics; check the command, working directory, and required files.\n")
+	}
+	if commandLooksLikeValidation(command) {
+		b.WriteString("- Next: fix the reported issue, then rerun this same validation command or the narrowest failing subset.\n")
+	} else {
+		b.WriteString("- Next: inspect the diagnostic lines, fix the root cause, and rerun a focused verification command.\n")
+	}
+	return b.String()
+}
+
+// commandLooksLikeValidation returns true for common test/lint/build commands.
+func commandLooksLikeValidation(command string) bool {
+	lower := strings.ToLower(command)
+	for _, p := range []string{
+		"go test", "go build", "go vet", "pytest", "npm test", "npm run test",
+		"npm run lint", "pnpm test", "yarn test", "cargo test", "cargo check",
+		"make test", "make check", "mvn test", "gradle test", "ruff", "mypy",
+		"tsc", "eslint",
+	} {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // executeSandboxed executes the command with sandbox isolation

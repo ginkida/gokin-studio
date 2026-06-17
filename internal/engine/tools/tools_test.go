@@ -3810,3 +3810,117 @@ func TestMemoryStore_GetReturnsCopy(t *testing.T) {
 		t.Errorf("store Tags were mutated by caller; got %v", got2.Tags)
 	}
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// benign exit code handling — grep no-match should be success, not error
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestBenignNonZeroExit_GrepNoMatch(t *testing.T) {
+	// grep exits 1 with no stderr when no lines match — should be benign
+	if !benignNonZeroExit("grep foo file.txt", 1, "") {
+		t.Error("expected grep exit 1 (no match) to be benign")
+	}
+}
+
+func TestBenignNonZeroExit_GrepRealError(t *testing.T) {
+	// grep exits 1 WITH stderr = real error
+	if benignNonZeroExit("grep foo file.txt", 1, "grep: file.txt: No such file or directory") {
+		t.Error("expected grep exit 1 with stderr to be a real error")
+	}
+}
+
+func TestBenignNonZeroExit_DiffFindsChanges(t *testing.T) {
+	// diff exits 1 with no stderr when files differ — benign
+	if !benignNonZeroExit("diff a.txt b.txt", 1, "") {
+		t.Error("expected diff exit 1 (files differ) to be benign")
+	}
+}
+
+func TestBenignNonZeroExit_ExitCode2(t *testing.T) {
+	// exit 2+ is always a real error even for grep/diff
+	if benignNonZeroExit("grep foo file.txt", 2, "") {
+		t.Error("expected exit code 2 to be a real error for grep")
+	}
+}
+
+func TestBenignNonZeroExit_PipelineGrep(t *testing.T) {
+	// "ps aux | grep foo" — last command determines exit
+	if !benignNonZeroExit("ps aux | grep foo", 1, "") {
+		t.Error("expected piped grep exit 1 to be benign")
+	}
+}
+
+func TestBenignNonZeroExit_RipgrepNoMatch(t *testing.T) {
+	if !benignNonZeroExit("rg 'pattern' .", 1, "") {
+		t.Error("expected rg exit 1 (no match) to be benign")
+	}
+}
+
+func TestExitDeterminingProgram_SimpleCommand(t *testing.T) {
+	prog, _ := exitDeterminingProgram("grep foo bar.txt")
+	if prog != "grep" {
+		t.Errorf("expected prog='grep', got %q", prog)
+	}
+}
+
+func TestExitDeterminingProgram_Pipeline(t *testing.T) {
+	prog, _ := exitDeterminingProgram("cat file | grep pattern")
+	if prog != "grep" {
+		t.Errorf("expected prog='grep' (last in pipe), got %q", prog)
+	}
+}
+
+func TestExitDeterminingProgram_CdPrefix(t *testing.T) {
+	prog, _ := exitDeterminingProgram("cd /tmp && grep pattern file")
+	if prog != "grep" {
+		t.Errorf("expected prog='grep' after cd prefix, got %q", prog)
+	}
+}
+
+func TestBenignEmptyLabel_Search(t *testing.T) {
+	label := benignEmptyLabel("grep foo bar.txt")
+	if label != "(no matches)" {
+		t.Errorf("expected '(no matches)', got %q", label)
+	}
+}
+
+func TestBenignEmptyLabel_Diff(t *testing.T) {
+	label := benignEmptyLabel("diff a.txt b.txt")
+	if label != "(differs)" {
+		t.Errorf("expected '(differs)', got %q", label)
+	}
+}
+
+func TestCommandLooksLikeValidation(t *testing.T) {
+	cases := []struct {
+		cmd  string
+		want bool
+	}{
+		{"go test ./...", true},
+		{"npm test", true},
+		{"cargo test", true},
+		{"eslint src/", true},
+		{"tsc --noEmit", true},
+		{"ls -la", false},
+		{"git status", false},
+	}
+	for _, c := range cases {
+		if got := commandLooksLikeValidation(c.cmd); got != c.want {
+			t.Errorf("commandLooksLikeValidation(%q) = %v, want %v", c.cmd, got, c.want)
+		}
+	}
+}
+
+func TestBashFailureSummary_ContainsActionableHint(t *testing.T) {
+	summary := bashFailureSummary("go test ./...", 1, "", "FAIL: TestFoo")
+	if !strings.Contains(summary, "Actionable summary:") {
+		t.Error("expected 'Actionable summary:' in failure summary")
+	}
+	if !strings.Contains(summary, "STDERR") {
+		t.Error("expected 'STDERR' reference in failure summary")
+	}
+	// go test is a validation command — should give rerun hint
+	if !strings.Contains(summary, "rerun") {
+		t.Error("expected 'rerun' hint in validation failure summary")
+	}
+}
