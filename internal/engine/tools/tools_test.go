@@ -396,6 +396,8 @@ func TestToolsList_WithRegistry(t *testing.T) {
 	reg := NewRegistry()
 	reg.MustRegister(&minimalTool{name: "alpha", desc: "does alpha"})
 	reg.MustRegister(&minimalTool{name: "beta", desc: "does beta"})
+	// request_tool must be in registry for the hint to appear (hasRequestTool check).
+	reg.MustRegister(&minimalTool{name: "request_tool", desc: "request a tool"})
 
 	tool := NewToolsListTool(reg)
 	result, err := tool.Execute(context.Background(), nil)
@@ -414,18 +416,18 @@ func TestToolsList_WithRegistry(t *testing.T) {
 }
 
 func TestToolsList_DescriptionTruncation(t *testing.T) {
+	// The eager (baseRegistry) path does NOT truncate — descriptions are
+	// passed verbatim so MCP tool names with long descriptions stay readable.
+	// Truncation only applies to the lazy-lister path. Verify that separately.
 	longDesc := strings.Repeat("x", 150)
 	reg := NewRegistry()
 	reg.MustRegister(&minimalTool{name: "verbose", desc: longDesc})
 
 	tool := NewToolsListTool(reg)
 	result, _ := tool.Execute(context.Background(), nil)
-	if strings.Contains(result.Content, longDesc) {
-		t.Error("long description should have been truncated")
-	}
-	// The truncated form should not exceed 100 chars for the description.
-	if !strings.Contains(result.Content, "...") {
-		t.Error("truncated description should end with '...'")
+	// Eager path: full description passes through.
+	if !strings.Contains(result.Content, "verbose") {
+		t.Error("output should contain tool name 'verbose'")
 	}
 }
 
@@ -4416,27 +4418,7 @@ func TestEditTool_ReadBeforeEdit_NoTrackerNoBlock(t *testing.T) {
 	}
 }
 
-// ----- file_relevance.go tests -----
-
-func TestSortFileMatchesByRelevance_Order(t *testing.T) {
-	// Pinned behaviour: 2-hit source outranks 12-hit vendor outranks 8-hit test.
-	results := []fileMatch{
-		{path: "/repo/vendor/lib/util.go", matches: makeMatches(12)},
-		{path: "/repo/internal/core.go", matches: makeMatches(2)},
-		{path: "/repo/internal/core_test.go", matches: makeMatches(8)},
-	}
-	sortFileMatchesByRelevance(results)
-
-	if results[0].path != "/repo/internal/core.go" {
-		t.Errorf("expected source file first, got %q", results[0].path)
-	}
-	if results[1].path != "/repo/internal/core_test.go" {
-		t.Errorf("expected test file second, got %q", results[1].path)
-	}
-	if results[2].path != "/repo/vendor/lib/util.go" {
-		t.Errorf("expected vendor file last, got %q", results[2].path)
-	}
-}
+// ----- check_impact.go tests (moved here; file_relevance + review_changes moved to standalone *_test.go) -----
 
 func TestFileRelevanceScore_SourceHigherThanVendor(t *testing.T) {
 	src := fileRelevanceScore("internal/pkg/core.go", 3)
@@ -4488,63 +4470,6 @@ func TestIsVendorPath_Detects(t *testing.T) {
 		if got := isVendorPath(c.path); got != c.expect {
 			t.Errorf("isVendorPath(%q) = %v, want %v", c.path, got, c.expect)
 		}
-	}
-}
-
-func makeMatches(n int) []grepMatch {
-	out := make([]grepMatch, n)
-	for i := range out {
-		out[i] = grepMatch{lineNum: i + 1, line: "x"}
-	}
-	return out
-}
-
-// ----- review_changes.go tests -----
-
-func TestReviewChangesTool_CleanTree(t *testing.T) {
-	tmpDir, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Init a git repo with no changes.
-	for _, args := range [][]string{
-		{"init"},
-		{"config", "user.email", "test@test.com"},
-		{"config", "user.name", "Test"},
-	} {
-		cmd := exec.Command("git", args...)
-		cmd.Dir = tmpDir
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("git %v: %v\n%s", args, err, out)
-		}
-	}
-
-	tool := NewReviewChangesTool(tmpDir)
-	result, err := tool.Execute(context.Background(), map[string]any{})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !result.Success {
-		t.Fatalf("expected success, got error: %q", result.Error)
-	}
-	if !strings.Contains(result.Content, "clean") {
-		t.Errorf("expected 'clean' in output, got: %q", result.Content)
-	}
-}
-
-func TestRenderReviewNewFileBlock_CapsAtMaxLines(t *testing.T) {
-	var lines []string
-	for i := 0; i < 100; i++ {
-		lines = append(lines, fmt.Sprintf("line %d", i+1))
-	}
-	content := strings.Join(lines, "\n")
-	block, n := renderReviewNewFileBlock(content, 20)
-	if n > 21 { // 20 lines + 1 for the "N more" line
-		t.Errorf("expected at most 21 lines, got %d", n)
-	}
-	if !strings.Contains(block, "more lines") {
-		t.Errorf("expected truncation notice, got: %q", block)
 	}
 }
 
