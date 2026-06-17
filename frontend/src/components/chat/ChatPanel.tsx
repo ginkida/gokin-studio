@@ -4392,6 +4392,7 @@ function getToolIcon(name: string) {
   if (name === 'ask_user') return <MessageSquare size={12} />
   if (name === 'todo' || name.startsWith('enter_plan') || name.startsWith('update_plan') || name === 'get_plan_status' || name === 'exit_plan_mode') return <ListChecks size={12} />
   if (name === 'request_tool' || name === 'tools_list') return <Download size={12} />
+  if (name === 'run_tests' || name === 'verify_code' || name === 'review_changes') return <FileText size={12} />
   return <Zap size={12} />
 }
 
@@ -4453,6 +4454,9 @@ function getToolPrimary(name: string, args: Record<string, unknown> | undefined)
     case 'get_plan_status': return null
     case 'request_tool': return a.tool_name ? String(a.tool_name) : null
     case 'tools_list': return null
+    case 'run_tests': return a.path || a.filter || null
+    case 'verify_code': return a.path || null
+    case 'review_changes': return a.file ? String(a.file).slice(0, 60) : (a.staged ? 'staged' : null)
     default: return null
   }
 }

@@ -259,6 +259,14 @@ func (t *GrepTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 		fileMatches = t.searchParallel(ctx, files, re, contextLines, onProgress)
 	}
 
+	// Rank results: first-party source > tests > generated > vendor.
+	// Avoids having a 100-hit vendor file drown the 3 first-party hits
+	// the model actually wanted. invertMatches preserves alpha-sort within
+	// ties; forward-search files are already deterministic via path order.
+	if !invertMatch {
+		sortFileMatchesByRelevance(fileMatches)
+	}
+
 	// Count-only mode
 	if countOnly {
 		var results strings.Builder

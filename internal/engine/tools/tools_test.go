@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -4412,5 +4413,137 @@ func TestEditTool_ReadBeforeEdit_NoTrackerNoBlock(t *testing.T) {
 	}
 	if !result.Success {
 		t.Fatalf("expected edit to succeed without tracker, got: %q", result.Error)
+	}
+}
+
+// ----- file_relevance.go tests -----
+
+func TestSortFileMatchesByRelevance_Order(t *testing.T) {
+	// Pinned behaviour: 2-hit source outranks 12-hit vendor outranks 8-hit test.
+	results := []fileMatch{
+		{path: "/repo/vendor/lib/util.go", matches: makeMatches(12)},
+		{path: "/repo/internal/core.go", matches: makeMatches(2)},
+		{path: "/repo/internal/core_test.go", matches: makeMatches(8)},
+	}
+	sortFileMatchesByRelevance(results)
+
+	if results[0].path != "/repo/internal/core.go" {
+		t.Errorf("expected source file first, got %q", results[0].path)
+	}
+	if results[1].path != "/repo/internal/core_test.go" {
+		t.Errorf("expected test file second, got %q", results[1].path)
+	}
+	if results[2].path != "/repo/vendor/lib/util.go" {
+		t.Errorf("expected vendor file last, got %q", results[2].path)
+	}
+}
+
+func TestFileRelevanceScore_SourceHigherThanVendor(t *testing.T) {
+	src := fileRelevanceScore("internal/pkg/core.go", 3)
+	vnd := fileRelevanceScore("vendor/pkg/lib.go", 100)
+	if src <= vnd {
+		t.Errorf("source (%v) should outrank vendor (%v) even with lower match count", src, vnd)
+	}
+}
+
+func TestFileRelevanceScore_GeneratedLower(t *testing.T) {
+	src := fileRelevanceScore("internal/service.go", 5)
+	gen := fileRelevanceScore("internal/service_gen.go", 5)
+	if src <= gen {
+		t.Errorf("source (%v) should outrank generated (%v)", src, gen)
+	}
+}
+
+func TestIsTestPath_Detects(t *testing.T) {
+	cases := []struct {
+		path   string
+		expect bool
+	}{
+		{"internal/foo_test.go", true},
+		{"src/foo.test.ts", true},
+		{"src/foo.spec.js", true},
+		{"tests/helper.go", true},
+		{"testdata/fixture.json", true},
+		{"internal/foo.go", false},
+		{"internal/testing_utils.go", false},
+	}
+	for _, c := range cases {
+		if got := isTestPath(c.path); got != c.expect {
+			t.Errorf("isTestPath(%q) = %v, want %v", c.path, got, c.expect)
+		}
+	}
+}
+
+func TestIsVendorPath_Detects(t *testing.T) {
+	cases := []struct {
+		path   string
+		expect bool
+	}{
+		{"vendor/pkg/lib.go", true},
+		{"node_modules/react/index.js", true},
+		{"/repo/build/output.js", true},
+		{"internal/pkg/lib.go", false},
+	}
+	for _, c := range cases {
+		if got := isVendorPath(c.path); got != c.expect {
+			t.Errorf("isVendorPath(%q) = %v, want %v", c.path, got, c.expect)
+		}
+	}
+}
+
+func makeMatches(n int) []grepMatch {
+	out := make([]grepMatch, n)
+	for i := range out {
+		out[i] = grepMatch{lineNum: i + 1, line: "x"}
+	}
+	return out
+}
+
+// ----- review_changes.go tests -----
+
+func TestReviewChangesTool_CleanTree(t *testing.T) {
+	tmpDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Init a git repo with no changes.
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "test@test.com"},
+		{"config", "user.name", "Test"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = tmpDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+
+	tool := NewReviewChangesTool(tmpDir)
+	result, err := tool.Execute(context.Background(), map[string]any{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Success {
+		t.Fatalf("expected success, got error: %q", result.Error)
+	}
+	if !strings.Contains(result.Content, "clean") {
+		t.Errorf("expected 'clean' in output, got: %q", result.Content)
+	}
+}
+
+func TestRenderReviewNewFileBlock_CapsAtMaxLines(t *testing.T) {
+	var lines []string
+	for i := 0; i < 100; i++ {
+		lines = append(lines, fmt.Sprintf("line %d", i+1))
+	}
+	content := strings.Join(lines, "\n")
+	block, n := renderReviewNewFileBlock(content, 20)
+	if n > 21 { // 20 lines + 1 for the "N more" line
+		t.Errorf("expected at most 21 lines, got %d", n)
+	}
+	if !strings.Contains(block, "more lines") {
+		t.Errorf("expected truncation notice, got: %q", block)
 	}
 }

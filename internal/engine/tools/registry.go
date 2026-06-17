@@ -146,7 +146,7 @@ var toolSetDefinitions = map[ToolSet][]string{
 	},
 	ToolSetAdvanced: {
 		"batch", "refactor", "check_impact",
-		"verify_code", "run_tests",
+		"verify_code", "run_tests", "review_changes",
 	},
 	ToolSetSemantic: {
 		"semantic_search", "code_graph",
@@ -263,9 +263,10 @@ func DefaultRegistry(workDir string) *Registry {
 	// Agent Scratchpad tool (Phase 7)
 	r.MustRegister(NewUpdateScratchpadTool(nil))
 
-	// Testing and verification tools
+	// Testing, verification, and self-review tools
 	r.MustRegister(NewRunTestsTool(workDir))
 	r.MustRegister(NewVerifyCodeTool(workDir))
+	r.MustRegister(NewReviewChangesTool(workDir))
 
 	return r
 }
