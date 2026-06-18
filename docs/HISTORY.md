@@ -7,6 +7,38 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## What's Done (iter 1229+ — GLM client-layer stability ports: signature guard, error-body cap, think-flush)
+
+Three verified client-layer ports from fresh gokin, surfaced by the same GLM-support audit. All in
+`internal/engine/client/anthropic.go`.
+
+- **`signature_delta` guarded on `currentBlockType == "thinking"`** (gokin `d6eab26`): studio captured the
+  Extended-Thinking signature unconditionally. Since `content_block_start` resets `thinkingBuilder` but
+  not `currentThinkingSignature` (only a thinking block's `content_block_stop` does), a stray/out-of-order
+  `signature_delta` emitted inside a text/tool_use block would leak a stale signature into the NEXT
+  thinking block's `ThoughtSignature`. GLM auto-enables signed thinking, and that block round-trips on
+  every tool call — a mismatched signature draws a 400 from a strict validator on replay. Now the capture
+  is gated on the active block being `thinking`, plus a belt-and-suspenders `currentThinkingSignature.Reset()`
+  in the `content_block_start` thinking branch.
+- **Bounded error-response body reads** (gokin `53150e7`): both non-200 paths (`CountTokens` ~`:546`,
+  `doStreamRequest` ~`:999`) did `io.ReadAll(resp.Body)` with no cap. On GLM/Z.AI a gateway 5xx / WAF
+  block can return a large HTML page, read into memory only to feed an error string. Wrapped both with
+  `io.LimitReader(resp.Body, 64<<10)`.
+- **`ThinkTagParser.Flush()` at `message_stop`** (gokin `c7af80b`): a partial inline tag (`<thi`/`</thi`)
+  straddling the final chunk lives only in the parser's `tagBuffer`; the SSE loop returns on the first
+  Done chunk, so without a flush those bytes are dropped (truncating output for inline-`<think>` providers
+  — MiniMax/DeepSeek-R1/QwQ). Added the flush, folding remaining thinking/text into the terminal chunk.
+  No-op for GLM (native thinking deltas leave the parser buffer empty).
+- **Tests** (`glm_stream_stability_test.go`, +4): `TestProcessStreamEvent_SignatureDeltaGuardedOnThinkingBlock`
+  (stray signature must not leak), `…SignatureResetBetweenThinkingBlocks`, `…MessageStopFlushesThinkTagParser`
+  (buffered fragment recovered), `TestErrorBodyReadIsBounded` (256KB 400 body stays bounded). Full
+  `-race ./internal/engine/client/` green, module builds.
+- **Honest value**: the signature guard is the GLM-relevant correctness item (prevents a spurious 400 on a
+  malformed/out-of-order stream during signed-thinking replay) — though it's a defensive fix triggered only
+  by non-compliant streams, so low absolute frequency. Error-body cap is a zero-risk memory-safety port.
+  Think-flush is out of strict GLM scope (no-op for GLM) but a real fix for inline-think providers; ported
+  for client-layer parity.
+
 ## What's Done (iter 1228+ — GLM thinking-config correctness: honor "disabled", consistent budget, testable policy)
 
 Driven by a multi-agent GLM-support audit (5 dimensions × adversarial verification). The audit's

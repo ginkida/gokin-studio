@@ -543,7 +543,7 @@ func (c *AnthropicClient) countTokensNative(ctx context.Context, contents []*gen
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10)) // cap error body; it only feeds the message
 		return nil, fmt.Errorf("count_tokens returned %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -996,7 +996,9 @@ func (c *AnthropicClient) doStreamRequest(ctx context.Context, requestBody map[s
 
 	if resp.StatusCode != http.StatusOK {
 		retryAfter := ParseRetryAfter(resp)
-		body, err := io.ReadAll(resp.Body)
+		// Cap the error body — on GLM/Z.AI a gateway 5xx / WAF block can return a
+		// large HTML page, and the body only feeds the humanized error message.
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		if err != nil {
 			logging.Error("failed to read error response", "error", err)
 			body = []byte("(failed to read response body)")
@@ -1399,6 +1401,10 @@ func (c *AnthropicClient) processStreamEvent(event map[string]interface{}, acc *
 				}
 			} else if blockType == "thinking" {
 				acc.thinkingBuilder.Reset()
+				// Reset the signature too (belt-and-suspenders alongside the
+				// content_block_stop reset) so a new thinking block never starts
+				// with a stale signature carried over from a prior block.
+				acc.currentThinkingSignature.Reset()
 				logging.Debug("thinking block started")
 			}
 		}
@@ -1428,11 +1434,18 @@ func (c *AnthropicClient) processStreamEvent(event map[string]interface{}, acc *
 				}
 			}
 
-			// Handle thinking signature delta (Anthropic/Kimi extended thinking).
-			// The signature lets strict validators verify the thinking block
-			// hasn't been tampered with on round-trip; Kimi requires either a
-			// signed or unsigned "thinking" block when thinking is enabled.
-			if deltaType == "signature_delta" {
+			// Handle thinking signature delta (Anthropic/Kimi/GLM extended
+			// thinking). The signature lets strict validators verify the thinking
+			// block hasn't been tampered with on round-trip; Kimi/GLM require
+			// either a signed or unsigned "thinking" block when thinking is on.
+			//
+			// Guarded on currentBlockType == "thinking": a malformed stream that
+			// emits signature_delta inside a text/tool_use block would otherwise
+			// leak a stale signature into the NEXT thinking block (content_block_
+			// start resets thinkingBuilder but the signature is only reset on a
+			// thinking block's content_block_stop), producing a corrupt
+			// ThoughtSignature that a strict provider rejects with a 400 on replay.
+			if deltaType == "signature_delta" && acc.currentBlockType == "thinking" {
 				if sig, ok := delta["signature"].(string); ok && sig != "" {
 					acc.currentThinkingSignature.WriteString(sig)
 				}
@@ -1578,6 +1591,16 @@ func (c *AnthropicClient) processStreamEvent(event map[string]interface{}, acc *
 
 	case "message_stop":
 		chunk.Done = true
+		// Flush any content still buffered in the think-tag parser (a partial or
+		// never-closed inline <think> tag straddling the final chunk). The SSE
+		// loop returns on the first Done chunk, so without this flush that
+		// trailing text/reasoning is silently dropped. Affects inline-<think>
+		// providers (MiniMax, DeepSeek-R1, QwQ); GLM streams native thinking
+		// deltas so its parser buffer is empty here, making this a no-op for GLM.
+		if flushedThinking, flushedRegular := acc.thinkTagParser.Flush(); flushedThinking != "" || flushedRegular != "" {
+			chunk.Thinking += flushedThinking
+			chunk.Text += flushedRegular
+		}
 		// Include any accumulated tool calls only if not already emitted
 		// by message_delta (stop_reason: "tool_use"). Emitting them twice
 		// causes duplicate tool_use blocks which MiniMax rejects with 400.
