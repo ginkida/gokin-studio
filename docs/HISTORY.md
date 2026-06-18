@@ -7,6 +7,11 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## What's Done (iter 1227+ — test fixup for SetTurnContext behavior change)
+
+- **Test updates** (`agent_loop_test.go`, `permission_mode_test.go`): batch 25 switched pinned context delivery from system instruction injection to `SetTurnContext`, but three existing tests (`TestSendMessage_PinnedContextApplied`, `TestSendMessage_NoPinNoSystemInstructionUpdate`, `TestSendMessage_AskAndPinnedCombined`) still asserted the old behavior (pin in `lastSystemInstruction`). Updated: `TestSendMessage_PinnedContextApplied` now checks `lastTurnContext` contains the pin and `lastSystemInstruction` does NOT; `TestSendMessage_NoPinNoSystemInstructionUpdate` also checks `lastTurnContext == ""`; `TestSendMessage_AskAndPinnedCombined` now verifies ask directive in system instruction + pin in turn context. Added `lastTurnContext` capture field to `mockClient.SetTurnContext`.
+- **Honest value**: pure correctness follow-up — the tests were asserting behavior that was intentionally changed; leaving them passing-but-misleading would be worse than fixing them.
+
 ## What's Done (iter 1226+ — Kimi+DeepSeek factory-level thinking auto-enable + SetTurnContext interface rollout)
 
 - **Factory auto-enable for Kimi** (`factory.go`): `newKimiClient` previously only normalized the thinking budget when `cfg.Model.EnableThinking` was already true — missing the auto-enable path that GLM already had. Added the same `if !enableThinking && budget==0 && SupportsKimiThinking(modelID)` guard. Studio's `initClient` sets the flag correctly via `ThinkingMode=""` auto-logic, but making the factory self-sufficient means direct `NewClientNoPool` callers (engine-layer tests, future library consumers) also get the right default. Ported from gokin.

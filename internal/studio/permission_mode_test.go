@@ -83,7 +83,9 @@ func TestSendMessage_AskBeforeChangesDirective(t *testing.T) {
 }
 
 // TestSendMessage_AskAndPinnedCombined verifies that ask mode and pinned
-// context coexist in the assembled system instruction.
+// context coexist correctly after the SetTurnContext refactor:
+// - system instruction carries the base prompt + ask directive (NOT the pin)
+// - turn context carries the pinned content (outside the cached prefix)
 func TestSendMessage_AskAndPinnedCombined(t *testing.T) {
 	mc := &mockClient{responses: []mockResp{{text: "done"}}}
 	p, _ := newTestProject(t, mc, nil)
@@ -94,13 +96,19 @@ func TestSendMessage_AskAndPinnedCombined(t *testing.T) {
 	runAgent(p, "hello")
 
 	mc.mu.Lock()
-	got := mc.lastSystemInstruction
+	gotSI := mc.lastSystemInstruction
+	gotTC := mc.lastTurnContext
 	mc.mu.Unlock()
-	if !strings.Contains(got, "remember the deploy key") {
-		t.Errorf("pinned context missing; got %q", got)
+	// Ask directive must be in the system instruction.
+	if !strings.Contains(gotSI, "ask_user") {
+		t.Errorf("ask directive missing from system instruction; got %q", gotSI)
 	}
-	if !strings.Contains(got, "ask_user") {
-		t.Errorf("ask directive missing when combined with pin; got %q", got)
+	// Pinned context must be in turn context (NOT in system instruction).
+	if !strings.Contains(gotTC, "remember the deploy key") {
+		t.Errorf("pinned context missing from turn context; got %q", gotTC)
+	}
+	if strings.Contains(gotSI, "remember the deploy key") {
+		t.Errorf("pinned context must not be in system instruction; got %q", gotSI)
 	}
 }
 

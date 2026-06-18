@@ -1662,8 +1662,8 @@ func TestInitMemoryAndPlan_PinContextWired(t *testing.T) {
 }
 
 // TestSendMessage_PinnedContextApplied verifies that when p.pinnedContext is
-// non-empty at the start of SendMessage, SetSystemInstruction is called on the
-// client with the base system prompt appended by the pinned context section.
+// non-empty, SetTurnContext is called with the pinned content (delivered outside
+// the cached prefix), and SetSystemInstruction is NOT updated for the pin itself.
 func TestSendMessage_PinnedContextApplied(t *testing.T) {
 	mc := &mockClient{responses: []mockResp{{text: "done"}}}
 	p, _ := newTestProject(t, mc, nil)
@@ -1673,19 +1673,22 @@ func TestSendMessage_PinnedContextApplied(t *testing.T) {
 	runAgent(p, "hello")
 
 	mc.mu.Lock()
-	got := mc.lastSystemInstruction
+	gotTC := mc.lastTurnContext
+	gotSI := mc.lastSystemInstruction
 	mc.mu.Unlock()
-	if !strings.Contains(got, "important note") {
-		t.Errorf("SetSystemInstruction not called with pinned content; got %q", got)
+	if !strings.Contains(gotTC, "important note") {
+		t.Errorf("SetTurnContext not called with pinned content; got %q", gotTC)
 	}
-	if !strings.Contains(got, "you are a test agent") {
-		t.Errorf("SetSystemInstruction missing base system prompt; got %q", got)
+	// System instruction must NOT embed the pin — that would re-bill the cached prefix.
+	if strings.Contains(gotSI, "important note") {
+		t.Errorf("SetSystemInstruction must not embed pinned content; got %q", gotSI)
 	}
 }
 
 // TestSendMessage_NoPinNoSystemInstructionUpdate verifies that when
 // p.pinnedContext is empty, SetSystemInstruction is NOT called during SendMessage
-// (client retains whatever instruction was set during initClient).
+// (client retains whatever instruction was set during initClient), and
+// SetTurnContext is called with an empty string (clearing any prior context).
 func TestSendMessage_NoPinNoSystemInstructionUpdate(t *testing.T) {
 	mc := &mockClient{responses: []mockResp{{text: "done"}}}
 	p, _ := newTestProject(t, mc, nil)
@@ -1694,10 +1697,14 @@ func TestSendMessage_NoPinNoSystemInstructionUpdate(t *testing.T) {
 	runAgent(p, "hello")
 
 	mc.mu.Lock()
-	got := mc.lastSystemInstruction
+	gotSI := mc.lastSystemInstruction
+	gotTC := mc.lastTurnContext
 	mc.mu.Unlock()
-	if got != "" {
-		t.Errorf("SetSystemInstruction should not be called when no pin; got %q", got)
+	if gotSI != "" {
+		t.Errorf("SetSystemInstruction should not be called when no pin; got %q", gotSI)
+	}
+	if gotTC != "" {
+		t.Errorf("SetTurnContext should be empty when no pin; got %q", gotTC)
 	}
 }
 
