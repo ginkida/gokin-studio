@@ -63,10 +63,11 @@ var knownModelProfiles = map[string]ModelProfile{
 	"deepseek-chat":     {Family: "deepseek", ContextWindow: 64000, SupportsTools: true, IsCoding: true},
 	"deepseek-reasoner": {Family: "deepseek", ContextWindow: 64000, SupportsTools: true, IsCoding: true},
 
-	// GLM family
-	"glm-5.1":     {Family: "glm", ContextWindow: 128000, SupportsTools: true, IsCoding: true},
-	"glm-5":       {Family: "glm", ContextWindow: 128000, SupportsTools: true, IsCoding: true},
-	"glm-5-turbo": {Family: "glm", ContextWindow: 128000, SupportsTools: true, IsCoding: true},
+	// GLM family — context windows verified via Z.AI API (Jun 2026)
+	"glm-5.2":     {Family: "glm", ContextWindow: 1000000, SupportsTools: true, IsCoding: true}, // 1M context
+	"glm-5.1":     {Family: "glm", ContextWindow: 200000, SupportsTools: true, IsCoding: true},
+	"glm-5":       {Family: "glm", ContextWindow: 200000, SupportsTools: true, IsCoding: true},
+	"glm-5-turbo": {Family: "glm", ContextWindow: 200000, SupportsTools: true, IsCoding: true},
 	"glm-4.7":     {Family: "glm", ContextWindow: 128000, SupportsTools: true, IsCoding: true},
 	"glm-4.6":     {Family: "glm", ContextWindow: 128000, SupportsTools: true, IsCoding: true},
 	"glm-4.5":     {Family: "glm", ContextWindow: 128000, SupportsTools: true},

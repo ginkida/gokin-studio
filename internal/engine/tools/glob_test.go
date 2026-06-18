@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -84,6 +85,43 @@ func TestGlobTool_SetCache(t *testing.T) {
 	tool.SetCache(c)
 	if tool.cache != c {
 		t.Error("SetCache() did not set cache")
+	}
+}
+
+// TestGlobTool_CacheHitIncludesActionableSummary guards the iter-1200 fix: the
+// cache-hit path must include the "Found N file(s)" header and actionable
+// summary (category grouping + "Next:" hint), not just the raw file list.
+func TestGlobTool_CacheHitIncludesActionableSummary(t *testing.T) {
+	tmpDir := resolvedTempDir(t)
+	if err := os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte("package main"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	c := cache.NewSearchCache(100, 5*time.Minute)
+	tool := NewGlobTool(tmpDir)
+	tool.SetCache(c)
+
+	// First call — live result, populates cache.
+	r1, err := tool.Execute(context.Background(), map[string]any{"pattern": "*.go"})
+	if err != nil {
+		t.Fatalf("first Execute: %v", err)
+	}
+	if !r1.Success {
+		t.Fatalf("first Execute failed: %s", r1.Content)
+	}
+
+	// Second call — cache hit.
+	r2, err := tool.Execute(context.Background(), map[string]any{"pattern": "*.go"})
+	if err != nil {
+		t.Fatalf("cache-hit Execute: %v", err)
+	}
+	if !r2.Success {
+		t.Fatalf("cache-hit Execute failed: %s", r2.Content)
+	}
+	if !strings.Contains(r2.Content, "Found") {
+		t.Errorf("cache-hit result missing 'Found N file(s)' header:\n%s", r2.Content)
+	}
+	if !strings.Contains(r2.Content, "Next:") {
+		t.Errorf("cache-hit result missing 'Next:' actionable summary:\n%s", r2.Content)
 	}
 }
 

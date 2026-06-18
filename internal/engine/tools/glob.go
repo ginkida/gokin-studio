@@ -160,13 +160,19 @@ func (t *GlobTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 			if len(cached.Files) == 0 {
 				return NewSuccessResult("(no matches)"), nil
 			}
-			var builder strings.Builder
+			relPaths := make([]string, 0, len(cached.Files))
 			for _, f := range cached.Files {
 				relPath, err := filepath.Rel(t.workDir, f)
 				if err != nil {
 					relPath = f
 				}
-				builder.WriteString(relPath)
+				relPaths = append(relPaths, relPath)
+			}
+			var builder strings.Builder
+			fmt.Fprintf(&builder, "Found %d file(s) matching '%s' (cached):\n", len(cached.Files), pattern)
+			builder.WriteString(actionableGlobSummary(relPaths))
+			for _, p := range relPaths {
+				builder.WriteString(p)
 				builder.WriteString("\n")
 			}
 			return NewSuccessResult(builder.String()), nil
