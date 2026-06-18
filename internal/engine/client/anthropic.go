@@ -620,6 +620,32 @@ type toolCallAccumulator struct {
 	thinkTagParser ThinkTagParser
 }
 
+// appendToolInput appends a tool input value to the accumulator's input buffer.
+// Empty string/map placeholders (the canonical Anthropic "{}" start-block
+// placeholder) are skipped so they don't concatenate with real delta JSON into
+// invalid "{}{...}". Non-empty inline inputs and raw JSON are written directly.
+func (acc *toolCallAccumulator) appendToolInput(input interface{}) {
+	switch v := input.(type) {
+	case string:
+		if t := strings.TrimSpace(v); t == "" || t == "{}" {
+			return
+		}
+		acc.currentToolInput.WriteString(v)
+	case map[string]interface{}:
+		if len(v) == 0 {
+			return
+		}
+		if b, err := json.Marshal(v); err == nil {
+			acc.currentToolInput.Write(b)
+		}
+	case json.RawMessage:
+		if t := strings.TrimSpace(string(v)); t == "" || t == "{}" {
+			return
+		}
+		acc.currentToolInput.Write(v)
+	}
+}
+
 // isRetryableError returns true if the error should trigger a retry.
 func (c *AnthropicClient) isRetryableError(err error, statusCode int) bool {
 	// HTTP status codes that are retryable (5xx server errors and 429 rate limit)
@@ -1213,6 +1239,9 @@ func (c *AnthropicClient) processStreamEvent(event map[string]interface{}, acc *
 					logging.Debug("generated tool_use ID (provider didn't return one)", "id", acc.currentToolID, "name", acc.currentToolName)
 				}
 				acc.currentToolInput.Reset()
+				if input, ok := contentBlock["input"]; ok {
+					acc.appendToolInput(input)
+				}
 			} else if blockType == "thinking" {
 				acc.thinkingBuilder.Reset()
 				logging.Debug("thinking block started")
@@ -1277,8 +1306,9 @@ func (c *AnthropicClient) processStreamEvent(event map[string]interface{}, acc *
 				}
 			}
 
-			// Handle tool input JSON delta
-			if deltaType == "input_json_delta" {
+			// Handle tool input JSON delta. Also handle empty deltaType for
+			// providers that omit "type" in the delta object.
+			if deltaType == "input_json_delta" || (deltaType == "" && acc.currentBlockType == "tool_use") {
 				if partialJSON, ok := delta["partial_json"].(string); ok {
 					acc.currentToolInput.WriteString(partialJSON)
 				}

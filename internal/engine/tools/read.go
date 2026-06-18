@@ -323,7 +323,7 @@ func (t *ReadTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 			return NewErrorResult(errMsg), nil
 		}
 		errMsg := fmt.Sprintf("error accessing file: %s", err)
-		if suggestions := suggestFilesInWorkDir(t.workDir, filepath.Base(filePath)); len(suggestions) > 0 {
+		if suggestions := suggestSimilarFiles(filePath); len(suggestions) > 0 {
 			errMsg += "\n\nNearby files:\n" + strings.Join(suggestions, "\n")
 		}
 		return NewErrorResult(errMsg), nil
