@@ -1357,6 +1357,24 @@ outer:
 			continue
 		}
 
+		// Truncation budget exhausted: the response hit the output-token limit
+		// and all auto-continuation attempts were used (or the truncated response
+		// had no text to continue). Surface a chat:error so the user understands
+		// why the response ended mid-thought instead of seeing a silent break.
+		if collected != nil &&
+			collected.FinishReason == genai.FinishReasonMaxTokens &&
+			len(collected.FunctionCalls) == 0 {
+			suffix := ""
+			if truncationContinuations > 0 {
+				suffix = fmt.Sprintf(" after %d continuation attempt(s)", truncationContinuations)
+			}
+			p.emitEvent(wailsCtx, EventChatError, ChatTextEvent{
+				ProjectID: p.ID, SessionID: sid,
+				Text: "Response truncated (max output tokens reached" + suffix + "). " +
+					"Consider increasing max_output_tokens in Settings → Provider.",
+			})
+		}
+
 		// Incomplete-work continuation: model returned text with no tool calls
 		// but its OWN todo list still has unfinished items — it announced the
 		// next step without taking it. Nudge it to act rather than ending the

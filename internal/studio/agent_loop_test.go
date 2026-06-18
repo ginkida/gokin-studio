@@ -1821,6 +1821,22 @@ func TestAgentLoop_TruncationContinuation_BudgetExhausted(t *testing.T) {
 	if len(rec.find(EventChatComplete)) == 0 {
 		t.Error("chat:complete not emitted after exhausting truncation budget")
 	}
+
+	// chat:error should fire with a truncation message so the user knows why
+	// the response ended mid-thought.
+	errs := rec.find(EventChatError)
+	if len(errs) == 0 {
+		t.Error("no chat:error emitted after truncation budget exhausted")
+	} else {
+		if d, ok := errs[0].data.(ChatTextEvent); ok {
+			if !strings.Contains(d.Text, "truncated") {
+				t.Errorf("chat:error text should mention truncation; got %q", d.Text)
+			}
+			if !strings.Contains(d.Text, "continuation") {
+				t.Errorf("chat:error text should mention continuation attempts; got %q", d.Text)
+			}
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
