@@ -4353,6 +4353,7 @@ async function copyToClipboard(text: string): Promise<void> {
 
 // Format a token count as "1.2k" / "23k" / "128k".
 function formatTokens(n: number): string {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1).replace(/\.0$/, '') + 'M'
   if (n < 1000) return String(n)
   if (n < 10000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k'
   return Math.round(n / 1000) + 'k'
