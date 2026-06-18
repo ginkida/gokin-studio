@@ -31,7 +31,9 @@ type ModelPricing struct {
 // All values are USD per million tokens.
 var modelPricing = map[string]ModelPricing{
 	// GLM family — bigmodel.cn published rates, USD-equivalent.
-	// glm-5.1 / glm-5 are GLM's flagship coding/reasoning model.
+	// glm-5.2 is the current flagship (1M context); glm-5.1 / glm-5 are the
+	// previous flagship coding/reasoning models — all share the Max tier rate.
+	"glm-5.2":     {InputPerMTok: 0.55, OutputPerMTok: 2.19, CacheReadPerMTok: 0.11, CacheWritePerMTok: 0.69},
 	"glm-5.1":     {InputPerMTok: 0.55, OutputPerMTok: 2.19, CacheReadPerMTok: 0.11, CacheWritePerMTok: 0.69},
 	"glm-5":       {InputPerMTok: 0.55, OutputPerMTok: 2.19, CacheReadPerMTok: 0.11, CacheWritePerMTok: 0.69},
 	"glm-5-turbo": {InputPerMTok: 0.30, OutputPerMTok: 1.20, CacheReadPerMTok: 0.06, CacheWritePerMTok: 0.38},
@@ -41,7 +43,15 @@ var modelPricing = map[string]ModelPricing{
 	"glm-4.5-air": {InputPerMTok: 0.20, OutputPerMTok: 1.10, CacheReadPerMTok: 0.04, CacheWritePerMTok: 0.25},
 	"glm-4":       {InputPerMTok: 0.55, OutputPerMTok: 2.19, CacheReadPerMTok: 0.11, CacheWritePerMTok: 0.69},
 
-	// MiniMax abab series — minimax.io pricing.
+	// MiniMax — M2.x is the current lineup (minimax.io pay-as-you-go rates).
+	// Keys are lowercased to match LookupPricing's ToLower; "minimax" is the
+	// catch-all so any future MiniMax model still resolves to a sane figure.
+	"minimax-m2.7":           {InputPerMTok: 0.30, OutputPerMTok: 1.20},
+	"minimax-m2.7-highspeed": {InputPerMTok: 0.60, OutputPerMTok: 2.40},
+	"minimax-m2.5":           {InputPerMTok: 0.30, OutputPerMTok: 1.20},
+	"minimax-m2.5-highspeed": {InputPerMTok: 0.60, OutputPerMTok: 2.40},
+	"minimax":                {InputPerMTok: 0.30, OutputPerMTok: 1.20},
+	// Legacy MiniMax abab series (kept for back-compat with saved projects).
 	"abab7-chat-pro":  {InputPerMTok: 1.00, OutputPerMTok: 2.00},
 	"abab6.5-chat":    {InputPerMTok: 0.85, OutputPerMTok: 1.70},
 	"abab6.5s-chat":   {InputPerMTok: 0.30, OutputPerMTok: 0.60},

@@ -35,7 +35,7 @@ func TestToConfig_NoRaceWithSetProjectProvider(t *testing.T) {
 		defer wg.Done()
 		for i := 0; i < iters; i++ {
 			provider := "glm"
-			model := "glm-5.1"
+			model := "glm-5.2"
 			if i%2 == 1 {
 				provider = "kimi"
 				model = "kimi-for-coding"
@@ -56,16 +56,17 @@ func TestToConfig_NoRaceWithSetProjectProvider(t *testing.T) {
 		for i := 0; i < iters; i++ {
 			cfg := p.ToConfig()
 			// Also assert the (provider, model) pair is internally
-			// consistent — if the reader sees "kimi" + "glm-5.1" the
+			// consistent — if the reader sees "kimi" + "glm-5.2" the
 			// torn read happened and the consistency invariant broke.
 			// SetProjectProvider currently writes both fields together
 			// under one lock, so a fully-locked reader always sees
-			// matching pairs.
+			// matching pairs. (The project's initial default model is
+			// glm-5.2, so the glm branch accepts that too.)
 			provider := cfg.Provider
 			model := cfg.Model
 			switch provider {
 			case "glm":
-				if model != "" && model != "glm-5.1" {
+				if model != "" && model != "glm-5.2" {
 					t.Errorf("torn read: provider=glm but model=%q", model)
 					return
 				}

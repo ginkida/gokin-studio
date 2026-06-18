@@ -370,6 +370,32 @@ func (s *Studio) SetProjectThinking(id, mode string, budget int32) error {
 	return nil
 }
 
+// SetProjectPermissionMode sets a project's change-confirmation mode. "" / "auto"
+// proceeds without asking; "ask" makes the agent confirm via the ask_user tool
+// before file/git/destructive changes (soft enforcement via a system-prompt
+// directive — the agent loop has no hard approval gate). Stored as "" for auto
+// so it round-trips with omitempty.
+func (s *Studio) SetProjectPermissionMode(id, mode string) error {
+	if mode == "auto" {
+		mode = ""
+	}
+	if mode != "" && mode != "ask" {
+		return fmt.Errorf("invalid permission mode %q: must be \"\", \"auto\", or \"ask\"", mode)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.projects[id]
+	if !ok {
+		return fmt.Errorf("project not found: %s", id)
+	}
+	p.mu.Lock()
+	p.PermissionMode = mode
+	p.resetClientLocked() // rebuild client so the directive is added/removed next send
+	p.mu.Unlock()
+	s.saveConfig()
+	return nil
+}
+
 // SetProjectBudget sets the per-project monthly USD spend cap. The frontend
 // uses it to draw a progress bar in the usage modal and warn at 80%/100%.
 // Pass 0 to remove the budget. Capped at $100,000 to defend against typos.
@@ -1794,12 +1820,15 @@ type ProviderInfo struct {
 
 // GetProviders returns the list of available LLM providers and models.
 func (s *Studio) GetProviders() []*ProviderInfo {
+	// Lineup mirrors internal/engine/client.AvailableModels (cloud providers)
+	// so the picker never drifts from what the engine can actually construct.
+	// glm-5.2 is the current flagship/default.
 	return []*ProviderInfo{
 		{ID: "glm", Name: "GLM (Zhipu AI)", Models: []string{
-			"glm-5.1", "glm-4-plus", "glm-4-air", "glm-4-flash", "glm-4-long",
+			"glm-5.2", "glm-5.1", "glm-5", "glm-5-turbo", "glm-4.7", "glm-4.5",
 		}},
 		{ID: "minimax", Name: "MiniMax", Models: []string{
-			"MiniMax-M1", "MiniMax-Text-01", "abab6.5s-chat",
+			"MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.5", "MiniMax-M2.5-highspeed",
 		}},
 		{ID: "kimi", Name: "Kimi for Coding", Models: []string{
 			"kimi-for-coding",

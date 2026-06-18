@@ -160,3 +160,31 @@ func TestEstimateCost_GLM4_5Air(t *testing.T) {
 		t.Errorf("glm-4.5-air cost = %f, want %f", got, want)
 	}
 }
+
+// TestEstimateCost_GLM5_2 verifies the new flagship default resolves to the
+// Max-tier rate (same as glm-5.1) rather than falling through to $0.
+func TestEstimateCost_GLM5_2(t *testing.T) {
+	got := EstimateCost("glm", "glm-5.2", 1_000_000, 1_000_000, 0, 0)
+	want := 0.55 + 2.19
+	if !approxEqual(got, want) {
+		t.Errorf("glm-5.2 cost = %f, want %f", got, want)
+	}
+	// Prefix match: a future glm-5.2-* variant still resolves to the 5.2 tier.
+	if EstimateCost("glm", "glm-5.2-preview", 1_000_000, 0, 0, 0) != 0.55 {
+		t.Errorf("glm-5.2-preview should resolve to the glm-5.2 tier (0.55 input)")
+	}
+}
+
+// TestEstimateCost_MiniMaxM2_7 verifies the current MiniMax lineup is priced
+// (the old table only had abab/minimax-m1, so M2.7 used to fall through to $0).
+func TestEstimateCost_MiniMaxM2_7(t *testing.T) {
+	got := EstimateCost("minimax", "MiniMax-M2.7", 1_000_000, 1_000_000, 0, 0)
+	want := 0.30 + 1.20
+	if !approxEqual(got, want) {
+		t.Errorf("MiniMax-M2.7 cost = %f, want %f", got, want)
+	}
+	// The "minimax" catch-all keeps an unknown future model from costing $0.
+	if EstimateCost("minimax", "MiniMax-M9-unknown", 1_000_000, 0, 0, 0) != 0.30 {
+		t.Errorf("unknown MiniMax model should fall back to the minimax catch-all (0.30 input)")
+	}
+}

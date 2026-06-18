@@ -135,7 +135,7 @@ settings:
 
 // TestLoadConfig_DeprecatedModelMigration verifies that old GLM model names
 // (glm-4-plus, glm-4-air, glm-4-flash, glm-4-long) are transparently
-// upgraded to the current default model (glm-5.1) on load.
+// upgraded to the current default model (glm-5.2) on load.
 func TestLoadConfig_DeprecatedModelMigration(t *testing.T) {
 	withTempConfigDir(t)
 	for _, oldModel := range []string{"glm-4-plus", "glm-4-air", "glm-4-flash", "glm-4-long"} {
@@ -145,15 +145,15 @@ settings:
   default_model: `+oldModel+`
 `)
 		cfg := LoadConfig()
-		if cfg.Settings.DefaultModel != "glm-5.1" {
-			t.Errorf("deprecated model %q not migrated: DefaultModel = %q, want 'glm-5.1'",
+		if cfg.Settings.DefaultModel != "glm-5.2" {
+			t.Errorf("deprecated model %q not migrated: DefaultModel = %q, want 'glm-5.2'",
 				oldModel, cfg.Settings.DefaultModel)
 		}
 	}
 }
 
 // TestLoadConfig_RemovedProviderMigration verifies that providers that are
-// no longer supported (anthropic, gemini) are migrated to glm/glm-5.1 so
+// no longer supported (anthropic, gemini) are migrated to glm/glm-5.2 so
 // the app starts cleanly on an old config. iter 940+ note: DeepSeek used
 // to be on the removed list but came BACK with V4 — see TestLoadConfig_
 // DeepSeekRevived below.
@@ -170,8 +170,8 @@ settings:
 			t.Errorf("removed provider %q: DefaultProvider = %q, want 'glm'",
 				removed, cfg.Settings.DefaultProvider)
 		}
-		if cfg.Settings.DefaultModel != "glm-5.1" {
-			t.Errorf("removed provider %q: DefaultModel = %q, want 'glm-5.1'",
+		if cfg.Settings.DefaultModel != "glm-5.2" {
+			t.Errorf("removed provider %q: DefaultModel = %q, want 'glm-5.2'",
 				removed, cfg.Settings.DefaultModel)
 		}
 	}
@@ -225,16 +225,16 @@ settings:
 
 // TestLoadConfig_ProjectProviderMigration verifies three project-level
 // migration cases:
-//   - empty provider → glm/glm-5.1
-//   - removed provider (e.g. anthropic) → glm/glm-5.1
+//   - empty provider → glm/glm-5.2
+//   - removed provider (e.g. anthropic) → glm/glm-5.2
 //   - empty model with valid provider → filled from settings default model
-//   - deprecated model name → upgraded to glm-5.1
+//   - deprecated model name → upgraded to glm-5.2
 func TestLoadConfig_ProjectProviderMigration(t *testing.T) {
 	withTempConfigDir(t)
 	writeConfigYAML(t, `
 settings:
   default_provider: glm
-  default_model: glm-5.1
+  default_model: glm-5.2
 projects:
   - id: p1
     name: EmptyProvider
@@ -272,32 +272,32 @@ projects:
 	if p1 == nil {
 		t.Fatal("project p1 not found")
 	}
-	if p1.Provider != "glm" || p1.Model != "glm-5.1" {
-		t.Errorf("p1 (empty provider): got (%q, %q), want (glm, glm-5.1)", p1.Provider, p1.Model)
+	if p1.Provider != "glm" || p1.Model != "glm-5.2" {
+		t.Errorf("p1 (empty provider): got (%q, %q), want (glm, glm-5.2)", p1.Provider, p1.Model)
 	}
 
 	p2 := find("p2")
 	if p2 == nil {
 		t.Fatal("project p2 not found")
 	}
-	if p2.Provider != "glm" || p2.Model != "glm-5.1" {
-		t.Errorf("p2 (removed provider anthropic): got (%q, %q), want (glm, glm-5.1)", p2.Provider, p2.Model)
+	if p2.Provider != "glm" || p2.Model != "glm-5.2" {
+		t.Errorf("p2 (removed provider anthropic): got (%q, %q), want (glm, glm-5.2)", p2.Provider, p2.Model)
 	}
 
 	p3 := find("p3")
 	if p3 == nil {
 		t.Fatal("project p3 not found")
 	}
-	if p3.Model != "glm-5.1" {
-		t.Errorf("p3 (empty model): got %q, want 'glm-5.1'", p3.Model)
+	if p3.Model != "glm-5.2" {
+		t.Errorf("p3 (empty model): got %q, want 'glm-5.2'", p3.Model)
 	}
 
 	p4 := find("p4")
 	if p4 == nil {
 		t.Fatal("project p4 not found")
 	}
-	if p4.Model != "glm-5.1" {
-		t.Errorf("p4 (deprecated model glm-4-flash): got %q, want 'glm-5.1'", p4.Model)
+	if p4.Model != "glm-5.2" {
+		t.Errorf("p4 (deprecated model glm-4-flash): got %q, want 'glm-5.2'", p4.Model)
 	}
 }
 

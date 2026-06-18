@@ -33,6 +33,7 @@ type Project struct {
 	MaxTokens      int
 	ThinkingMode   string  // "" = auto, "enabled", "disabled"
 	ThinkingBudget int32   // 0 = use default (4096) when enabled
+	PermissionMode string  // "" / "auto" = proceed; "ask" = confirm before changes
 	BudgetUSD      float64 // 0 = no budget set; otherwise per-month spend cap in USD
 	// EnforceBudget, when true, blocks new SendMessage calls once cumulative
 	// cost (cached, seeded from ProjectUsageStats on first need, bumped on
@@ -111,6 +112,7 @@ type ProjectInfo struct {
 	MaxTokens      int     `json:"maxTokens,omitempty"`
 	ThinkingMode   string  `json:"thinkingMode,omitempty"`
 	ThinkingBudget int32   `json:"thinkingBudget,omitempty"`
+	PermissionMode string  `json:"permissionMode,omitempty"`
 	BudgetUSD      float64 `json:"budgetUSD,omitempty"`
 	EnforceBudget  bool    `json:"enforceBudget,omitempty"`
 	Pinned         bool    `json:"pinned,omitempty"`
@@ -140,6 +142,7 @@ func NewProject(pc ProjectConfig) *Project {
 		MaxTokens:      pc.MaxTokens,
 		ThinkingMode:   pc.ThinkingMode,
 		ThinkingBudget: pc.ThinkingBudget,
+		PermissionMode: pc.PermissionMode,
 		BudgetUSD:      pc.BudgetUSD,
 		EnforceBudget:  pc.EnforceBudget,
 		Pinned:         pc.Pinned,
@@ -277,6 +280,7 @@ func (p *Project) Info() *ProjectInfo {
 		MaxTokens:      p.MaxTokens,
 		ThinkingMode:   p.ThinkingMode,
 		ThinkingBudget: p.ThinkingBudget,
+		PermissionMode: p.PermissionMode,
 		BudgetUSD:      p.BudgetUSD,
 		EnforceBudget:  p.EnforceBudget,
 		Pinned:         p.Pinned,
@@ -609,12 +613,13 @@ func (p *Project) initClient(settings Settings) error {
 	// agent proceeds without them, same as before this hook-up.
 	p.initMemoryAndPlan(reg)
 
-	// Apply system prompt (user-configured or sensible default).
+	// Apply system prompt (user-configured or sensible default), plus the
+	// "ask before changes" directive when the project is in that mode.
 	sysPrompt := p.SystemPrompt
 	if sysPrompt == "" {
 		sysPrompt = defaultSystemPrompt(p.Directory, p.Name)
 	}
-	c.SetSystemInstruction(sysPrompt)
+	c.SetSystemInstruction(sysPrompt + permissionDirective(p.PermissionMode))
 
 	sets := toolSetsForProvider(provider)
 	toolDecls := reg.FilteredDeclarations(sets...)
@@ -736,6 +741,7 @@ func (p *Project) SendMessage(wailsCtx context.Context, message string, settings
 	pinnedCtx := p.pinnedContext
 	sysPr := p.SystemPrompt
 	pName := p.Name
+	permMode := p.PermissionMode
 	p.mu.Unlock()
 
 	// Persist the lastUsedAt bump so sidebar ordering survives restarts. Uses
@@ -756,12 +762,19 @@ func (p *Project) SendMessage(wailsCtx context.Context, message string, settings
 	// incorporate it into the system instruction for this run so it survives
 	// history compaction. The instruction is re-applied each send so a new pin
 	// from the previous turn is visible immediately.
-	if pinnedCtx != "" {
+	// Re-assemble the system instruction when there's pinned context OR the
+	// project is in "ask" permission mode, so both survive history compaction
+	// and reflect the current setting (the cached client was built once at
+	// init). No-pin + auto-mode keeps the init-time instruction untouched.
+	if pinnedCtx != "" || permMode == "ask" {
 		base := sysPr
 		if base == "" {
 			base = defaultSystemPrompt(p.Directory, pName)
 		}
-		c.SetSystemInstruction(base + "\n\n## Pinned Context\n" + pinnedCtx)
+		if pinnedCtx != "" {
+			base += "\n\n## Pinned Context\n" + pinnedCtx
+		}
+		c.SetSystemInstruction(base + permissionDirective(permMode))
 	}
 
 	// Replay log captures every event so an abrupt shutdown doesn't lose the
@@ -997,6 +1010,23 @@ func (p *Project) SendMessage(wailsCtx context.Context, message string, settings
 			streamEmitted = false
 			collected, serr := streamAndProcess(resp)
 			if serr == nil {
+				// A completely empty 200 (no text/tools/thinking) is usually a
+				// transient provider glitch. Retry it the way the upstream engine
+				// classifies it (client.EmptyModelResponseError is retryable), but
+				// only while nothing has been streamed (so a retry can't duplicate
+				// output). If retries are exhausted, fall through and return the
+				// empty response so the turn still completes rather than erroring.
+				if responseIsEmpty(collected) && attempt < maxStreamAttempts && !streamEmitted && ctx.Err() == nil {
+					emptyErr := &client.EmptyModelResponseError{}
+					notifyRetry(attempt, maxStreamAttempts, int(delay/time.Millisecond), summarizeRetryReason(emptyErr))
+					select {
+					case <-time.After(delay):
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					}
+					delay *= 2
+					continue
+				}
 				return collected, nil
 			}
 			if ctx.Err() != nil {
@@ -1595,6 +1625,7 @@ func (p *Project) ToConfig() ProjectConfig {
 		MaxTokens:      p.MaxTokens,
 		ThinkingMode:   p.ThinkingMode,
 		ThinkingBudget: p.ThinkingBudget,
+		PermissionMode: p.PermissionMode,
 		BudgetUSD:      p.BudgetUSD,
 		EnforceBudget:  p.EnforceBudget,
 		Pinned:         p.Pinned,
@@ -1617,9 +1648,34 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+// askBeforeChangesDirective is appended to the system prompt when a project's
+// PermissionMode == "ask". Soft enforcement: the agent loop has no hard
+// approval gate (project.go initMemoryAndPlan uses requireApproval=false), so
+// this instructs the model to confirm via ask_user before mutating anything.
+const askBeforeChangesDirective = "\n\n## Permission mode: ask before changes\n" +
+	"Before making any change to the user's files or repository — file " +
+	"writes/edits/deletes/moves, `git` mutations (commit, reset, checkout, " +
+	"rebase, push), or destructive shell commands (rm, overwriting files, " +
+	"dropping data) — FIRST use the ask_user tool to briefly describe what you " +
+	"intend to do and get confirmation. Read-only operations (reading files, " +
+	"search, git status/diff, running tests) do NOT need confirmation. Batch " +
+	"related changes into a single confirmation rather than asking per file."
+
+// permissionDirective returns the system-prompt addendum for a permission mode.
+// Only "ask" adds anything; "" / "auto" return the empty string.
+func permissionDirective(mode string) string {
+	if mode == "ask" {
+		return askBeforeChangesDirective
+	}
+	return ""
+}
+
 // defaultSystemPrompt returns a baseline instruction for the agent when the
-// user hasn't configured a project-specific one. Optimized for GLM-5.1 which
-// responds well to explicit tool-use directives and clear workflow phases.
+// user hasn't configured a project-specific one. Tuned for GLM-5.2 (the default
+// model: 1M-token context window, strong tool use) — explicit tool-selection
+// directives, evidence-first discipline, and an architecture-first sketch for
+// new features (the latter three merged from the gokin upstream's
+// baseSystemPrompt in internal/context/prompt.go).
 func defaultSystemPrompt(directory, name string) string {
 	return `You are a senior software engineer working inside the project "` + name + `" at ` + directory + `.
 
@@ -1628,6 +1684,15 @@ You have access to file tools (read, write, edit, copy, move, delete, mkdir, dif
 
 Prefer run_tests over bare "bash go test ./..." — run_tests auto-detects the framework, parses JSON output, surfaces only failed test names and their file:line assertion locations.
 Prefer review_changes over bare "git diff" — review_changes also shows untracked (newly-created) files in the same view and truncates sensibly for long diffs.
+
+Always prefer the dedicated tool over a bash equivalent — it returns structured, safer results:
+- Find files → glob (NOT bash find/ls)
+- Search content → grep (NOT bash grep/rg or cat | grep)
+- Read a file → read (NOT bash cat/head/tail)
+- Targeted change → edit (NOT rewriting the whole file with write)
+- New file → write
+- Builds / tests / commands → bash, only when no dedicated tool fits
+When several independent operations are needed, call the tools in parallel in one step.
 
 NEVER describe what you would do — just do it with tools. If asked "what files are here?", call list_dir or tree, do not guess. If asked to fix a bug, read the relevant files first, then edit them.
 
@@ -1653,6 +1718,15 @@ Rule of thumb: if you learn something the user would be annoyed to re-explain ne
 2. EXECUTE — work through steps; after each meaningful step, update_plan_progress.
 3. VERIFY — after edits: re-read modified files, run relevant commands (tests, builds, lints), check git_diff. Don't claim "done" without verification.
 
+# Evidence over assumption
+- Identify the smallest relevant slice first: entry points, interfaces, tests, config, and existing conventions for the area. GLM-5.2 has a large (1M-token) context window — read broadly (the defining files AND a nearby caller/test) before editing rather than guessing.
+- Prefer existing patterns, helpers, error handling, and naming over inventing new abstractions.
+- Keep changes scoped to the request; don't refactor unrelated code or rename public APIs unless the task requires it.
+- If a tool result disproves your assumption, revise immediately — never keep coding from stale assumptions.
+
+# Architecture-first for new features
+When asked to build something NEW (a feature, module, or major refactor) and plan mode is NOT active, first output a short sketch (3-6 lines) — Design / Components / Flow / Order — then implement it. This lets the user redirect before you invest in the wrong direction. Skip the sketch for bug fixes, single-file edits, or questions. If the user interrupts with new direction, revise the sketch first ("Revised design: ...") before continuing.
+
 # Quality bar
 - Make small focused edits, not sweeping rewrites.
 - Match existing code style (read nearby code first).
@@ -1667,6 +1741,26 @@ Rule of thumb: if you learn something the user would be annoyed to re-explain ne
 - Don't apologize or hedge unnecessarily.`
 }
 
+// responseIsEmpty reports whether a model response carried no usable content
+// (no text, no tool calls, no thinking). Such empty 200s are usually a
+// transient provider glitch worth retrying rather than ending the turn on.
+func responseIsEmpty(r *client.Response) bool {
+	if r == nil {
+		return true
+	}
+	if r.Text != "" || len(r.FunctionCalls) > 0 || r.Thinking != "" {
+		return false
+	}
+	// A response carrying thinking-signature parts (Kimi / native Anthropic on
+	// round-trip) is not "empty" even with no plain text — don't retry it away.
+	for _, part := range r.Parts {
+		if part != nil && part.Thought && part.Text != "" {
+			return false
+		}
+	}
+	return true
+}
+
 // contextWindowForProvider returns an approximate token budget for a provider.
 func contextWindowForProvider(provider, model string) int {
 	switch provider {
@@ -1677,16 +1771,19 @@ func contextWindowForProvider(provider, model string) int {
 		}
 		return 8192
 	case "glm":
-		if strings.HasPrefix(model, "glm-5") {
-			return 128000 // GLM-5.x has 128k context
+		if strings.HasPrefix(model, "glm-5.2") {
+			return 1000000 // GLM-5.2 ships a 1M input context window (Z.AI)
 		}
-		return 128000
+		if strings.HasPrefix(model, "glm-5") {
+			return 200000 // GLM-5/5.1/5-turbo — 200K context
+		}
+		return 128000 // older GLM-4.x families
 	case "kimi":
 		return 262144 // kimi-for-coding (Kimi-k2.6) has 262K context
 	case "deepseek":
 		return 128000 // DeepSeek V4 (both pro + flash) — 128K context
 	default:
-		return 128000 // MiniMax
+		return 204800 // MiniMax M2.x — 200K context
 	}
 }
 

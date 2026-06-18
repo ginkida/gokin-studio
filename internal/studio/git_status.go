@@ -3,14 +3,16 @@ package studio
 import (
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // GitFileChange is one entry from `git status --porcelain`.
-//   Status is the two-letter porcelain code ("M ", " M", "??", "A ", etc.)
-//   normalised to a human label: "modified", "added", "deleted", "untracked".
-//   The frontend uses Status to colour the chip and Path as the click action.
+//
+//	Status is the two-letter porcelain code ("M ", " M", "??", "A ", etc.)
+//	normalised to a human label: "modified", "added", "deleted", "untracked".
+//	The frontend uses Status to colour the chip and Path as the click action.
 type GitFileChange struct {
 	Path   string `json:"path"`
 	Status string `json:"status"`
@@ -37,6 +39,11 @@ type ProjectGitContext struct {
 	// AheadBehind: "+3 -1" if the branch is 3 ahead and 1 behind upstream;
 	// "" if there's no upstream or it can't be determined.
 	AheadBehind string `json:"aheadBehind,omitempty"`
+	// Insertions / Deletions: summed line counts of uncommitted tracked
+	// changes vs HEAD (`git diff HEAD --numstat`). Untracked files are not
+	// counted (they're not in the diff). Both 0 = clean tracked tree.
+	Insertions int `json:"insertions,omitempty"`
+	Deletions  int `json:"deletions,omitempty"`
 }
 
 // GetProjectGitContext gathers a snapshot of the project's git state for
@@ -154,6 +161,24 @@ func (s *Studio) GetProjectGitContext(projectID string) (*ProjectGitContext, err
 			ahead, behind := fields[0], fields[1]
 			if ahead != "0" || behind != "0" {
 				out.AheadBehind = "+" + ahead + " -" + behind
+			}
+		}
+	}
+
+	// Line-count diff stat for uncommitted tracked changes vs HEAD. Each
+	// numstat line is "<added>\t<deleted>\t<path>"; binary files show "-".
+	// On a repo with no commits yet, `git diff HEAD` fails → empty → skipped.
+	if ns := runGit(dir, "diff", "HEAD", "--numstat"); ns != "" {
+		for _, line := range strings.Split(ns, "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				continue
+			}
+			if a, err := strconv.Atoi(fields[0]); err == nil {
+				out.Insertions += a
+			}
+			if d, err := strconv.Atoi(fields[1]); err == nil {
+				out.Deletions += d
 			}
 		}
 	}

@@ -29,6 +29,11 @@ type ProjectConfig struct {
 	// provider default of 4096 when thinking is enabled).
 	ThinkingMode   string `yaml:"thinking_mode,omitempty" json:"thinkingMode,omitempty"`
 	ThinkingBudget int32  `yaml:"thinking_budget,omitempty" json:"thinkingBudget,omitempty"`
+	// PermissionMode controls how cautious the agent is about changes.
+	// "" / "auto" = proceed without asking; "ask" = confirm via the ask_user
+	// tool before file/git/destructive changes (soft enforcement: a directive
+	// appended to the system prompt, since the agent loop has no hard gate).
+	PermissionMode string `yaml:"permission_mode,omitempty" json:"permissionMode,omitempty"`
 	// BudgetUSD is the user-set monthly spend cap. The UI uses it to render
 	// progress vs. accumulated session usage and warn at 80%/100%. 0 = no
 	// budget set (no warnings). Capped at $100,000 to defend against typos.
@@ -127,10 +132,10 @@ func LoadConfig() *StudioConfig {
 	// V4 lineup proactively). deepseek-reasoner → v4-pro (thinking),
 	// deepseek-chat → v4-flash (non-thinking).
 	deprecatedModels := map[string]string{
-		"glm-4-plus":        "glm-5.1",
-		"glm-4-air":         "glm-5.1",
-		"glm-4-flash":       "glm-5.1",
-		"glm-4-long":        "glm-5.1",
+		"glm-4-plus":        "glm-5.2",
+		"glm-4-air":         "glm-5.2",
+		"glm-4-flash":       "glm-5.2",
+		"glm-4-long":        "glm-5.2",
 		"deepseek-chat":     "deepseek-v4-flash",
 		"deepseek-reasoner": "deepseek-v4-pro",
 	}
@@ -150,7 +155,7 @@ func LoadConfig() *StudioConfig {
 	// Migrate settings default provider if it was removed.
 	if removedProviders[cfg.Settings.DefaultProvider] {
 		cfg.Settings.DefaultProvider = "glm"
-		cfg.Settings.DefaultModel = "glm-5.1"
+		cfg.Settings.DefaultModel = "glm-5.2"
 	}
 
 	// Migrate project-level provider/model: projects that still reference
@@ -159,7 +164,7 @@ func LoadConfig() *StudioConfig {
 		p := &cfg.Projects[i]
 		if p.Provider == "" || removedProviders[p.Provider] {
 			p.Provider = "glm"
-			p.Model = "glm-5.1"
+			p.Model = "glm-5.2"
 		}
 		if p.Model == "" {
 			p.Model = cfg.Settings.DefaultModel
@@ -191,7 +196,7 @@ func defaultConfig() *StudioConfig {
 		Settings: Settings{
 			Theme:           "dark",
 			DefaultProvider: "glm",
-			DefaultModel:    "glm-5.1",
+			DefaultModel:    "glm-5.2",
 			OllamaURL:       "http://localhost:11434",
 		},
 	}

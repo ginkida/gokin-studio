@@ -12,15 +12,17 @@ func TestContextWindowForProvider(t *testing.T) {
 	}{
 		// Kimi-for-coding (Kimi-k2.6) has a 262K context window.
 		{"kimi", "kimi-for-coding", 262144},
-		// GLM-5.x always returns 128K regardless of sub-model name.
-		{"glm", "glm-5.1", 128000},
-		{"glm", "glm-5-flash", 128000},
-		{"glm", "glm-4", 128000}, // non-5.x prefix also falls through to 128K
-		// MiniMax (default case) → 128K.
-		{"minimax", "minimax-text", 128000},
-		// Unknown provider → 128K (same default).
-		{"", "", 128000},
-		{"anthropic", "claude-3", 128000},
+		// GLM-5.2 ships a 1M context window; other GLM-5.x → 200K; GLM-4.x → 128K.
+		{"glm", "glm-5.2", 1000000},
+		{"glm", "glm-5.2-experimental", 1000000}, // prefix match still 1M
+		{"glm", "glm-5.1", 200000},
+		{"glm", "glm-5-flash", 200000},
+		{"glm", "glm-4", 128000}, // non-5.x prefix falls through to 128K
+		// MiniMax (default case) → 200K (M2.x).
+		{"minimax", "MiniMax-M2.7", 204800},
+		// Unknown provider → MiniMax default (204800).
+		{"", "", 204800},
+		{"anthropic", "claude-3", 204800},
 		// Ollama: known model uses profile's context window.
 		{"ollama", "llama3.1", 128000}, // llama3.1 profile = 128K
 		{"ollama", "qwen2.5-coder", 32768},
