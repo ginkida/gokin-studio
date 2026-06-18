@@ -90,8 +90,11 @@ export function StatusBar() {
             <span className="status-sep" />
             <span className="status-provider">{activeProject.provider || 'glm'}</span>
             <span className="status-model">{activeProject.model || 'glm-5.2'}</span>
-            {(activeProject.thinkingMode === 'enabled' || (activeProject.thinkingMode !== 'disabled' && activeProject.provider === 'kimi')) && (
-              <span className="status-thinking" title="Extended thinking enabled">
+            {activeProject.thinkingActive && (
+              <span
+                className="status-thinking"
+                title={`Extended thinking enabled${activeProject.thinkingBudgetEffective ? ` (${activeProject.thinkingBudgetEffective} tokens)` : ''}`}
+              >
                 <Brain size={11} />
               </span>
             )}

@@ -178,7 +178,7 @@ export function ProviderSelect({ projectId, currentProvider, currentModel, curre
         </div>
         {thinkingMode === 'enabled' && (
           <div className="provider-select-field">
-            <label>Thinking budget tokens (0 = 4096)</label>
+            <label>Thinking budget tokens (0 = {provider === 'glm' ? 8192 : 4096})</label>
             <input
               type="number"
               min="0"

@@ -1702,8 +1702,8 @@ function ChatPanelBody({
               {activeProject.model}
             </span>
           )}
-          {(activeProject.thinkingMode === 'enabled' || ((!activeProject.thinkingMode) && activeProject.provider === 'kimi')) && (
-            <span className="chat-header-thinking" title={`Extended thinking ${activeProject.thinkingMode === 'enabled' ? 'enabled' : 'on by default for Kimi'}${activeProject.thinkingBudget ? ` (${activeProject.thinkingBudget} tokens)` : ''}`}>
+          {activeProject.thinkingActive && (
+            <span className="chat-header-thinking" title={`Extended thinking ${activeProject.thinkingMode === 'enabled' ? 'enabled' : `on by default for ${activeProject.provider || 'glm'}`}${activeProject.thinkingBudgetEffective ? ` (${activeProject.thinkingBudgetEffective} tokens)` : ''}`}>
               <Brain size={10} /> thinking
             </span>
           )}

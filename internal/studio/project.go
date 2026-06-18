@@ -123,12 +123,20 @@ type ProjectInfo struct {
 	MaxTokens      int     `json:"maxTokens,omitempty"`
 	ThinkingMode   string  `json:"thinkingMode,omitempty"`
 	ThinkingBudget int32   `json:"thinkingBudget,omitempty"`
-	PermissionMode string  `json:"permissionMode,omitempty"`
-	BudgetUSD      float64 `json:"budgetUSD,omitempty"`
-	EnforceBudget  bool    `json:"enforceBudget,omitempty"`
-	Pinned         bool    `json:"pinned,omitempty"`
-	ContextWindow  int     `json:"contextWindow"`
-	PinnedContext  string  `json:"pinnedContext,omitempty"`
+	// ThinkingActive / ThinkingBudgetEffective are the RESOLVED thinking state
+	// for the project's provider+model+mode (computed via resolveThinkingConfig,
+	// the same policy the client factory consumes). The UI uses these for the
+	// "thinking" indicator instead of re-deriving the per-provider auto-enable
+	// rules in TypeScript (which would drift). ThinkingBudgetEffective is 0 when
+	// thinking is off.
+	ThinkingActive          bool    `json:"thinkingActive"`
+	ThinkingBudgetEffective int32   `json:"thinkingBudgetEffective"`
+	PermissionMode          string  `json:"permissionMode,omitempty"`
+	BudgetUSD               float64 `json:"budgetUSD,omitempty"`
+	EnforceBudget           bool    `json:"enforceBudget,omitempty"`
+	Pinned                  bool    `json:"pinned,omitempty"`
+	ContextWindow           int     `json:"contextWindow"`
+	PinnedContext           string  `json:"pinnedContext,omitempty"`
 }
 
 // ChatMessage is a single chat entry for the frontend.
@@ -277,27 +285,37 @@ func (p *Project) Info() *ProjectInfo {
 		}
 	}
 
+	// Resolve the effective thinking state the same way initClient does, so the
+	// UI badge reflects reality (GLM/DeepSeek V4 auto-enable thinking too, not
+	// just Kimi). Budget is reported as 0 when thinking is off.
+	thinkingActive, thinkingBudgetEff := resolveThinkingConfig(p.ThinkingMode, p.Provider, p.Model, p.ThinkingBudget)
+	if !thinkingActive {
+		thinkingBudgetEff = 0
+	}
+
 	return &ProjectInfo{
-		ID:             p.ID,
-		Name:           p.Name,
-		Directory:      p.Directory,
-		DirectoryOK:    dirOK,
-		Provider:       p.Provider,
-		Model:          p.Model,
-		Active:         anyActive,
-		LastUsedAt:     p.lastUsedAt,
-		SystemPrompt:   p.SystemPrompt,
-		Temperature:    p.Temperature,
-		MaxTokens:      p.MaxTokens,
-		ThinkingMode:   p.ThinkingMode,
-		ThinkingBudget: p.ThinkingBudget,
-		PermissionMode: p.PermissionMode,
-		BudgetUSD:      p.BudgetUSD,
-		EnforceBudget:  p.EnforceBudget,
-		Pinned:         p.Pinned,
-		GitBranch:      branch,
-		ContextWindow:  contextWindowForProvider(p.Provider, p.Model),
-		PinnedContext:  p.pinnedContext,
+		ID:                      p.ID,
+		Name:                    p.Name,
+		Directory:               p.Directory,
+		DirectoryOK:             dirOK,
+		Provider:                p.Provider,
+		Model:                   p.Model,
+		Active:                  anyActive,
+		LastUsedAt:              p.lastUsedAt,
+		SystemPrompt:            p.SystemPrompt,
+		Temperature:             p.Temperature,
+		MaxTokens:               p.MaxTokens,
+		ThinkingMode:            p.ThinkingMode,
+		ThinkingBudget:          p.ThinkingBudget,
+		ThinkingActive:          thinkingActive,
+		ThinkingBudgetEffective: thinkingBudgetEff,
+		PermissionMode:          p.PermissionMode,
+		BudgetUSD:               p.BudgetUSD,
+		EnforceBudget:           p.EnforceBudget,
+		Pinned:                  p.Pinned,
+		GitBranch:               branch,
+		ContextWindow:           contextWindowForProvider(p.Provider, p.Model),
+		PinnedContext:           p.pinnedContext,
 	}
 }
 

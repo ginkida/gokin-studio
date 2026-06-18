@@ -7,6 +7,32 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## What's Done (iter 1231+ — frontend thinking indicator reflects GLM/DeepSeek auto-thinking, drift-free)
+
+Closing the loop on iter 1228 at the UI layer. The "Extended thinking" badge in the StatusBar and the
+ChatPanel header only lit up for `kimi` in auto mode — but GLM (the **default** provider) and DeepSeek V4
+also auto-enable thinking. So most users (GLM, auto mode = the default config) saw **no** thinking
+indicator even though GLM was reasoning at an 8192 budget every turn. The frontend was re-deriving the
+per-provider auto-enable rules in TypeScript and had drifted from the backend.
+
+- **Backend single source of truth** (`project.go`): `ProjectInfo` gains `ThinkingActive bool` +
+  `ThinkingBudgetEffective int32`, computed in `Info()` via the same `resolveThinkingConfig` the client
+  factory consumes (budget reported as 0 when off). The UI now reads the resolved state instead of
+  guessing — no more TS/Go drift.
+- **Frontend** (`StatusBar.tsx`, `ChatPanel.tsx`, `projectStore.ts`): both badges switch from the stale
+  `thinkingMode==='enabled' || (auto && provider==='kimi')` condition to `activeProject.thinkingActive`;
+  tooltips show `thinkingBudgetEffective`. Store `ProjectInfo` type gains the two fields.
+- **Budget-label accuracy** (`ProviderSelect.tsx`, `SettingsPage.tsx`): the "0 = 4096" thinking-budget
+  labels were wrong after iter 1228 made the explicit-enable default provider-aware. Per-project label now
+  shows `0 = 8192` for GLM (else 4096); the global Settings label says "0 = provider default · GLM 8192".
+- **Tests**: `TestProjectInfo_ThinkingActiveResolved` (8 cases — GLM auto 8192, disabled→off, DeepSeek/Kimi
+  auto, unsupported models off). `tsc --noEmit` clean, `vite build` clean, `-race ./internal/studio/` green,
+  `go vet` clean. (Generated wailsjs bindings refresh on next `wails dev`; runtime JSON already carries the
+  fields and the store type declares them, so tsc passes today.)
+- **Honest value**: medium — a real UX-correctness fix on the default provider's hot path (most users were
+  missing the thinking indicator), done drift-free by computing the state once in the backend rather than
+  duplicating provider rules in the UI.
+
 ## What's Done (iter 1230+ — GLM implicit-cache prefix-stability regression lock)
 
 The user asked whether GLM's context cache is actually used. It IS: GLM caches the system+tools prefix

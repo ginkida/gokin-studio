@@ -15,6 +15,8 @@ export interface ProjectInfo {
   maxTokens?: number
   thinkingMode?: string  // "" | "enabled" | "disabled"
   thinkingBudget?: number
+  thinkingActive?: boolean          // backend-resolved: is Extended Thinking effectively on?
+  thinkingBudgetEffective?: number  // backend-resolved budget (0 when off)
   permissionMode?: string  // "" | "auto" | "ask"
   budgetUSD?: number
   enforceBudget?: boolean

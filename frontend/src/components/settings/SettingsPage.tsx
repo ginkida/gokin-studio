@@ -626,7 +626,7 @@ export function SettingsPage() {
           </div>
           {local.defaultThinkingMode === 'enabled' && (
             <div className="settings-field">
-              <label>Budget tokens (0 = 4096)</label>
+              <label>Budget tokens (0 = provider default · GLM 8192)</label>
               <input
                 type="number"
                 min="0"
