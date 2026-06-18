@@ -325,3 +325,63 @@ func TestCappedRetryDelay(t *testing.T) {
 		}
 	}
 }
+
+// TestOnThinkingIdle_DefaultImplementation verifies that DefaultStatusCallback
+// satisfies the StatusCallback interface including the new OnThinkingIdle method,
+// and that calling it is safe (no panic). This pins the interface shape added for
+// thinking-idle timeout extension (batch 23): when a thinking-enabled model is in
+// its silent reasoning phase, the stream loop calls OnThinkingIdle so callers can
+// show an appropriate UI hint ("Model is thinking...") rather than a generic
+// "waiting for response" idle warning.
+func TestOnThinkingIdle_DefaultImplementation(t *testing.T) {
+	var cb StatusCallback = &DefaultStatusCallback{}
+	// Must satisfy the interface — compile-time check.
+	_ = cb
+
+	// Calling it must not panic.
+	cb.OnThinkingIdle(15*time.Second, "glm")
+	cb.OnThinkingIdle(30*time.Second, "kimi")
+	cb.OnThinkingIdle(0, "")
+}
+
+// TestOnThinkingIdle_InvocationTracking verifies that a custom StatusCallback
+// that records OnThinkingIdle calls works correctly — guards that the method
+// signature (elapsed, provider) is correctly defined on the interface.
+func TestOnThinkingIdle_InvocationTracking(t *testing.T) {
+	type call struct {
+		elapsed  time.Duration
+		provider string
+	}
+	var calls []call
+	tracker := &trackingCallback{
+		onThinkingIdle: func(elapsed time.Duration, provider string) {
+			calls = append(calls, call{elapsed, provider})
+		},
+	}
+
+	tracker.OnThinkingIdle(15*time.Second, "glm")
+	tracker.OnThinkingIdle(45*time.Second, "kimi")
+
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 OnThinkingIdle calls, got %d", len(calls))
+	}
+	if calls[0].provider != "glm" || calls[0].elapsed != 15*time.Second {
+		t.Errorf("first call: got (%v, %q), want (15s, glm)", calls[0].elapsed, calls[0].provider)
+	}
+	if calls[1].provider != "kimi" || calls[1].elapsed != 45*time.Second {
+		t.Errorf("second call: got (%v, %q), want (45s, kimi)", calls[1].elapsed, calls[1].provider)
+	}
+}
+
+// trackingCallback is a local test-only StatusCallback that lets individual
+// callbacks be overridden.
+type trackingCallback struct {
+	DefaultStatusCallback
+	onThinkingIdle func(time.Duration, string)
+}
+
+func (tc *trackingCallback) OnThinkingIdle(elapsed time.Duration, provider string) {
+	if tc.onThinkingIdle != nil {
+		tc.onThinkingIdle(elapsed, provider)
+	}
+}

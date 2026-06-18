@@ -20,6 +20,12 @@ type StatusCallback interface {
 	// elapsed is the time since the last data was received.
 	OnStreamIdle(elapsed time.Duration)
 
+	// OnThinkingIdle is called when a thinking-enabled model is in its silent
+	// reasoning phase (no content received yet). Unlike OnStreamIdle, this tells
+	// the UI that the delay is expected — the model is deliberately thinking.
+	// elapsed is the time since the request was sent; provider identifies the backend.
+	OnThinkingIdle(elapsed time.Duration, provider string)
+
 	// OnStreamResume is called when the stream resumes after being idle.
 	OnStreamResume()
 
@@ -41,6 +47,9 @@ func (d *DefaultStatusCallback) OnRateLimit(waitTime time.Duration) {}
 
 // OnStreamIdle does nothing.
 func (d *DefaultStatusCallback) OnStreamIdle(elapsed time.Duration) {}
+
+// OnThinkingIdle does nothing.
+func (d *DefaultStatusCallback) OnThinkingIdle(elapsed time.Duration, provider string) {}
 
 // OnStreamResume does nothing.
 func (d *DefaultStatusCallback) OnStreamResume() {}

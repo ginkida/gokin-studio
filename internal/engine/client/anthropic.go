@@ -972,9 +972,13 @@ func (c *AnthropicClient) doStreamRequest(ctx context.Context, requestBody map[s
 	// Stream idle warning - half of idle timeout
 	streamIdleWarning := streamIdleTimeout / 2
 
-	// Capture status callback for goroutine
+	// Capture status callback and thinking config for goroutine.
+	// Reading EnableThinking in the goroutine without the lock is a data race
+	// (SetThinkingBudget can mutate it concurrently). Snapshot both here.
 	c.mu.RLock()
 	statusCb := c.statusCallback
+	enableThinkingSnap := c.config.EnableThinking
+	providerSnap := c.config.Provider
 	c.mu.RUnlock()
 
 	// Use sync.Once to prevent double-close of response body.
@@ -1052,6 +1056,7 @@ func (c *AnthropicClient) doStreamRequest(ctx context.Context, requestBody map[s
 
 		eventCount := 0
 		contentReceived := false
+		initialTimeoutExtended := false // tracks whether we've already extended once for a thinking model
 		idleTimer := time.NewTimer(streamIdleTimeout)
 		defer idleTimer.Stop()
 
@@ -1076,10 +1081,20 @@ func (c *AnthropicClient) doStreamRequest(ctx context.Context, requestBody map[s
 					return
 
 				case <-warningTimer.C:
-					// Stream idle warning - notify UI
-					lastWarningAt += streamIdleWarning
+					// Stream idle warning - notify UI.
+					// Distinguish the silent thinking phase (no content yet + thinking enabled)
+					// from a generic idle so callers can show the right UI hint.
+					if lastWarningAt == 0 {
+						lastWarningAt = streamIdleWarning
+					} else {
+						lastWarningAt += 10 * time.Second
+					}
 					if statusCb != nil {
-						statusCb.OnStreamIdle(lastWarningAt)
+						if !contentReceived && enableThinkingSnap {
+							statusCb.OnThinkingIdle(lastWarningAt, providerSnap)
+						} else {
+							statusCb.OnStreamIdle(lastWarningAt)
+						}
 					}
 					// Reset for next warning (every 10 seconds after first)
 					warningTimer.Reset(10 * time.Second)
@@ -1087,6 +1102,21 @@ func (c *AnthropicClient) doStreamRequest(ctx context.Context, requestBody map[s
 					continue waitLoop
 
 				case <-idleTimer.C:
+					// If thinking is enabled and no content has arrived yet, the model
+					// is likely in its silent reasoning phase. Extend the timeout once
+					// to avoid killing a legitimate (just slow) thinking turn. Without
+					// this, a GLM-5.2 / Kimi model doing a long think would be killed
+					// at 30 s even though it was still working.
+					if !contentReceived && !initialTimeoutExtended && enableThinkingSnap {
+						initialTimeoutExtended = true
+						logging.Info("extending idle timeout for thinking model — no content yet",
+							"provider", providerSnap, "original_timeout", streamIdleTimeout)
+						idleTimer.Reset(streamIdleTimeout)
+						if statusCb != nil {
+							statusCb.OnThinkingIdle(streamIdleTimeout, providerSnap)
+						}
+						continue waitLoop
+					}
 					logging.Warn("stream idle timeout exceeded", "timeout", streamIdleTimeout, "partial", contentReceived)
 					// ctx-guarded: if the consumer already returned on cancel and
 					// the buffered channel is full, a bare send would block this
