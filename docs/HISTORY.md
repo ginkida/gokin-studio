@@ -7,6 +7,32 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## What's Done (iter 1234+ — tool-layer correctness from a fresh gokin diff: grep cache count + fuzzy-edit lock)
+
+Re-diffed fresh gokin `internal/tools/` for unported correctness fixes (the prior re-audit's gokin-diff
+dimension came back clean, but these two recent commits landed after). Found one real unported bug + one
+critical-but-already-handled path that lacked regression coverage.
+
+- **Grep cached-path count inflation** (real bug; gokin `0c21074`): `grep.go` already counted only real
+  matches on the LIVE path (`countRealMatches`/`isMatch`), but the cache-HIT summary used
+  `len(cached.Matches)` — and `cacheMatches` also stores context lines (the `isMatch` guard only gates the
+  `matchCount` increment, not the append). So a repeat `grep -C2` over-reported match density, misleading
+  the agent on which file to read. Fix: added `cache.GrepResult.MatchCount` (the real count), set it at the
+  cache write, and used it in the cached summary with a `len(Matches)` fallback for pre-field entries.
+  Test `TestGrep_CachedPathDoesNotInflateCount` (cache hit reports 1, not the inflated 5).
+- **Fuzzy-edit BlankLines corruption lock** (coverage; gokin `5ce4921`): gokin found its `edit` tool's
+  `BlankLines` fuzzy strategy silently corrupted files — it drops blank lines, so match indices into the
+  normalized (shorter) line list, when used to slice the ORIGINAL lines, hit the WRONG lines. gokin REMOVED
+  the strategy. **Studio is not vulnerable** — it solved the same misalignment more capably with an explicit
+  `normToOrig` map (edit.go:1049-1073) that maps normalized→original indices, so it applies the fuzzy match
+  CORRECTLY instead of erroring. But that subtle, high-blast-radius path (most-used tool) was UNTESTED.
+  Added `edit_blanklines_test.go` (+3): gokin's exact corruption case now produces the correct intact
+  result; blank lines preceding the match don't shift the splice; trailing code isn't orphaned/glued.
+- **Verification**: full `./internal/engine/tools/` + `-race` on grep/edit green, `go vet` clean.
+- **Honest value**: the grep fix is a genuine (low-medium) correctness bug on a hot tool's cache path; the
+  fuzzy-edit tests are insurance — they lock already-correct but subtle silent-corruption-prevention logic
+  that had zero coverage, so a future refactor can't reintroduce the corruption class undetected.
+
 ## What's Done (iter 1233+ — budget cost cache re-derives after clear/delete; honest budget-block message)
 
 From a fresh adversarial reliability re-audit (4 dimensions: agent-loop cancel/persist, tool/streaming

@@ -204,7 +204,14 @@ func (t *GrepTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 			if len(cached.Matches) == 0 {
 				return NewSuccessResult("No matches found. (cached)"), nil
 			}
-			summary := fmt.Sprintf("Found %d match(es) in %d file(s) (cached):\n\n", len(cached.Matches), cached.FileCount)
+			// Report the real match count, not len(Matches) (which includes
+			// context lines). MatchCount==0 on a non-empty result means the entry
+			// was cached before the field existed → fall back to len(Matches).
+			cachedCount := cached.MatchCount
+			if cachedCount == 0 {
+				cachedCount = len(cached.Matches)
+			}
+			summary := fmt.Sprintf("Found %d match(es) in %d file(s) (cached):\n\n", cachedCount, cached.FileCount)
 			return NewSuccessResult(summary + content), nil
 		}
 	}
@@ -344,11 +351,14 @@ func (t *GrepTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 		}
 	}
 
-	// Cache the results
+	// Cache the results. Store the REAL match count (matchCount) separately —
+	// cacheMatches also holds context lines, so len(cacheMatches) would
+	// over-report on a later cache hit.
 	if t.cache != nil && cacheKey != "" {
 		t.cache.SetGrep(cacheKey, cache.GrepResult{
-			Matches:   cacheMatches,
-			FileCount: fileCount,
+			Matches:    cacheMatches,
+			MatchCount: matchCount,
+			FileCount:  fileCount,
 		})
 	}
 
