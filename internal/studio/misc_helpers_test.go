@@ -240,7 +240,7 @@ func TestContentSize(t *testing.T) {
 }
 
 // TestDefaultSystemPrompt verifies that defaultSystemPrompt embeds the
-// project name and directory in its output.
+// project name and directory in its output, and contains required sections.
 func TestDefaultSystemPrompt(t *testing.T) {
 	name := "MyAwesomeProject"
 	dir := "/home/user/my-project"
@@ -253,6 +253,15 @@ func TestDefaultSystemPrompt(t *testing.T) {
 	}
 	if !strings.Contains(got, dir) {
 		t.Errorf("defaultSystemPrompt does not contain directory %q", dir)
+	}
+	// todo tool must be mentioned so GLM-5.2 knows to use it for task tracking,
+	// which is what the incomplete-work continuation (iter 1205) relies on.
+	if !strings.Contains(got, "todo") {
+		t.Errorf("defaultSystemPrompt does not mention 'todo' tool — incomplete-work continuation will never trigger")
+	}
+	// "in_progress" rule must be present — key instruction for task tracking discipline.
+	if !strings.Contains(got, "in_progress") {
+		t.Errorf("defaultSystemPrompt does not mention 'in_progress' status discipline")
 	}
 }
 
