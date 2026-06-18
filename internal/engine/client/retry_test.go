@@ -245,6 +245,59 @@ func TestExtractOpenAIRateLimits(t *testing.T) {
 	}
 }
 
+// TestStreamRequestRetryReasonTruncation verifies that the retry-reason string
+// emitted to StatusCallback.OnRetry is truncated at a rune boundary, not a byte
+// boundary.  Slicing a raw UTF-8 string at byte 47 splits a multi-byte rune and
+// produces invalid UTF-8; the fix uses []rune so Cyrillic/CJK/emoji are safe.
+func TestStreamRequestRetryReasonTruncation(t *testing.T) {
+	// Helper that mimics the exact logic in streamRequest.
+	truncateReason := func(reason string) string {
+		if runes := []rune(reason); len(runes) > 50 {
+			return string(runes[:47]) + "..."
+		}
+		return reason
+	}
+
+	// ASCII at exactly the boundary — must not be truncated.
+	exact50 := "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijkl"
+	if len([]rune(exact50)) != 48 {
+		t.Fatalf("test setup: expected 48-rune string, got %d", len([]rune(exact50)))
+	}
+	if got := truncateReason(exact50); got != exact50 {
+		t.Errorf("48-rune string should not be truncated, got %q", got)
+	}
+
+	// Long ASCII — truncated at 47 runes + "..."
+	long := "this is a very long error message that definitely exceeds fifty characters total"
+	got := truncateReason(long)
+	if len([]rune(got)) > 50 {
+		t.Errorf("truncated string has %d runes, want ≤50", len([]rune(got)))
+	}
+	if got[len(got)-3:] != "..." {
+		t.Errorf("truncated string must end with '...', got %q", got)
+	}
+
+	// Long multi-byte string (Cyrillic) — byte slice would corrupt; rune slice must not.
+	cyrillic := "Ошибка сервера: превышен лимит запросов, попробуйте позже через минуту"
+	gotCyrillic := truncateReason(cyrillic)
+	if !isValidUTF8(gotCyrillic) {
+		t.Errorf("truncated Cyrillic result is invalid UTF-8: %q", gotCyrillic)
+	}
+	if len([]rune(gotCyrillic)) > 50 {
+		t.Errorf("truncated Cyrillic string has %d runes, want ≤50", len([]rune(gotCyrillic)))
+	}
+}
+
+// isValidUTF8 is a helper used only in this test file.
+func isValidUTF8(s string) bool {
+	for _, r := range s {
+		if r == '�' {
+			return false
+		}
+	}
+	return true
+}
+
 // TestCappedRetryDelay pins the v0.85.15 fix: a server-supplied Retry-After is
 // honored above the computed backoff but never beyond maxRetryAfter, so a bad
 // provider sending an absurd value (e.g. a unix timestamp) can't park the

@@ -703,7 +703,8 @@ func calculateBackoffWithJitter(baseDelay time.Duration, attempt int, maxDelay t
 func (c *AnthropicClient) streamRequest(ctx context.Context, requestBody map[string]interface{}) (*StreamingResponse, error) {
 	var lastErr error
 	var lastStatusCode int
-	maxDelay := 30 * time.Second // Cap maximum delay at 30 seconds
+	maxDelay := 30 * time.Second     // Cap maximum delay at 30 seconds
+	maxRetryAfter := 2 * time.Minute // Cap server-supplied Retry-After (guards against unix-timestamp mistakes)
 
 	c.mu.RLock()
 	rateLimiter := c.rateLimiter
@@ -730,10 +731,11 @@ func (c *AnthropicClient) streamRequest(ctx context.Context, requestBody map[str
 			// Exponential backoff with jitter
 			delay := calculateBackoffWithJitter(c.config.RetryDelay, attempt-1, maxDelay)
 
-			// Respect Retry-After header from server (typically on 429)
+			// Respect Retry-After header from server (typically on 429),
+			// but cap it to prevent a misbehaving provider from parking us indefinitely.
 			var httpErr *HTTPError
-			if errors.As(lastErr, &httpErr) && httpErr.RetryAfter > 0 && httpErr.RetryAfter > delay {
-				delay = httpErr.RetryAfter
+			if errors.As(lastErr, &httpErr) {
+				delay = cappedRetryDelay(delay, httpErr.RetryAfter, maxRetryAfter)
 			}
 
 			logging.Debug("retrying request", "attempt", attempt, "delay", delay, "last_status", lastStatusCode)
@@ -753,8 +755,8 @@ func (c *AnthropicClient) streamRequest(ctx context.Context, requestBody map[str
 						reason = "connection error"
 					} else if strings.Contains(reason, "timeout") || strings.Contains(reason, "deadline exceeded") {
 						reason = "timeout"
-					} else if len(reason) > 50 {
-						reason = reason[:47] + "..."
+					} else if runes := []rune(reason); len(runes) > 50 {
+						reason = string(runes[:47]) + "..."
 					}
 				}
 				cb.OnRetry(attempt, c.config.MaxRetries, delay, reason)
