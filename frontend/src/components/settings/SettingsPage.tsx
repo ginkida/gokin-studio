@@ -1233,6 +1233,7 @@ export function SettingsPage() {
               <span className="shortcut-key">Ctrl+2</span><span>Files</span>
               <span className="shortcut-key">Ctrl+3</span><span>Settings</span>
               <span className="shortcut-key">Ctrl+B</span><span>Toggle sidebar</span>
+              <span className="shortcut-key">Ctrl+J</span><span>Toggle context panel</span>
               <span className="shortcut-key">Enter</span><span>Send message</span>
               <span className="shortcut-key">Shift+Enter</span><span>New line</span>
               <span className="shortcut-key">Ctrl+L</span><span>Clear chat</span>

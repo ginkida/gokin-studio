@@ -8,8 +8,8 @@ import { useProjectStore, type ProjectInfo } from '../../stores/projectStore'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { DispatchModal } from '../dispatch/DispatchModal'
 import { FilePicker } from '../files/FilePicker'
-import { Send, Square, ChevronRight, CheckCircle, XCircle, Trash2, ArrowRightLeft, AlertTriangle, Brain, ExternalLink, ListChecks, Circle, Database, FileText, Download, Search, X, MessageSquare, Zap, Bot, User, Terminal, TerminalSquare, Pencil, Eye, EyeOff, GitBranch, FolderSearch, Loader2, Copy, Check, MoreHorizontal, RotateCcw, FolderTree, Pin, GitFork, Bookmark, BookmarkPlus, BookmarkMinus, Activity, DollarSign } from 'lucide-react'
-import { SendMessage, StopGeneration, ClearHistory, GetHistory, SetProjectSystemPrompt, ExportChat, ListDirectory, EditUserMessage, ReadFileContent, GetRecoveryEvents, DiscardRecoveryEvents, AnswerQuestion, CancelQuestion, ListProjectMemory, DeleteMemoryEntry, ClearPinnedContext, SearchProjectHistory, SaveDraft, GetDraft, ForkChatSession, PinMessage, UnpinMessage, ListPinnedMessages, ListPromptTemplates, SaveUserPromptTemplate, DeleteUserPromptTemplate, ListUserPromptTemplates, GetProjectGitContext, ProjectUsageStats, ExportProjectAllSessions, SummarizeSession, SetProjectBudget, SetProjectEnforceBudget, SetProjectProvider, GetProject, ListUserSnippets, ListChatSessions, DeleteChatSession, ListProjectFiles, ExportSessionJSON, ImportSessionJSON, ExportProjectUsageCSV, GetModelPricing } from '../../../wailsjs/go/studio/Studio'
+import { Send, Square, ChevronRight, ChevronDown, CheckCircle, XCircle, Trash2, ArrowRightLeft, AlertTriangle, Brain, ExternalLink, ListChecks, Circle, Database, FileText, Download, Search, X, MessageSquare, Zap, Bot, User, Terminal, TerminalSquare, Pencil, Eye, EyeOff, GitBranch, FolderSearch, Loader2, Copy, Check, MoreHorizontal, RotateCcw, FolderTree, Pin, GitFork, Bookmark, BookmarkPlus, BookmarkMinus, Activity, DollarSign, ShieldCheck, ShieldOff } from 'lucide-react'
+import { SendMessage, StopGeneration, ClearHistory, GetHistory, SetProjectSystemPrompt, ExportChat, ListDirectory, EditUserMessage, ReadFileContent, GetRecoveryEvents, DiscardRecoveryEvents, AnswerQuestion, CancelQuestion, ListProjectMemory, DeleteMemoryEntry, ClearPinnedContext, SearchProjectHistory, SaveDraft, GetDraft, ForkChatSession, PinMessage, UnpinMessage, ListPinnedMessages, ListPromptTemplates, SaveUserPromptTemplate, DeleteUserPromptTemplate, ListUserPromptTemplates, GetProjectGitContext, ProjectUsageStats, ExportProjectAllSessions, SummarizeSession, SetProjectBudget, SetProjectEnforceBudget, SetProjectProvider, GetProject, ListUserSnippets, ListChatSessions, DeleteChatSession, ListProjectFiles, ExportSessionJSON, ImportSessionJSON, ExportProjectUsageCSV, GetModelPricing, SetProjectThinking, SetProjectPermissionMode } from '../../../wailsjs/go/studio/Studio'
 import { ClipboardSetText, EventsOn } from '../../../wailsjs/runtime/runtime'
 import { isProjectMuted } from '../../lib/mutedProjects'
 
@@ -161,6 +161,7 @@ function ChatPanelBody({
   // listing every provider×model combo. Search filters; ↑↓ navigates;
   // Enter applies. Faster than clicking through ProviderSelect popup.
   const [showModelSwitcher, setShowModelSwitcher] = useState(false)
+  const [effortOpen, setEffortOpen] = useState(false)
   const [modelSwitcherQuery, setModelSwitcherQuery] = useState('')
   const [modelSwitcherIdx, setModelSwitcherIdx] = useState(0)
   const [modelSwitcherSaving, setModelSwitcherSaving] = useState(false)
@@ -866,7 +867,7 @@ function ChatPanelBody({
   useEffect(() => {
     if (!activeProject) { setInputRateUSDPerMTok(0); return }
     let cancelled = false
-    GetModelPricing(activeProject.provider || 'glm', activeProject.model || 'glm-5.1')
+    GetModelPricing(activeProject.provider || 'glm', activeProject.model || 'glm-5.2')
       .then((p: any) => {
         if (cancelled) return
         setInputRateUSDPerMTok(p?.InputPerMTok || 0)
@@ -1976,7 +1977,7 @@ function ChatPanelBody({
               })()}
             </span>
           ) : (
-            <span className="chat-model">{activeProject.model || 'glm-5.1'}</span>
+            <span className="chat-model">{activeProject.model || 'glm-5.2'}</span>
           )}
         </div>
       </div>
@@ -2564,6 +2565,7 @@ function ChatPanelBody({
             { left: 'Ctrl+1 / Ctrl+2 / Ctrl+3', right: 'Switch to Chat / Files / Settings' },
             { left: 'Alt+1 … Alt+9', right: 'Jump directly to session N in the tab order' },
             { left: 'Ctrl+B', right: 'Toggle sidebar' },
+            { left: 'Ctrl+J', right: 'Toggle context panel (Git / Goal / Progress)' },
             { left: 'Ctrl+K', right: 'Command palette' },
             { left: 'Ctrl+P', right: 'Browse project files' },
             { left: 'Ctrl+`', right: 'Toggle integrated terminal' },
@@ -3811,33 +3813,120 @@ function ChatPanelBody({
           )}
         </div>
         <div className="chat-input-footer">
+          <div className="input-bar-controls">
+            {/* Model chip — opens the Ctrl+M quick-switcher. */}
+            <button
+              className="input-bar-chip"
+              onClick={() => setShowModelSwitcher(true)}
+              title="Switch model (Ctrl+M)"
+            >
+              <Bot size={12} />
+              <span className="ibc-label">{activeProject.model || 'glm-5.2'}</span>
+              <ChevronDown size={11} className="ibc-caret" />
+            </button>
+
+            {/* Effort selector — maps onto per-project thinking mode + budget. */}
+            <div className="effort-selector">
+              {(() => {
+                const curKey = effortKeyFor(activeProject.thinkingMode, activeProject.thinkingBudget)
+                const curLabel = EFFORTS.find((e) => e.key === curKey)?.label || 'Auto'
+                return (
+                  <>
+                    <button
+                      className={`input-bar-chip ${effortOpen ? 'is-open' : ''}`}
+                      onClick={() => setEffortOpen((o) => !o)}
+                      title="Reasoning effort (extended thinking)"
+                    >
+                      <Brain size={12} />
+                      <span className="ibc-label">{curLabel}</span>
+                      <ChevronDown size={11} className="ibc-caret" />
+                    </button>
+                    {effortOpen && (
+                      <>
+                        <div className="effort-backdrop" onClick={() => setEffortOpen(false)} />
+                        <div className="effort-menu" role="menu">
+                          {EFFORTS.map((o) => (
+                            <button
+                              key={o.key}
+                              className={`effort-opt ${o.key === curKey ? 'active' : ''}`}
+                              onClick={() => {
+                                setEffortOpen(false)
+                                if (!activeProjectId) return
+                                const pm = activeProject.thinkingMode
+                                const pb = activeProject.thinkingBudget
+                                updateProject(activeProjectId, { thinkingMode: o.mode, thinkingBudget: o.budget })
+                                SetProjectThinking(activeProjectId, o.mode, o.budget).catch(() => {
+                                  updateProject(activeProjectId, { thinkingMode: pm, thinkingBudget: pb })
+                                })
+                              }}
+                            >
+                              <span className="effort-opt-label">{o.label}</span>
+                              {o.key === curKey && <Check size={12} />}
+                            </button>
+                          ))}
+                        </div>
+                      </>
+                    )}
+                  </>
+                )
+              })()}
+            </div>
+
+            {/* Ask-before-changes toggle (soft permission mode). */}
+            {(() => {
+              const ask = activeProject.permissionMode === 'ask'
+              return (
+                <button
+                  className={`input-bar-chip ${ask ? 'perm-ask' : ''}`}
+                  onClick={() => {
+                    if (!activeProjectId) return
+                    const next = ask ? '' : 'ask'
+                    const prev = activeProject.permissionMode
+                    updateProject(activeProjectId, { permissionMode: next })
+                    SetProjectPermissionMode(activeProjectId, next || 'auto').catch(() => {
+                      updateProject(activeProjectId, { permissionMode: prev })
+                    })
+                  }}
+                  title={ask
+                    ? 'Ask before changes: the agent confirms via ask_user before file/git/destructive changes. Click to allow automatically.'
+                    : 'Auto: the agent proceeds without asking. Click to require confirmation before changes.'}
+                >
+                  {ask ? <ShieldCheck size={12} /> : <ShieldOff size={12} />}
+                  <span className="ibc-label">{ask ? 'Ask first' : 'Auto'}</span>
+                </button>
+              )
+            })()}
+          </div>
+
           {/* iter 1050+: cost preview alongside chars/tokens. tokens × inputRate
               gives an UPPER BOUND on what this user message ALONE will cost
               (ignoring the existing history, which the model also reprocesses
               every turn). It's a "minimum spend for this send"; the real
               billed cost will be higher once history tokens are added. The
               "≈" prefix and "input only" tooltip make this explicit. */}
-          {(() => {
-            if (input.length === 0) {
-              return <span className="chat-char-count"></span>
-            }
-            const tokens = Math.ceil(input.length / 4)
-            const cost = inputRateUSDPerMTok > 0 ? (tokens / 1_000_000) * inputRateUSDPerMTok : 0
-            return (
-              <span className="chat-char-count">
-                {input.length.toLocaleString()} chars · ~{tokens.toLocaleString()} tokens
-                {cost > 0 && (
-                  <span
-                    className="chat-cost-preview"
-                    title="Lower-bound cost for this message alone — actual cost adds history tokens reprocessed each turn"
-                  >
-                    {' · '}≈{formatCostUSD(cost)} input
-                  </span>
-                )}
-              </span>
-            )
-          })()}
-          <span className="chat-send-hint">Enter to send · Shift+Enter for new line</span>
+          <div className="input-bar-meta">
+            {(() => {
+              if (input.length === 0) {
+                return <span className="chat-char-count"></span>
+              }
+              const tokens = Math.ceil(input.length / 4)
+              const cost = inputRateUSDPerMTok > 0 ? (tokens / 1_000_000) * inputRateUSDPerMTok : 0
+              return (
+                <span className="chat-char-count">
+                  {input.length.toLocaleString()} chars · ~{tokens.toLocaleString()} tokens
+                  {cost > 0 && (
+                    <span
+                      className="chat-cost-preview"
+                      title="Lower-bound cost for this message alone — actual cost adds history tokens reprocessed each turn"
+                    >
+                      {' · '}≈{formatCostUSD(cost)} input
+                    </span>
+                  )}
+                </span>
+              )
+            })()}
+            <span className="chat-send-hint">Enter to send · Shift+Enter for new line</span>
+          </div>
         </div>
       </div>
 
@@ -4183,6 +4272,22 @@ function userIndexForMessage(list: ChatMessage[], id: string): number {
 // the agent can still see the reference; successful reads get the content
 // inlined with the file name as a header.
 const EXPAND_FILE_MAX_BYTES = 50_000 // 50 KB per @-file attachment
+
+// Reasoning-effort presets for the input-bar selector, mapped onto the
+// per-project thinking config (mode + budget). "Auto" lets the provider
+// default decide (Kimi / DeepSeek-v4-pro on; others off).
+const EFFORTS: { key: string; label: string; mode: string; budget: number }[] = [
+  { key: 'auto', label: 'Auto', mode: '', budget: 0 },
+  { key: 'off', label: 'Off', mode: 'disabled', budget: 0 },
+  { key: 'standard', label: 'Standard', mode: 'enabled', budget: 4096 },
+  { key: 'max', label: 'Max', mode: 'enabled', budget: 16000 },
+]
+
+function effortKeyFor(mode?: string, budget?: number): string {
+  if (mode === 'disabled') return 'off'
+  if (mode === 'enabled') return (budget || 0) >= 12000 ? 'max' : 'standard'
+  return 'auto'
+}
 
 async function expandFileRefs(message: string, projectId: string): Promise<string> {
   // Match tokens starting with @ followed by a path-ish character sequence.

@@ -3517,11 +3517,84 @@
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 6px 4px 0;
-  height: 22px;
+  gap: 10px;
+  padding: 7px 4px 0;
+  min-height: 28px;
   font-size: 10px;
   color: var(--text-muted);
 }
+.input-bar-controls { display: flex; align-items: center; gap: 6px; }
+.input-bar-meta { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.input-bar-meta .chat-char-count { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.input-bar-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 4px 8px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-family: inherit;
+  line-height: 1;
+}
+.input-bar-chip:hover,
+.input-bar-chip.is-open {
+  color: var(--text-primary);
+  border-color: var(--accent);
+  background: var(--accent-subtle);
+}
+.input-bar-chip .ibc-label { font-weight: 500; }
+.input-bar-chip .ibc-caret { opacity: 0.6; }
+.input-bar-chip.perm-ask {
+  color: #d9a13a;
+  border-color: rgba(217, 161, 58, 0.5);
+  background: rgba(217, 161, 58, 0.12);
+}
+.input-bar-chip.perm-ask:hover {
+  color: #d9a13a;
+  border-color: rgba(217, 161, 58, 0.75);
+  background: rgba(217, 161, 58, 0.2);
+}
+
+.effort-selector { position: relative; }
+.effort-backdrop { position: fixed; inset: 0; z-index: 40; }
+.effort-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 41;
+  min-width: 144px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.4);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.effort-opt {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 9px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-family: inherit;
+  text-align: left;
+}
+.effort-opt:hover { background: var(--accent-subtle); color: var(--text-primary); }
+.effort-opt.active { color: var(--accent); }
+.effort-opt .effort-opt-label { font-weight: 500; }
 
 .chat-char-count { font-family: 'Geist Mono', 'SF Mono', monospace; }
 .chat-send-hint { opacity: 0.7; }
@@ -8318,4 +8391,263 @@
 
 .logs-filter-row-source .logs-filter.active {
   opacity: 1;
+}
+
+/* ============================================================
+   Right-hand context panel (Git tools / Goal / Progress)
+   ============================================================ */
+.chat-with-context {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.context-panel {
+  width: 304px;
+  flex-shrink: 0;
+  border-left: 1px solid var(--border);
+  background: var(--bg-panel);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.context-panel.is-collapsed {
+  width: 40px;
+  align-items: center;
+  padding-top: 10px;
+}
+
+.context-rail-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 6px;
+  border-radius: 6px;
+  display: flex;
+}
+.context-rail-btn:hover { color: var(--accent); background: var(--accent-subtle); }
+.context-rail-btn { position: relative; }
+.context-rail-dot {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px var(--bg-panel);
+}
+
+.context-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-subtle);
+  position: sticky;
+  top: 0;
+  background: var(--bg-panel);
+  z-index: 1;
+}
+.context-head-title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+.context-head-actions { display: flex; gap: 2px; }
+.context-head-actions button {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 5px;
+  display: flex;
+}
+.context-head-actions button:hover:not(:disabled) { color: var(--accent); background: var(--accent-subtle); }
+.context-head-actions button:disabled { opacity: 0.5; cursor: default; }
+
+.context-section { padding: 12px 14px; border-bottom: 1px solid var(--border-subtle); }
+.context-section-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin-bottom: 9px;
+}
+.context-section-head svg { opacity: 0.8; }
+
+.context-empty {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+/* Git tools */
+.context-git { display: flex; flex-direction: column; gap: 7px; }
+.context-git-branch {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12.5px;
+  color: var(--text-primary);
+  font-weight: 500;
+}
+.cg-branch-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cg-aheadbehind {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: var(--font-mono, monospace);
+  margin-left: auto;
+}
+.context-git-stat {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-family: var(--font-mono, monospace);
+}
+.cg-changes { color: var(--text-muted); }
+.cg-add { color: var(--success); font-weight: 600; }
+.cg-del { color: var(--error); font-weight: 600; }
+.context-git-clean {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.context-git-files {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.context-git-files li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-family: var(--font-mono, monospace);
+  color: var(--text-secondary);
+  overflow: hidden;
+}
+.cg-fstat { font-weight: 700; flex-shrink: 0; width: 12px; text-align: center; }
+.cg-fs-modified { color: #d9a13a; }
+.cg-fs-added { color: var(--success); }
+.cg-fs-deleted { color: var(--error); }
+.cg-fs-renamed { color: var(--accent); }
+.cg-fs-untracked { color: #818cf8; }
+.cg-fpath { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cg-more { color: var(--text-muted); font-style: italic; }
+
+/* Goal */
+.context-goal-badge {
+  margin-left: auto;
+  font-size: 9.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 7px;
+  border-radius: 999px;
+}
+.gb-completed { color: var(--success); background: var(--success-subtle); }
+.gb-failed { color: var(--error); background: var(--error-subtle); }
+.gb-in_progress { color: var(--accent); background: var(--accent-subtle); }
+.context-goal-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 1.35;
+}
+.context-goal-meta { font-size: 11.5px; color: var(--text-muted); margin-top: 4px; }
+
+/* Progress */
+.context-progress { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 7px; }
+.cp-step { display: flex; align-items: flex-start; gap: 7px; font-size: 12.5px; line-height: 1.35; }
+.cp-step-title { color: var(--text-secondary); }
+.cp-step svg { flex-shrink: 0; margin-top: 1px; }
+.cp-completed .cp-step-title { color: var(--text-muted); text-decoration: line-through; }
+.cp-in_progress .cp-step-title { color: var(--text-primary); font-weight: 500; }
+.cp-failed .cp-step-title { color: var(--error); }
+.cp-ic-done { color: var(--success); }
+.cp-ic-active { color: var(--accent); }
+.cp-ic-fail { color: var(--error); }
+.cp-ic-skip { color: var(--text-muted); }
+.cp-ic-pending { color: var(--text-muted); opacity: 0.55; }
+
+/* Commit composer (Git tools) */
+.context-git-untracked { font-size: 11.5px; color: var(--text-muted); }
+.context-commit-btn {
+  margin-top: 3px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  justify-content: center;
+  background: var(--accent-subtle);
+  color: var(--accent);
+  border: 1px solid var(--accent-muted);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.context-commit-btn:hover { background: var(--accent-muted); }
+
+.commit-composer { display: flex; flex-direction: column; gap: 6px; margin-top: 3px; }
+.commit-msg {
+  width: 100%;
+  resize: vertical;
+  min-height: 42px;
+  background: var(--bg-deepest);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 12px;
+  padding: 7px 8px;
+  box-sizing: border-box;
+}
+.commit-msg:focus { outline: none; border-color: var(--accent); box-shadow: var(--shadow-glow); }
+.commit-error { font-size: 11.5px; color: var(--error); background: var(--error-subtle); padding: 5px 7px; border-radius: 5px; word-break: break-word; }
+.commit-actions { display: flex; gap: 6px; justify-content: flex-end; }
+.commit-actions button {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  border-radius: 6px;
+  padding: 5px 11px;
+  font-size: 12px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+}
+.commit-cancel { background: transparent; color: var(--text-secondary); }
+.commit-cancel:hover:not(:disabled) { color: var(--text-primary); border-color: var(--text-muted); }
+.commit-go { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 500; }
+.commit-go:hover:not(:disabled) { background: var(--accent-hover); }
+.commit-actions button:disabled { opacity: 0.55; cursor: default; }
+.commit-ok {
+  margin-top: 4px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  color: var(--success);
+  background: var(--success-subtle);
+  padding: 4px 8px;
+  border-radius: 5px;
 }

@@ -113,8 +113,8 @@ export function OnboardingWizard({ onComplete, onSkip }: Props) {
     setKeySaving(true)
     try {
       const updates: any = { ...settings, defaultProvider: provider }
-      if (provider === 'glm') { updates.glmKey = apiKey.trim(); updates.defaultModel = 'glm-5.1' }
-      if (provider === 'minimax') { updates.minimaxKey = apiKey.trim(); updates.defaultModel = 'minimax-text-01' }
+      if (provider === 'glm') { updates.glmKey = apiKey.trim(); updates.defaultModel = 'glm-5.2' }
+      if (provider === 'minimax') { updates.minimaxKey = apiKey.trim(); updates.defaultModel = 'MiniMax-M2.7' }
       if (provider === 'kimi') { updates.kimiKey = apiKey.trim(); updates.defaultModel = 'kimi-for-coding' }
       if (provider === 'deepseek') { updates.deepseekKey = apiKey.trim(); updates.defaultModel = 'deepseek-v4-pro' }
       if (provider === 'ollama') { updates.ollamaUrl = ollamaUrl.trim() || 'http://localhost:11434'; updates.defaultModel = 'llama3.1' }

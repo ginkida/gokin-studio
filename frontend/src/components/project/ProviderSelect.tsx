@@ -17,7 +17,7 @@ interface ProviderSelectProps {
 export function ProviderSelect({ projectId, currentProvider, currentModel, currentTemperature, currentMaxTokens, currentThinkingMode, currentThinkingBudget }: ProviderSelectProps) {
   const [open, setOpen] = useState(false)
   const [provider, setProvider] = useState(currentProvider || 'glm')
-  const [model, setModel] = useState(currentModel || 'glm-5.1')
+  const [model, setModel] = useState(currentModel || 'glm-5.2')
   const [temperature, setTemperature] = useState(currentTemperature || 0)
   const [maxTokens, setMaxTokens] = useState(currentMaxTokens || 0)
   const [thinkingMode, setThinkingMode] = useState(currentThinkingMode || '')
@@ -32,7 +32,7 @@ export function ProviderSelect({ projectId, currentProvider, currentModel, curre
   // Sync props to state when project data changes externally.
   useEffect(() => {
     setProvider(currentProvider || 'glm')
-    setModel(currentModel || 'glm-5.1')
+    setModel(currentModel || 'glm-5.2')
     setTemperature(currentTemperature || 0)
     setMaxTokens(currentMaxTokens || 0)
     setThinkingMode(currentThinkingMode || '')
@@ -98,7 +98,7 @@ export function ProviderSelect({ projectId, currentProvider, currentModel, curre
 
   const handleCancel = () => {
     setProvider(currentProvider || 'glm')
-    setModel(currentModel || 'glm-5.1')
+    setModel(currentModel || 'glm-5.2')
     setTemperature(currentTemperature || 0)
     setMaxTokens(currentMaxTokens || 0)
     setThinkingMode(currentThinkingMode || '')

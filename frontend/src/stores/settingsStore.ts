@@ -34,7 +34,7 @@ export const useSettingsStore = create<SettingsStore>((set) => ({
   settings: {
     theme: 'dark',
     defaultProvider: 'glm',
-    defaultModel: 'glm-5.1',
+    defaultModel: 'glm-5.2',
     glmKey: '',
     minimaxKey: '',
     kimiKey: '',

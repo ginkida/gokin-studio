@@ -554,7 +554,7 @@ export function Sidebar({ onOpenSettings, onToggleCollapse, collapsed }: Sidebar
                 <ProviderSelect
                   projectId={p.id}
                   currentProvider={p.provider || 'glm'}
-                  currentModel={p.model || 'glm-5.1'}
+                  currentModel={p.model || 'glm-5.2'}
                   currentTemperature={p.temperature}
                   currentMaxTokens={p.maxTokens}
                   currentThinkingMode={p.thinkingMode}

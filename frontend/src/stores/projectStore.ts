@@ -15,6 +15,7 @@ export interface ProjectInfo {
   maxTokens?: number
   thinkingMode?: string  // "" | "enabled" | "disabled"
   thinkingBudget?: number
+  permissionMode?: string  // "" | "auto" | "ask"
   budgetUSD?: number
   enforceBudget?: boolean
   pinned?: boolean

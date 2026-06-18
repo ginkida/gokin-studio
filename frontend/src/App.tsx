@@ -3,6 +3,7 @@ import { Sidebar } from './components/layout/Sidebar'
 import { ChatPanel } from './components/chat/ChatPanel'
 import { StatusBar } from './components/layout/StatusBar'
 import { ToastStack } from './components/layout/ToastStack'
+import { ContextPanel } from './components/layout/ContextPanel'
 import { ErrorBoundary, installGlobalErrorHandlers } from './components/layout/ErrorBoundary'
 import { OnboardingWizard, shouldShowOnboarding } from './components/onboarding/OnboardingWizard'
 import { SettingsPage } from './components/settings/SettingsPage'
@@ -247,7 +248,7 @@ function AppContent() {
           setSettings({
             theme: s.theme || 'dark',
             defaultProvider: s.defaultProvider || 'glm',
-            defaultModel: s.defaultModel || 'glm-5.1',
+            defaultModel: s.defaultModel || 'glm-5.2',
             glmKey: s.glmKey || '',
             minimaxKey: s.minimaxKey || '',
             kimiKey: s.kimiKey || '',
@@ -612,7 +613,12 @@ function AppContent() {
         <div className="content-area">
           {view === 'settings' ? <SettingsPage />
             : view === 'files' ? <FileBrowser />
-            : <ChatPanel sessionId={view} sessionName={sessions.find((s) => s.id === view)?.name} />}
+            : (
+              <div className="chat-with-context">
+                <ChatPanel sessionId={view} sessionName={sessions.find((s) => s.id === view)?.name} />
+                {activeProjectId && <ContextPanel projectId={activeProjectId} />}
+              </div>
+            )}
         </div>
       </div>
       <StatusBar />
