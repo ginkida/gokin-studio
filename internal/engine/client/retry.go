@@ -208,21 +208,53 @@ func AdaptiveStreamRetryPolicy(provider string) StreamRetryPolicy {
 		base.MaxDelay = 60 * time.Second
 	}
 
+	// Kimi's Coding Plan endpoint is prone to long silent reasoning/tool phases.
+	// Give healthy/new Kimi sessions one extra cold retry and one extra partial
+	// retry so transient stream stalls don't surface to the user immediately.
+	if strings.EqualFold(strings.TrimSpace(provider), "kimi") && h.Score >= 0 {
+		if base.MaxRetries < 3 {
+			base.MaxRetries = 3
+		}
+		if base.MaxPartialRetries < 2 {
+			base.MaxPartialRetries = 2
+		}
+		if h.Score < 5 {
+			if base.BaseDelay < 3*time.Second {
+				base.BaseDelay = 3 * time.Second
+			}
+			if base.MaxDelay < 45*time.Second {
+				base.MaxDelay = 45 * time.Second
+			}
+		}
+	}
+
 	return base
 }
 
 // CalculateBackoff calculates exponential backoff with jitter.
 // This prevents thundering herd problem when many clients retry simultaneously.
 func CalculateBackoff(baseDelay time.Duration, attempt int, maxDelay time.Duration) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	const maxShift = 20 // 2^20 × any sane baseDelay already dwarfs maxDelay
+	if attempt > maxShift {
+		attempt = maxShift
+	}
+
 	// Exponential backoff: baseDelay * 2^attempt
 	delay := baseDelay * time.Duration(1<<uint(attempt))
-	if delay > maxDelay {
+	if delay <= 0 || delay > maxDelay { // <= 0 catches overflow / zero baseDelay
 		delay = maxDelay
 	}
 
-	// Add jitter: random value between 0 and 25% of delay
-	jitter := time.Duration(rand.Int63n(int64(delay / 4)))
-	return delay + jitter
+	// Add jitter: random value between 0 and 25% of delay. rand.Int63n panics on
+	// n <= 0, so skip jitter when the quarter rounds to zero (sub-4ns or a
+	// degenerate maxDelay).
+	if quarter := int64(delay / 4); quarter > 0 {
+		delay += time.Duration(rand.Int63n(quarter))
+	}
+	return delay
 }
 
 // ParseRetryAfter extracts Retry-After duration from an HTTP response.
@@ -370,4 +402,17 @@ func extractGeminiRateLimits(resp *http.Response) *RateLimitMetadata {
 	}
 
 	return metadata
+}
+
+// cappedRetryDelay returns the delay to use given a computed backoff, a
+// server-supplied Retry-After hint, and a maximum allowed Retry-After value.
+//
+// If the hint is positive and greater than the backoff, the hint is used but
+// capped at maxRetryAfter.  This prevents a misbehaving provider from parking
+// the client by sending an absurd value (e.g. a unix timestamp).
+func cappedRetryDelay(backoff, retryAfter, maxRetryAfter time.Duration) time.Duration {
+	if retryAfter > backoff {
+		return min(retryAfter, maxRetryAfter)
+	}
+	return backoff
 }

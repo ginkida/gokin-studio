@@ -43,6 +43,66 @@ func poolKey(provider, model string) string {
 	return fmt.Sprintf("%s:%s", provider, model)
 }
 
+// parsePoolKey reverses poolKey: splits "provider:model" into its components.
+func parsePoolKey(key string) (provider, model string, ok bool) {
+	for i := 0; i < len(key); i++ {
+		if key[i] == ':' {
+			return key[:i], key[i+1:], true
+		}
+	}
+	return "", "", false
+}
+
+// Invalidate removes (and closes) the pooled client for the given provider
+// and model. No-op if absent or pool is closed.
+//
+// Must be called whenever inputs that change how a client is built (API key,
+// base URL, thinking budget) mutate so the next Get builds a fresh client.
+func (p *ClientPool) Invalidate(provider, model string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.closed {
+		return
+	}
+
+	key := poolKey(provider, model)
+	if c, ok := p.clients[key]; ok {
+		_ = c.Close()
+		delete(p.clients, key)
+		delete(p.lastUsed, key)
+		logging.Debug("pool entry invalidated",
+			"provider", provider,
+			"model", model)
+	}
+}
+
+// FlushProvider removes (and closes) all pooled clients for the given provider.
+// Useful when a provider's API key or base URL changes.
+func (p *ClientPool) FlushProvider(provider string) {
+	if p == nil {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.closed {
+		return
+	}
+
+	for key, c := range p.clients {
+		if keyProvider, _, ok := parsePoolKey(key); ok && keyProvider == provider {
+			_ = c.Close()
+			delete(p.clients, key)
+			delete(p.lastUsed, key)
+			logging.Debug("pool entry flushed by provider",
+				"provider", provider,
+				"key", key)
+		}
+	}
+}
+
 // Get retrieves a client from the pool for the given provider and model.
 // Returns the client and true if found, or nil and false if not pooled.
 func (p *ClientPool) Get(provider, model string) (Client, bool) {

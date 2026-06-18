@@ -269,15 +269,31 @@ func (c *AnthropicClient) SetSystemInstruction(instruction string) {
 	c.systemInstruction = instruction
 }
 
-// supportsPromptCaching returns true if the provider supports Anthropic prompt caching.
-// Currently Anthropic (native) and MiniMax support cache_control; GLM and DeepSeek do not.
+// supportsPromptCaching returns true if the provider supports Anthropic-style
+// prompt caching via cache_control markers.
+//
+// Verified by live request-usage inspection (upstream gokin, April 2026):
+//   - Anthropic native: honours cache_control, reports both
+//     cache_creation_input_tokens and cache_read_input_tokens.
+//   - MiniMax: same as Anthropic.
+//   - Kimi (api.kimi.com/coding): honours cache_control.
+//   - DeepSeek (api.deepseek.com/anthropic): caches automatically on the
+//     server side. cache_control markers are accepted (don't 400) and the
+//     server reports cache_read_input_tokens on repeat prefixes — measured
+//     ~95% input-token reduction on a 1.2K-token prefix on the second call.
+//     cache_creation_input_tokens stays 0 (implicit caching), but read
+//     credits land correctly so token accounting works as intended.
+//   - GLM / Z.AI: cache_control is a silent no-op; skipping keeps the
+//     request body smaller without losing savings.
 func (c *AnthropicClient) supportsPromptCaching() bool {
 	base := c.config.BaseURL
 	if base == DefaultAnthropicBaseURL || base == "" {
 		return true
 	}
-	// MiniMax and Kimi support Anthropic-compatible prompt caching
-	return strings.Contains(base, "minimax") || strings.Contains(base, "moonshot") || strings.Contains(base, "kimi.com")
+	return strings.Contains(base, "minimax") ||
+		strings.Contains(base, "moonshot") ||
+		strings.Contains(base, "kimi.com") ||
+		strings.Contains(base, "api.deepseek.com")
 }
 
 // applyCacheControl injects cache_control markers into the request body
@@ -662,7 +678,7 @@ func (c *AnthropicClient) streamRequest(ctx context.Context, requestBody map[str
 		}
 		if err := rateLimiter.AcquireWithContext(ctx, estimatedTokens); err != nil {
 			if statusCb != nil {
-				statusCb.OnRateLimit(time.Second) 
+				statusCb.OnRateLimit(time.Second)
 			}
 			return nil, fmt.Errorf("rate limit aborted: %w", err)
 		}
@@ -1450,6 +1466,16 @@ func (c *AnthropicClient) convertHistoryToMessagesWithSystem(history []*genai.Co
 		if content.Role == genai.RoleUser {
 			messages = append(messages, c.buildUserMessage(content.Parts))
 		} else if content.Role == genai.RoleModel {
+			// Skip assistant turns that can't be serialised for this provider
+			// (empty/degenerate, or unsigned-thinking for strict providers like
+			// DeepSeek/Anthropic that would 400 on it). The sanitiser cascades
+			// cleanup of any now-unpaired user tool_result turns.
+			if !c.canSerialiseAssistantForProvider(content.Parts) {
+				logging.Warn("skipping unserialisable assistant history item",
+					"parts", len(content.Parts),
+					"thinking_replay_required", c.requiresThinkingReplay())
+				continue
+			}
 			messages = append(messages, c.buildAssistantMessage(content.Parts))
 		}
 	}
@@ -1565,6 +1591,16 @@ func (c *AnthropicClient) convertHistoryWithResultsAndSystem(history []*genai.Co
 		if content.Role == genai.RoleUser {
 			messages = append(messages, c.buildUserMessage(content.Parts))
 		} else if content.Role == genai.RoleModel {
+			// Skip assistant turns that can't be serialised for this provider
+			// (empty/degenerate, or unsigned-thinking for strict providers like
+			// DeepSeek/Anthropic that would 400 on it). The sanitiser cascades
+			// cleanup of any now-unpaired user tool_result turns.
+			if !c.canSerialiseAssistantForProvider(content.Parts) {
+				logging.Warn("skipping unserialisable assistant history item",
+					"parts", len(content.Parts),
+					"thinking_replay_required", c.requiresThinkingReplay())
+				continue
+			}
 			messages = append(messages, c.buildAssistantMessage(content.Parts))
 		}
 	}
@@ -1748,6 +1784,71 @@ func (c *AnthropicClient) buildUserMessage(parts []*genai.Part) map[string]inter
 		"role":    "user",
 		"content": content,
 	}
+}
+
+// requiresThinkingReplay returns true when the provider requires that
+// thinking blocks (with signature) are preserved and replayed in history.
+// DeepSeek and native Anthropic are strict — missing thinking causes 400.
+// Kimi, GLM, MiniMax tolerate missing thinking blocks.
+func (c *AnthropicClient) requiresThinkingReplay() bool {
+	if !c.config.EnableThinking {
+		return false
+	}
+	base := c.config.BaseURL
+	if base == DefaultAnthropicBaseURL || base == "" {
+		return true
+	}
+	return strings.Contains(base, "api.deepseek.com")
+}
+
+// hasSerializableAssistantParts reports whether an assistant turn carries any
+// content worth sending: a tool call, plain (non-thought) text, or a SIGNED
+// thought. Empty parts, or parts that are only unsigned thoughts / empty text,
+// are unserialisable — emitting them produces a degenerate assistant message.
+// (Ported from the gokin upstream.)
+func hasSerializableAssistantParts(parts []*genai.Part) bool {
+	for _, part := range parts {
+		if part == nil {
+			continue
+		}
+		if part.FunctionCall != nil {
+			return true
+		}
+		if part.Text == "" {
+			continue
+		}
+		if !part.Thought {
+			return true
+		}
+		if len(part.ThoughtSignature) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// canSerialiseAssistantForProvider returns false when an assistant turn can't be
+// round-tripped to the provider: it has no serialisable content at all, or the
+// provider demands thinking-block replay and the parts contain an unsigned
+// thought (sending it without the signature would 400). Callers drop the whole
+// turn and let the sanitiser cascade the cleanup of any now-unpaired tool
+// results. (Ported from the gokin upstream — was defined here but never wired.)
+func (c *AnthropicClient) canSerialiseAssistantForProvider(parts []*genai.Part) bool {
+	if !hasSerializableAssistantParts(parts) {
+		return false
+	}
+	if !c.requiresThinkingReplay() {
+		return true
+	}
+	for _, part := range parts {
+		if part == nil {
+			continue
+		}
+		if part.Thought && len(part.ThoughtSignature) == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // buildAssistantMessage builds an assistant message from parts.

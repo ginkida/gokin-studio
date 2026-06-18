@@ -287,6 +287,29 @@ func IsRateLimitError(err error) bool {
 
 // IsRetryableError checks if an error is retryable using proper type checks.
 // Uses errors.Is/errors.As for typed errors, with string fallback only for untyped errors.
+// ErrEmptyModelResponse is the sentinel for a model that returned no usable
+// content (no text, tool calls, or thinking). Ported from the gokin upstream:
+// treated as retryable because providers occasionally emit an empty 200 that
+// resolves on retry, which would otherwise end a turn silently.
+var ErrEmptyModelResponse = errors.New("empty model response")
+
+// EmptyModelResponseError wraps ErrEmptyModelResponse with context about where
+// the empty response occurred (after tool results means work may be incomplete).
+type EmptyModelResponseError struct {
+	AfterToolResults bool
+}
+
+func (e *EmptyModelResponseError) Error() string {
+	if e.AfterToolResults {
+		return "model returned an empty response after tool results; work may be incomplete"
+	}
+	return "model returned an empty response"
+}
+
+func (e *EmptyModelResponseError) Unwrap() error {
+	return ErrEmptyModelResponse
+}
+
 func IsRetryableError(err error) bool {
 	if err == nil {
 		return false
@@ -298,6 +321,9 @@ func IsRetryableError(err error) bool {
 	}
 	if errors.Is(err, ErrModelRoundTimeout) {
 		return false
+	}
+	if errors.Is(err, ErrEmptyModelResponse) {
+		return true
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return true

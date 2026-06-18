@@ -62,9 +62,16 @@ var AvailableModels = []ModelInfo{
 	},
 	// GLM models (via Anthropic-compatible API on Z.AI)
 	{
+		ID:          "glm-5.2",
+		Name:        "GLM-5.2",
+		Description: "Most capable GLM model — 1M context, Max tier (Coding Plan)",
+		Provider:    "glm",
+		BaseURL:     DefaultGLMBaseURL,
+	},
+	{
 		ID:          "glm-5.1",
 		Name:        "GLM-5.1",
-		Description: "Most capable GLM model — Max tier (Coding Plan)",
+		Description: "Previous flagship GLM — 200K context (Coding Plan)",
 		Provider:    "glm",
 		BaseURL:     DefaultGLMBaseURL,
 	},
@@ -412,6 +419,9 @@ type Response struct {
 // Collect collects all chunks from a streaming response into a single Response.
 func (sr *StreamingResponse) Collect() (*Response, error) {
 	resp := &Response{}
+	// Track which FunctionCalls already arrived as structured Parts so the
+	// back-fill below doesn't duplicate them.
+	fcInParts := make(map[*genai.FunctionCall]bool)
 
 	for chunk := range sr.Chunks {
 		if chunk.Error != nil {
@@ -422,7 +432,29 @@ func (sr *StreamingResponse) Collect() (*Response, error) {
 		resp.Text += chunk.Text
 		resp.Thinking += chunk.Thinking
 		resp.FunctionCalls = append(resp.FunctionCalls, chunk.FunctionCalls...)
-		resp.Parts = append(resp.Parts, chunk.Parts...)
+
+		// Accumulate original parts first (preserves ThoughtSignature etc.),
+		// tracking the FunctionCalls they already carry.
+		for _, part := range chunk.Parts {
+			if part != nil {
+				resp.Parts = append(resp.Parts, part)
+				if part.FunctionCall != nil {
+					fcInParts[part.FunctionCall] = true
+				}
+			}
+		}
+		// Back-fill Parts from FunctionCalls that weren't already emitted as
+		// structured parts. Anthropic-compatible providers (GLM, MiniMax, Kimi)
+		// stream tool calls as FunctionCall-only, so without this Response.Parts
+		// loses the tool_use entries and SendFunctionResponse can't reconstruct
+		// history — the provider then rejects the follow-up ("tool_use_id not
+		// found"). Mirrors ProcessStream's back-fill (the path the main agent
+		// loop uses); Collect() is used by ask_agent / dispatch / summarizer.
+		for _, fc := range chunk.FunctionCalls {
+			if !fcInParts[fc] {
+				resp.Parts = append(resp.Parts, &genai.Part{FunctionCall: fc})
+			}
+		}
 
 		if chunk.Done {
 			resp.FinishReason = chunk.FinishReason
