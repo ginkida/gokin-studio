@@ -2,6 +2,34 @@ package client
 
 import "testing"
 
+// TestClampThinkingBudgetBelowMax guards the iter-1210 port from gokin.
+// Anthropic/strict-DeepSeek 400 when budget_tokens >= max_tokens.
+// Default budget (8192) == default max_tokens (8192) → must clamp.
+func TestClampThinkingBudgetBelowMax(t *testing.T) {
+	cases := []struct {
+		name      string
+		budget    int32
+		maxTokens int32
+		want      int32
+	}{
+		{"budget < maxTokens → no clamp", 4096, 8192, 4096},
+		{"budget == maxTokens → clamp to maxTokens-1024", 8192, 8192, 7168},
+		{"budget > maxTokens → clamp to maxTokens-1024", 9000, 8192, 7168},
+		{"maxTokens <= 1024 → no clamp (avoid going negative)", 8192, 1024, 8192},
+		{"maxTokens == 0 → no clamp", 8192, 0, 8192},
+		{"budget well under maxTokens → no clamp", 1024, 16384, 1024},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := clampThinkingBudgetBelowMax(tc.budget, tc.maxTokens)
+			if got != tc.want {
+				t.Errorf("clampThinkingBudgetBelowMax(%d, %d) = %d, want %d",
+					tc.budget, tc.maxTokens, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestNormalizeThinkingBudget guards the iter-1201 port from upstream gokin.
 // The function repairs hand-edited config.yaml typos before an API call so
 // providers don't reject the request with a cryptic 400.

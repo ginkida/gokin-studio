@@ -189,7 +189,7 @@ func (c *AnthropicClient) SendMessageWithHistory(ctx context.Context, history []
 	if enableThinking && thinkingBudget > 0 {
 		requestBody["thinking"] = map[string]interface{}{
 			"type":          "enabled",
-			"budget_tokens": thinkingBudget,
+			"budget_tokens": clampThinkingBudgetBelowMax(thinkingBudget, maxTokens),
 		}
 		// Extended thinking requires temperature=1 (Anthropic requirement)
 		requestBody["temperature"] = 1.0
@@ -247,7 +247,7 @@ func (c *AnthropicClient) SendFunctionResponse(ctx context.Context, history []*g
 	if enableThinking && thinkingBudget > 0 {
 		requestBody["thinking"] = map[string]interface{}{
 			"type":          "enabled",
-			"budget_tokens": thinkingBudget,
+			"budget_tokens": clampThinkingBudgetBelowMax(thinkingBudget, maxTokens),
 		}
 		requestBody["temperature"] = 1.0
 	} else if temperature > 0 {
@@ -357,6 +357,20 @@ func (c *AnthropicClient) applyCacheControl(requestBody map[string]interface{}) 
 			}
 		}
 	}
+}
+
+// clampThinkingBudgetBelowMax keeps budget_tokens strictly below max_tokens.
+// Anthropic-compatible providers (and strict DeepSeek) return 400 when
+// budget_tokens >= max_tokens. The default thinking budget (8192) equals the
+// default max_tokens (8192), which would fail on strict providers. A 1024-token
+// headroom keeps the request valid without materially reducing reasoning quality.
+// Lenient gateways (GLM / Kimi) are unaffected — the budget is well under their
+// larger max_tokens limits.
+func clampThinkingBudgetBelowMax(budget, maxTokens int32) int32 {
+	if maxTokens > 1024 && budget >= maxTokens {
+		return maxTokens - 1024
+	}
+	return budget
 }
 
 // SetThinkingBudget configures the thinking/reasoning budget.
