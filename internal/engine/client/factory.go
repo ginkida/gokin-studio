@@ -12,6 +12,41 @@ import (
 	"github.com/ginkida/gokin-studio/internal/engine/security"
 )
 
+// defaultGLMThinkingBudget is the auto-default when the user hasn't configured
+// a budget explicitly. 8192 is a middle-ground — enough for multi-step
+// reasoning without inflating the per-turn cost. The old value (2048)
+// truncated chain-of-thought on moderately complex tasks (ported from
+// upstream gokin, which documents the same rationale). Users can override
+// via the Settings → Thinking Budget slider.
+const defaultGLMThinkingBudget int32 = 8192
+
+// defaultKimiThinkingBudget mirrors the GLM default for Kimi Coding Plan
+// (K2.6 / kimi-for-coding). The endpoint implements Anthropic Extended Thinking.
+const defaultKimiThinkingBudget int32 = 8192
+
+// thinkingBudgetMin / thinkingBudgetMax are the API-enforced bounds for
+// Anthropic-compat Extended Thinking. Requests outside [1024, 65536] get a
+// provider 400 with a cryptic message.
+const (
+	thinkingBudgetMin int32 = 1024
+	thinkingBudgetMax int32 = 65536
+)
+
+// normalizeThinkingBudget repairs a configured budget before an API call.
+// 0 → autoDefault (unset — use provider default); any value outside
+// [thinkingBudgetMin, thinkingBudgetMax] → autoDefault (hand-edited typo).
+// A user who set "100" almost certainly meant "1000" — clamping to 1024
+// would mask the slip; falling back to the auto-default is safer.
+func normalizeThinkingBudget(budget, autoDefault int32) int32 {
+	if budget == 0 {
+		return autoDefault
+	}
+	if budget < thinkingBudgetMin || budget > thinkingBudgetMax {
+		return autoDefault
+	}
+	return budget
+}
+
 // globalPool is the shared client connection pool.
 var (
 	globalPool *ClientPool
@@ -299,7 +334,12 @@ func newGLMClient(cfg *config.Config, modelID string) (Client, error) {
 	thinkingBudget := cfg.Model.ThinkingBudget
 	if !enableThinking && thinkingBudget == 0 && supportsGLMThinking(modelID) {
 		enableThinking = true
-		thinkingBudget = 2048
+		thinkingBudget = defaultGLMThinkingBudget
+	}
+	// Repair any out-of-range budget (hand-edited config.yaml typo) so we
+	// don't send a value the provider will reject with a cryptic 400.
+	if enableThinking {
+		thinkingBudget = normalizeThinkingBudget(thinkingBudget, defaultGLMThinkingBudget)
 	}
 
 	anthropicConfig := AnthropicConfig{
@@ -471,6 +511,11 @@ func newKimiClient(cfg *config.Config, modelID string) (Client, error) {
 	// Kimi may pause longer between chunks on complex tool chains.
 	streamIdleTimeout, httpTimeout := resolveProviderTimeouts(cfg, "kimi", 120*time.Second, 5*time.Minute)
 
+	kimiThinkingBudget := cfg.Model.ThinkingBudget
+	if cfg.Model.EnableThinking {
+		kimiThinkingBudget = normalizeThinkingBudget(kimiThinkingBudget, defaultKimiThinkingBudget)
+	}
+
 	anthropicConfig := AnthropicConfig{
 		APIKey:            loadedKey.Value,
 		BaseURL:           baseURL,
@@ -479,7 +524,7 @@ func newKimiClient(cfg *config.Config, modelID string) (Client, error) {
 		Temperature:       cfg.Model.Temperature,
 		StreamEnabled:     true,
 		EnableThinking:    cfg.Model.EnableThinking,
-		ThinkingBudget:    cfg.Model.ThinkingBudget,
+		ThinkingBudget:    kimiThinkingBudget,
 		StreamIdleTimeout: streamIdleTimeout,
 		MaxRetries:        0, // Request retries are orchestrated at App layer.
 		RetryDelay:        cfg.API.Retry.RetryDelay,

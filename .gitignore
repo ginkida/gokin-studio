@@ -38,3 +38,4 @@ Thumbs.db
 # Claude Code local settings + iteration log (private development notes)
 .claude/
 CLAUDE.md
+docs/HISTORY.md
