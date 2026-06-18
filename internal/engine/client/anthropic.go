@@ -811,6 +811,47 @@ func (c *AnthropicClient) streamRequest(ctx context.Context, requestBody map[str
 	return nil, fmt.Errorf("max retries (%d) exceeded: %w", c.config.MaxRetries, lastErr)
 }
 
+// classifyGLMErrorCode maps Z.AI / GLM error codes (returned as `{error:{code,message}}`
+// in SSE events with HTTP 200) to retryability and a user-friendly description.
+// Returns (retryable, keyword, description). keyword is embedded in the returned
+// error string so isRetryableError can pick it up via substring matching ("overloaded",
+// "rate limit"). description is what the user sees.
+//
+// Codes from the Z.AI API error reference:
+//
+//	1210: too-many-requests         → retryable
+//	1211/1213: insufficient balance → non-retryable (user must top up)
+//	1212: quota exceeded            → non-retryable
+//	1214/1215: auth failure         → non-retryable
+//	1301: concurrency limit         → retryable
+//	1302/1303: throughput limit     → retryable
+//	1305: service overloaded        → retryable
+//	unknown: non-retryable with raw message
+//
+// (Ported from gokin upstream.)
+func classifyGLMErrorCode(code, message string) (retryable bool, keyword, description string) {
+	switch code {
+	case "1210":
+		return true, "rate limit", "GLM rate limit — retrying"
+	case "1301":
+		return true, "overloaded", "GLM concurrency limit — retrying"
+	case "1302", "1303":
+		return true, "overloaded", "GLM throughput limit — retrying"
+	case "1305":
+		return true, "overloaded", "GLM server overloaded — retrying"
+	case "1211", "1213":
+		return false, "", "GLM account balance insufficient — top up or switch provider"
+	case "1212":
+		return false, "", "GLM quota exceeded — check billing"
+	case "1214", "1215":
+		return false, "", "GLM authentication failed — check API key"
+	}
+	if message != "" {
+		return false, "", message
+	}
+	return false, "", "GLM error " + code
+}
+
 // doStreamRequest performs a single streaming request attempt.
 // Per-attempt timeouts are enforced at the Transport level (DialContext,
 // TLSHandshakeTimeout, ResponseHeaderTimeout). The ctx governs the overall
@@ -1149,16 +1190,27 @@ func (c *AnthropicClient) doStreamRequest(ctx context.Context, requestBody map[s
 						continue waitLoop
 					}
 
-					// Handle Z.AI/GLM error format
+					// Handle Z.AI/GLM error format.
+					// GLM returns structured errors inside HTTP 200 SSE events.
+					// classifyGLMErrorCode embeds a keyword ("overloaded", "rate limit")
+					// so isRetryableError can pick it up, enabling auto-retry.
 					if errObj, ok := event["error"].(map[string]interface{}); ok {
 						errCode := stringFromMap(errObj, "code")
 						errMsg := stringFromMap(errObj, "message")
-						logging.Error("Z.AI API error", "code", errCode, "message", errMsg)
+						retryable, keyword, description := classifyGLMErrorCode(errCode, errMsg)
+						logging.Error("Z.AI API error", "code", errCode, "message", errMsg, "retryable", retryable)
+						errText := fmt.Sprintf("%s (%s)", description, errCode)
+						if keyword != "" {
+							errText = fmt.Sprintf("%s [%s] (%s): %s", description, keyword, errCode, errMsg)
+						}
+						if statusCb != nil {
+							statusCb.OnError(errors.New(description), retryable)
+						}
 						// ctx-guarded so a full buffer + gone consumer on cancel
 						// can't strand this producer goroutine.
 						select {
 						case chunks <- ResponseChunk{
-							Error: fmt.Errorf("API error (%s): %s", errCode, errMsg),
+							Error: errors.New(errText),
 							Done:  true,
 						}:
 						case <-ctx.Done():
