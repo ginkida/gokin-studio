@@ -1911,7 +1911,7 @@ func contextWindowForProvider(provider, model string) int {
 	case "kimi":
 		return 262144 // kimi-for-coding (Kimi-k2.6) has 262K context
 	case "deepseek":
-		return 128000 // DeepSeek V4 (both pro + flash) — 128K context
+		return 1000000 // DeepSeek V4 Pro/Flash ship with a 1M-token context window
 	default:
 		return 204800 // MiniMax M2.x — 200K context
 	}

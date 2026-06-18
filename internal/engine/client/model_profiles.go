@@ -56,9 +56,10 @@ var knownModelProfiles = map[string]ModelProfile{
 	"claude-sonnet": {Family: "anthropic", ContextWindow: 200000, SupportsTools: true, IsCoding: true},
 	"claude-haiku":  {Family: "anthropic", ContextWindow: 200000, SupportsTools: true, IsSmall: true},
 
-	// DeepSeek family
-	"deepseek-v4-pro":   {Family: "deepseek", ContextWindow: 128000, SupportsTools: true, IsCoding: true},
-	"deepseek-v4-flash": {Family: "deepseek", ContextWindow: 128000, SupportsTools: true, IsCoding: true},
+	// DeepSeek family. V4 Pro/Flash ship with a 1M-token context window.
+	// Legacy chat/reasoner route to V4 Flash until retirement on 2026-07-24.
+	"deepseek-v4-pro":   {Family: "deepseek", ContextWindow: 1000000, SupportsTools: true, IsCoding: true},
+	"deepseek-v4-flash": {Family: "deepseek", ContextWindow: 1000000, SupportsTools: true, IsCoding: true},
 	"deepseek-r1":       {Family: "deepseek", ContextWindow: 128000, SupportsTools: true, IsCoding: true},
 	"deepseek-chat":     {Family: "deepseek", ContextWindow: 64000, SupportsTools: true, IsCoding: true},
 	"deepseek-reasoner": {Family: "deepseek", ContextWindow: 64000, SupportsTools: true, IsCoding: true},

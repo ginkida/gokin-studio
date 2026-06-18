@@ -9,11 +9,11 @@ import (
 // economical non-thinking variant. Both share cache pricing tier.
 func TestLookupPricing_DeepSeekV4(t *testing.T) {
 	cases := []struct {
-		model            string
-		wantInput        float64
-		wantOutput       float64
-		wantCacheRead    float64
-		wantCacheWrite   float64
+		model          string
+		wantInput      float64
+		wantOutput     float64
+		wantCacheRead  float64
+		wantCacheWrite float64
 	}{
 		{"deepseek-v4-pro", 0.55, 2.19, 0.07, 0.55},
 		{"deepseek-v4-flash", 0.27, 1.10, 0.03, 0.27},
@@ -69,11 +69,11 @@ func TestEnvVarForProvider_DeepSeek(t *testing.T) {
 	}
 }
 
-// TestContextWindow_DeepSeek verifies iter 940+ wiring of 128K context.
+// TestContextWindow_DeepSeek verifies DeepSeek V4 Pro/Flash expose the 1M context window.
 func TestContextWindow_DeepSeek(t *testing.T) {
 	for _, model := range []string{"deepseek-v4-pro", "deepseek-v4-flash"} {
-		if got := contextWindowForProvider("deepseek", model); got != 128000 {
-			t.Errorf("contextWindowForProvider(deepseek, %q)=%d, want 128000", model, got)
+		if got := contextWindowForProvider("deepseek", model); got != 1000000 {
+			t.Errorf("contextWindowForProvider(deepseek, %q)=%d, want 1000000", model, got)
 		}
 	}
 }
