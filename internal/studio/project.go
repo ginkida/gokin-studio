@@ -1120,7 +1120,11 @@ outer:
 		// recentToolPatterns records the stagnation key of each executed call
 		// in order; checkStagnation fires when the last stagnationLimit are
 		// identical (ported from gokin's executor loop guard).
+		// stagnationRecoveries counts how many recovery hints were sent per
+		// pattern; once > 0 the next stagnation triggers a hard abort so the
+		// inner loop can't spin indefinitely on the same stuck tool.
 		var recentToolPatterns []string
+		stagnationRecoveries := map[string]int{}
 		for toolRound := 0; len(collected.FunctionCalls) > 0 && toolRound < 40; toolRound++ {
 			if ctx.Err() != nil {
 				break outer
@@ -1129,6 +1133,7 @@ outer:
 			// Execute tools and collect responses.
 			toolsExecutedThisTurn += len(collected.FunctionCalls)
 			var funcParts []*genai.Part
+			stagnationHardAbort := false
 			for _, fc := range collected.FunctionCalls {
 				if ctx.Err() != nil {
 					break
@@ -1211,6 +1216,13 @@ outer:
 					})
 					notSuccess := false
 					replay.Append(ReplayEvent{Type: "tool_result", Tool: fc.Name, Success: &notSuccess, Text: guardMsg})
+					if stagnationRecoveries[toolPattern] > 0 {
+						// Already sent one recovery hint for this pattern and the
+						// model is still calling it — hard abort to stop the loop.
+						stagnationHardAbort = true
+						break
+					}
+					stagnationRecoveries[toolPattern]++
 					continue
 				}
 
@@ -1284,6 +1296,17 @@ outer:
 			}
 
 			if ctx.Err() != nil {
+				break outer
+			}
+
+			// Hard-abort: model repeated a stagnated action after receiving a
+			// recovery hint — abort the turn so the loop can't spin for 40 rounds.
+			if stagnationHardAbort {
+				p.emitEvent(wailsCtx, EventChatError, ChatTextEvent{
+					ProjectID: p.ID, SessionID: sid,
+					Text: "Agent loop stopped: the model kept repeating the same action even after a recovery hint. " +
+						"Consider rephrasing your request or breaking the task into smaller steps.",
+				})
 				break outer
 			}
 

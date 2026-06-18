@@ -1951,3 +1951,60 @@ func TestAgentLoop_IncompleteWorkContinuation_BudgetExhausted(t *testing.T) {
 		t.Error("chat:complete not emitted after exhausting incomplete-work budget")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Stagnation hard-abort (iter 1207)
+// ---------------------------------------------------------------------------
+
+// TestAgentLoop_StagnationHardAbort verifies that when the model keeps calling
+// the same tool after receiving a recovery hint, the agent hard-aborts (emits
+// chat:error and stops) rather than spinning through all 40 inner tool rounds.
+//
+// Setup:
+//   - Response 0: 5 identical echo calls → fc[4] triggers stagnation → recovery
+//     hint sent, stagnationRecoveries["echo:"] = 1, loop continues.
+//   - Response 1: 1 more identical echo call → fc[0] triggers stagnation again,
+//     stagnationRecoveries["echo:"] = 1 > 0 → hard abort.
+//
+// Expectations: 2 LLM calls total, chat:error, chat:complete.
+func TestAgentLoop_StagnationHardAbort(t *testing.T) {
+	fc := func(id string) *genai.FunctionCall {
+		return &genai.FunctionCall{ID: id, Name: "echo", Args: map[string]any{"input": "stuck"}}
+	}
+	mc := &mockClient{responses: []mockResp{
+		// Round 0: 5 identical calls — fc[4] triggers first stagnation (recovery).
+		{funcCalls: []*genai.FunctionCall{fc("a"), fc("b"), fc("c"), fc("d"), fc("e")}},
+		// Round 1: same call again — triggers hard abort on first fc.
+		{funcCalls: []*genai.FunctionCall{fc("f")}},
+	}}
+	reg := tools.NewRegistry()
+	reg.MustRegister(&echoTool{})
+
+	p, rec := newTestProject(t, mc, reg)
+	runAgent(p, "do something")
+
+	mc.mu.Lock()
+	calls := mc.callCount
+	mc.mu.Unlock()
+
+	// Initial call + one SendFunctionResponse (round 1) = 2 total.
+	if calls != 2 {
+		t.Errorf("callCount = %d, want 2 (should hard-abort after first recovery round)", calls)
+	}
+
+	// chat:error must be emitted with the stagnation abort message.
+	errs := rec.find(EventChatError)
+	if len(errs) == 0 {
+		t.Fatal("no chat:error emitted on stagnation hard-abort")
+	}
+	if d, ok := errs[0].data.(ChatTextEvent); ok {
+		if !strings.Contains(d.Text, "repeating") {
+			t.Errorf("chat:error text should mention repeating; got %q", d.Text)
+		}
+	}
+
+	// chat:complete must still fire (turn exits cleanly for history persistence).
+	if len(rec.find(EventChatComplete)) == 0 {
+		t.Error("chat:complete not emitted after stagnation hard-abort")
+	}
+}
