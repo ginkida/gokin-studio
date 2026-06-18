@@ -33,12 +33,18 @@ func TestNormalizeThinkingBudget(t *testing.T) {
 
 func TestThinkingBudgetConstants(t *testing.T) {
 	// Guard the actual constant values — a drift here would silently change
-	// default reasoning quality for GLM-5.2 and Kimi users.
+	// default reasoning quality for all providers that support thinking.
 	if defaultGLMThinkingBudget != 8192 {
 		t.Errorf("defaultGLMThinkingBudget = %d, want 8192", defaultGLMThinkingBudget)
 	}
 	if defaultKimiThinkingBudget != 8192 {
 		t.Errorf("defaultKimiThinkingBudget = %d, want 8192", defaultKimiThinkingBudget)
+	}
+	if defaultDeepSeekThinkingBudget != 8192 {
+		t.Errorf("defaultDeepSeekThinkingBudget = %d, want 8192", defaultDeepSeekThinkingBudget)
+	}
+	if defaultMiniMaxThinkingBudget != 8192 {
+		t.Errorf("defaultMiniMaxThinkingBudget = %d, want 8192", defaultMiniMaxThinkingBudget)
 	}
 	if thinkingBudgetMin != 1024 {
 		t.Errorf("thinkingBudgetMin = %d, want 1024", thinkingBudgetMin)

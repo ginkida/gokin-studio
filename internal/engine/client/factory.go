@@ -24,6 +24,13 @@ const defaultGLMThinkingBudget int32 = 8192
 // (K2.6 / kimi-for-coding). The endpoint implements Anthropic Extended Thinking.
 const defaultKimiThinkingBudget int32 = 8192
 
+// defaultDeepSeekThinkingBudget is the auto-default for DeepSeek V4 Pro when
+// the user enables thinking but hasn't tuned the budget in config.yaml.
+const defaultDeepSeekThinkingBudget int32 = 8192
+
+// defaultMiniMaxThinkingBudget is the auto-default for MiniMax M2.x thinking.
+const defaultMiniMaxThinkingBudget int32 = 8192
+
 // thinkingBudgetMin / thinkingBudgetMax are the API-enforced bounds for
 // Anthropic-compat Extended Thinking. Requests outside [1024, 65536] get a
 // provider 400 with a cryptic message.
@@ -405,6 +412,11 @@ func newDeepSeekClient(cfg *config.Config, modelID string) (Client, error) {
 	// DeepSeek may have long silent reasoning/tool phases on complex prompts.
 	streamIdleTimeout, httpTimeout := resolveProviderTimeouts(cfg, "deepseek", 120*time.Second, 5*time.Minute)
 
+	dsThinkingBudget := cfg.Model.ThinkingBudget
+	if cfg.Model.EnableThinking {
+		dsThinkingBudget = normalizeThinkingBudget(dsThinkingBudget, defaultDeepSeekThinkingBudget)
+	}
+
 	anthropicConfig := AnthropicConfig{
 		APIKey:            loadedKey.Value,
 		BaseURL:           baseURL,
@@ -413,7 +425,7 @@ func newDeepSeekClient(cfg *config.Config, modelID string) (Client, error) {
 		Temperature:       cfg.Model.Temperature,
 		StreamEnabled:     true,
 		EnableThinking:    cfg.Model.EnableThinking,
-		ThinkingBudget:    cfg.Model.ThinkingBudget,
+		ThinkingBudget:    dsThinkingBudget,
 		StreamIdleTimeout: streamIdleTimeout,
 		// Request retries are orchestrated at App layer.
 		MaxRetries:  0,
@@ -459,6 +471,11 @@ func newMiniMaxClient(cfg *config.Config, modelID string) (Client, error) {
 	// Use relaxed defaults unless user explicitly configured stricter values.
 	streamIdleTimeout, httpTimeout := resolveProviderTimeouts(cfg, "minimax", 120*time.Second, 5*time.Minute)
 
+	mmThinkingBudget := cfg.Model.ThinkingBudget
+	if cfg.Model.EnableThinking {
+		mmThinkingBudget = normalizeThinkingBudget(mmThinkingBudget, defaultMiniMaxThinkingBudget)
+	}
+
 	anthropicConfig := AnthropicConfig{
 		APIKey:            loadedKey.Value,
 		BaseURL:           baseURL,
@@ -467,7 +484,7 @@ func newMiniMaxClient(cfg *config.Config, modelID string) (Client, error) {
 		Temperature:       cfg.Model.Temperature,
 		StreamEnabled:     true,
 		EnableThinking:    cfg.Model.EnableThinking,
-		ThinkingBudget:    cfg.Model.ThinkingBudget,
+		ThinkingBudget:    mmThinkingBudget,
 		StreamIdleTimeout: streamIdleTimeout,
 		MaxRetries:        0, // Request retries are orchestrated at App layer.
 		RetryDelay:        cfg.API.Retry.RetryDelay,
