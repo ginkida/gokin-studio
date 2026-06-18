@@ -435,8 +435,15 @@ func newDeepSeekClient(cfg *config.Config, modelID string) (Client, error) {
 	// DeepSeek may have long silent reasoning/tool phases on complex prompts.
 	streamIdleTimeout, httpTimeout := resolveProviderTimeouts(cfg, "deepseek", 120*time.Second, 5*time.Minute)
 
+	// Auto-enable Extended Thinking for V4 / reasoner. deepseek-chat is a
+	// plain chat model and the API rejects thinking blocks on that route (400).
+	enableThinking := cfg.Model.EnableThinking
 	dsThinkingBudget := cfg.Model.ThinkingBudget
-	if cfg.Model.EnableThinking {
+	if !enableThinking && dsThinkingBudget == 0 && SupportsDeepSeekThinking(modelID) {
+		enableThinking = true
+		dsThinkingBudget = defaultDeepSeekThinkingBudget
+	}
+	if enableThinking {
 		dsThinkingBudget = normalizeThinkingBudget(dsThinkingBudget, defaultDeepSeekThinkingBudget)
 	}
 
@@ -447,7 +454,7 @@ func newDeepSeekClient(cfg *config.Config, modelID string) (Client, error) {
 		MaxTokens:         cfg.Model.MaxOutputTokens,
 		Temperature:       cfg.Model.Temperature,
 		StreamEnabled:     true,
-		EnableThinking:    cfg.Model.EnableThinking,
+		EnableThinking:    enableThinking,
 		ThinkingBudget:    dsThinkingBudget,
 		StreamIdleTimeout: streamIdleTimeout,
 		// Request retries are orchestrated at App layer.
@@ -551,8 +558,15 @@ func newKimiClient(cfg *config.Config, modelID string) (Client, error) {
 	// Kimi may pause longer between chunks on complex tool chains.
 	streamIdleTimeout, httpTimeout := resolveProviderTimeouts(cfg, "kimi", 120*time.Second, 5*time.Minute)
 
+	// Kimi Coding Plan (K2.6+) supports Extended Thinking. Auto-enable when
+	// the user hasn't explicitly configured it — mirrors the GLM path.
+	enableThinking := cfg.Model.EnableThinking
 	kimiThinkingBudget := cfg.Model.ThinkingBudget
-	if cfg.Model.EnableThinking {
+	if !enableThinking && kimiThinkingBudget == 0 && SupportsKimiThinking(modelID) {
+		enableThinking = true
+		kimiThinkingBudget = defaultKimiThinkingBudget
+	}
+	if enableThinking {
 		kimiThinkingBudget = normalizeThinkingBudget(kimiThinkingBudget, defaultKimiThinkingBudget)
 	}
 
@@ -563,7 +577,7 @@ func newKimiClient(cfg *config.Config, modelID string) (Client, error) {
 		MaxTokens:         cfg.Model.MaxOutputTokens,
 		Temperature:       cfg.Model.Temperature,
 		StreamEnabled:     true,
-		EnableThinking:    cfg.Model.EnableThinking,
+		EnableThinking:    enableThinking,
 		ThinkingBudget:    kimiThinkingBudget,
 		StreamIdleTimeout: streamIdleTimeout,
 		MaxRetries:        0, // Request retries are orchestrated at App layer.

@@ -68,7 +68,10 @@ type AnthropicClient struct {
 	rateLimiter       RateLimiter
 	statusCallback    StatusCallback
 	systemInstruction string
-	mu                sync.RWMutex
+	// turnContext is the per-turn ephemeral context (working memory) delivered
+	// OUTSIDE the cached prefix — see SetTurnContext. Guarded by mu.
+	turnContext string
+	mu          sync.RWMutex
 }
 
 // NewAnthropicClient creates a new Anthropic-compatible client.
@@ -153,6 +156,7 @@ func (c *AnthropicClient) SendMessageWithHistory(ctx context.Context, history []
 	// Snapshot mutable fields under read lock
 	c.mu.RLock()
 	sysInstruction := c.systemInstruction
+	turnContext := c.turnContext
 	enableThinking := c.config.EnableThinking
 	thinkingBudget := c.config.ThinkingBudget
 	model := c.config.Model
@@ -171,6 +175,7 @@ func (c *AnthropicClient) SendMessageWithHistory(ctx context.Context, history []
 		// Legacy fallback: extract system prompt from first user message
 		messages, systemPrompt = c.convertHistoryToMessagesWithSystem(history, message)
 	}
+	messages = appendTurnContextBlock(messages, turnContext)
 
 	// Build request
 	requestBody := map[string]interface{}{
@@ -214,6 +219,7 @@ func (c *AnthropicClient) SendFunctionResponse(ctx context.Context, history []*g
 	// Snapshot mutable fields under read lock
 	c.mu.RLock()
 	sysInstruction := c.systemInstruction
+	turnContext := c.turnContext
 	enableThinking := c.config.EnableThinking
 	thinkingBudget := c.config.ThinkingBudget
 	model := c.config.Model
@@ -230,6 +236,7 @@ func (c *AnthropicClient) SendFunctionResponse(ctx context.Context, history []*g
 	} else {
 		messages, systemPrompt = c.convertHistoryWithResultsAndSystem(history, results)
 	}
+	messages = appendTurnContextBlock(messages, turnContext)
 
 	requestBody := map[string]interface{}{
 		"model":      model,
@@ -267,6 +274,50 @@ func (c *AnthropicClient) SetSystemInstruction(instruction string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.systemInstruction = instruction
+}
+
+// SetTurnContext sets the per-turn ephemeral context (working memory). It is
+// delivered OUTSIDE the cached prefix: appended at request-build time as a
+// text block on the LAST user-role message — which is never covered by a
+// cache_control marker — and never persisted into history, so every cached
+// message position only ever sees its turn-context-free bytes. Keeping this
+// in the system block instead re-bills the whole system+tools prefix on
+// every working-memory change.
+func (c *AnthropicClient) SetTurnContext(turnContext string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.turnContext = turnContext
+}
+
+// appendTurnContextBlock appends the turn context as an extra text block on
+// the final message when (and only when) that message is user-role. Content
+// may be a plain string or a block array depending on the conversion path —
+// both are normalized to a block array. Non-user final messages are left
+// untouched rather than risking a malformed conversation.
+func appendTurnContextBlock(messages []map[string]interface{}, turnContext string) []map[string]interface{} {
+	if turnContext == "" || len(messages) == 0 {
+		return messages
+	}
+	last := messages[len(messages)-1]
+	if role, _ := last["role"].(string); role != "user" {
+		return messages
+	}
+	ctxBlock := map[string]interface{}{
+		"type": "text",
+		"text": "<turn-context>\nEphemeral task-state snapshot (auto-generated, not part of the user's message):\n\n" + turnContext + "\n</turn-context>",
+	}
+	switch content := last["content"].(type) {
+	case string:
+		last["content"] = []map[string]interface{}{
+			{"type": "text", "text": content},
+			ctxBlock,
+		}
+	case []map[string]interface{}:
+		last["content"] = append(content, ctxBlock)
+	case []interface{}:
+		last["content"] = append(content, interface{}(ctxBlock))
+	}
+	return messages
 }
 
 // supportsPromptCaching returns true if the provider supports Anthropic-style
@@ -565,6 +616,7 @@ func (c *AnthropicClient) WithModel(modelName string) Client {
 	rl := c.rateLimiter
 	sc := c.statusCallback
 	si := c.systemInstruction
+	tc := c.turnContext
 	c.mu.RUnlock()
 
 	newConfig.Model = modelName
@@ -582,6 +634,9 @@ func (c *AnthropicClient) WithModel(modelName string) Client {
 	}
 	if si != "" {
 		newClient.SetSystemInstruction(si)
+	}
+	if tc != "" {
+		newClient.SetTurnContext(tc)
 	}
 	return newClient
 }

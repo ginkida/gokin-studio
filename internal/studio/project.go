@@ -770,21 +770,18 @@ func (p *Project) SendMessage(wailsCtx context.Context, message string, settings
 		safeGoFn("save-config-on-turn", p.studio.LogEvent, p.studio.saveConfigAsync)
 	}
 
-	// If the agent has previously pinned context via the pin_context tool,
-	// incorporate it into the system instruction for this run so it survives
-	// history compaction. The instruction is re-applied each send so a new pin
-	// from the previous turn is visible immediately.
-	// Re-assemble the system instruction when there's pinned context OR the
-	// project is in "ask" permission mode, so both survive history compaction
-	// and reflect the current setting (the cached client was built once at
-	// init). No-pin + auto-mode keeps the init-time instruction untouched.
-	if pinnedCtx != "" || permMode == "ask" {
+	// Deliver pinned context outside the cached prefix: appended as a text
+	// block on the last user message at request-build time (never persisted
+	// into history) so the system+tools prefix stays byte-stable when
+	// working memory changes. Passing "" clears any context from the prior turn.
+	c.SetTurnContext(pinnedCtx)
+
+	// Re-apply the "ask before changes" permission directive each turn so it
+	// reflects any change the user made since initClient ran.
+	if permMode == "ask" {
 		base := sysPr
 		if base == "" {
 			base = defaultSystemPrompt(p.Directory, pName)
-		}
-		if pinnedCtx != "" {
-			base += "\n\n## Pinned Context\n" + pinnedCtx
 		}
 		c.SetSystemInstruction(base + permissionDirective(permMode))
 	}

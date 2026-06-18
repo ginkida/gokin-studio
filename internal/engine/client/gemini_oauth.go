@@ -424,6 +424,9 @@ func (c *GeminiOAuthClient) SetSystemInstruction(instruction string) {
 	c.systemInstruction = instruction
 }
 
+// SetTurnContext is a no-op for GeminiOAuthClient (turn context not supported on this provider).
+func (c *GeminiOAuthClient) SetTurnContext(_ string) {}
+
 // SetThinkingBudget configures the thinking/reasoning budget.
 func (c *GeminiOAuthClient) SetThinkingBudget(budget int32) {
 	c.mu.Lock()
@@ -739,7 +742,7 @@ func (c *GeminiOAuthClient) doGenerateContentStream(ctx context.Context, content
 	var rateLimiterAcquired bool
 	if c.rateLimiter != nil {
 		estimatedTokens = ratelimit.EstimateTokensFromContents(len(contents), 500)
-		
+
 		waitTime := c.rateLimiter.EstimateWaitTime(estimatedTokens)
 		if waitTime > 500*time.Millisecond && c.statusCallback != nil {
 			c.statusCallback.OnRateLimit(waitTime)

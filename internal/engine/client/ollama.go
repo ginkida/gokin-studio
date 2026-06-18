@@ -41,7 +41,9 @@ type OllamaClient struct {
 	rateLimiter       RateLimiter
 	statusCallback    StatusCallback
 	systemInstruction string
-	mu                sync.RWMutex
+	// turnContext — per-turn ephemeral context, see SetTurnContext. Guarded by mu.
+	turnContext string
+	mu          sync.RWMutex
 }
 
 // authTransport adds Authorization header to HTTP requests.
@@ -398,6 +400,27 @@ func (c *OllamaClient) SetSystemInstruction(instruction string) {
 	c.systemInstruction = instruction
 }
 
+// SetTurnContext sets the per-turn ephemeral context appended to the last
+// user message at send time (never persisted into history).
+func (c *OllamaClient) SetTurnContext(turnContext string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.turnContext = turnContext
+}
+
+// appendOllamaTurnContext appends the turn context to the final user message.
+func appendOllamaTurnContext(messages []api.Message, turnContext string) []api.Message {
+	if turnContext == "" || len(messages) == 0 {
+		return messages
+	}
+	last := &messages[len(messages)-1]
+	if last.Role != "user" {
+		return messages
+	}
+	last.Content += "\n\n<turn-context>\nEphemeral task-state snapshot (auto-generated, not part of the user's message):\n\n" + turnContext + "\n</turn-context>"
+	return messages
+}
+
 // SetThinkingBudget is a no-op for Ollama (not supported).
 func (c *OllamaClient) SetThinkingBudget(budget int32) {}
 
@@ -480,6 +503,7 @@ func (c *OllamaClient) WithModel(modelName string) Client {
 	rl := c.rateLimiter
 	sc := c.statusCallback
 	si := c.systemInstruction
+	tc := c.turnContext
 	c.mu.RUnlock()
 
 	newConfig.Model = modelName
@@ -497,6 +521,9 @@ func (c *OllamaClient) WithModel(modelName string) Client {
 	}
 	if si != "" {
 		newClient.SetSystemInstruction(si)
+	}
+	if tc != "" {
+		newClient.SetTurnContext(tc)
 	}
 	return newClient
 }
@@ -608,6 +635,7 @@ func (c *OllamaClient) convertHistoryToMessages(history []*genai.Content, newMes
 	// Prepend system instruction if set
 	c.mu.RLock()
 	sysInstruction := c.systemInstruction
+	turnContext := c.turnContext
 	c.mu.RUnlock()
 	if sysInstruction != "" {
 		messages = append(messages, api.Message{Role: "system", Content: sysInstruction})
@@ -628,7 +656,7 @@ func (c *OllamaClient) convertHistoryToMessages(history []*genai.Content, newMes
 		})
 	}
 
-	return messages
+	return appendOllamaTurnContext(messages, turnContext)
 }
 
 // convertContentToMessage converts a single genai.Content to api.Message.
@@ -672,6 +700,7 @@ func (c *OllamaClient) convertHistoryForFallback(history []*genai.Content, resul
 	// Prepend system instruction if set
 	c.mu.RLock()
 	sysInstruction := c.systemInstruction
+	turnContext := c.turnContext
 	c.mu.RUnlock()
 	if sysInstruction != "" {
 		messages = append(messages, api.Message{Role: "system", Content: sysInstruction})
@@ -755,7 +784,7 @@ func (c *OllamaClient) convertHistoryForFallback(history []*genai.Content, resul
 		})
 	}
 
-	return messages
+	return appendOllamaTurnContext(messages, turnContext)
 }
 
 // convertHistoryWithResults converts history with function results to messages.

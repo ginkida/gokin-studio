@@ -60,6 +60,8 @@ type mockClient struct {
 
 	// Captured by SetSystemInstruction.
 	lastSystemInstruction string
+	// Captured by SetTurnContext.
+	lastTurnContext string
 }
 
 func (m *mockClient) pop() mockResp {
@@ -178,6 +180,11 @@ func (m *mockClient) GetRawClient() any                { return nil }
 func (m *mockClient) SetSystemInstruction(s string) {
 	m.mu.Lock()
 	m.lastSystemInstruction = s
+	m.mu.Unlock()
+}
+func (m *mockClient) SetTurnContext(s string) {
+	m.mu.Lock()
+	m.lastTurnContext = s
 	m.mu.Unlock()
 }
 func (m *mockClient) SetThinkingBudget(_ int32) {}

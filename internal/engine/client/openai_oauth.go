@@ -125,6 +125,9 @@ func (c *OpenAIOAuthClient) SetSystemInstruction(instruction string) {
 	c.systemInstruction = instruction
 }
 
+// SetTurnContext is a no-op for OpenAIOAuthClient (turn context not supported on this provider).
+func (c *OpenAIOAuthClient) SetTurnContext(_ string) {}
+
 // SetThinkingBudget configures the thinking/reasoning budget.
 func (c *OpenAIOAuthClient) SetThinkingBudget(budget int32) {
 	c.mu.Lock()
@@ -375,7 +378,7 @@ func (c *OpenAIOAuthClient) doRequest(ctx context.Context, contents []*genai.Con
 	var estimatedTokens int64
 	if rl != nil {
 		estimatedTokens = ratelimit.EstimateTokensFromContents(len(contents), 500)
-		
+
 		waitTime := rl.EstimateWaitTime(estimatedTokens)
 		if waitTime > 500*time.Millisecond && c.statusCallback != nil {
 			c.statusCallback.OnRateLimit(waitTime)
@@ -383,7 +386,7 @@ func (c *OpenAIOAuthClient) doRequest(ctx context.Context, contents []*genai.Con
 
 		if err := rl.AcquireWithContext(ctx, estimatedTokens); err != nil {
 			if c.statusCallback != nil {
-				c.statusCallback.OnRateLimit(time.Second) 
+				c.statusCallback.OnRateLimit(time.Second)
 			}
 			return nil, fmt.Errorf("rate limit aborted: %w", err)
 		}

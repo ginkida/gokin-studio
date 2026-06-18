@@ -186,6 +186,15 @@ func (fc *FallbackClient) SetSystemInstruction(instruction string) {
 	}
 }
 
+// SetTurnContext sets per-turn ephemeral context on ALL clients in the fallback chain.
+func (fc *FallbackClient) SetTurnContext(turnContext string) {
+	fc.mu.RLock()
+	defer fc.mu.RUnlock()
+	for _, c := range fc.clients {
+		c.SetTurnContext(turnContext)
+	}
+}
+
 // SetThinkingBudget sets thinking budget on ALL clients in the fallback chain.
 func (fc *FallbackClient) SetThinkingBudget(budget int32) {
 	fc.mu.RLock()

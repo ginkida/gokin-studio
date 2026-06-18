@@ -310,6 +310,14 @@ type Client interface {
 	// rather than being injected as a user message in the conversation history.
 	SetSystemInstruction(instruction string)
 
+	// SetTurnContext sets per-turn ephemeral context delivered OUTSIDE the
+	// cached prefix: appended as a text block on the last user message at
+	// request-build time, never persisted into history. This keeps the
+	// system+tools cached prefix byte-stable when working memory changes —
+	// unlike injecting it into the system instruction, which re-bills the
+	// entire cached prefix on every update.
+	SetTurnContext(turnContext string)
+
 	// SetThinkingBudget configures the thinking/reasoning budget for the next request.
 	// budget=0 disables thinking. Positive values set max thinking tokens.
 	SetThinkingBudget(budget int32)

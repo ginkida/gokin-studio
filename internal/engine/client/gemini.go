@@ -107,6 +107,9 @@ func (c *GeminiClient) SetSystemInstruction(instruction string) {
 	c.systemInstruction = instruction
 }
 
+// SetTurnContext is a no-op for GeminiClient (turn context not supported on this provider).
+func (c *GeminiClient) SetTurnContext(_ string) {}
+
 // SetThinkingBudget configures the thinking/reasoning budget.
 func (c *GeminiClient) SetThinkingBudget(budget int32) {
 	c.mu.Lock()
@@ -359,7 +362,7 @@ func (c *GeminiClient) doGenerateContentStream(ctx context.Context, contents []*
 	var estimatedTokens int64
 	if rateLimiter != nil {
 		estimatedTokens = ratelimit.EstimateTokensFromContents(len(contents), 500)
-		
+
 		waitTime := rateLimiter.EstimateWaitTime(estimatedTokens)
 		if waitTime > 500*time.Millisecond && statusCb != nil {
 			statusCb.OnRateLimit(waitTime)
@@ -368,7 +371,7 @@ func (c *GeminiClient) doGenerateContentStream(ctx context.Context, contents []*
 		if err := rateLimiter.AcquireWithContext(ctx, estimatedTokens); err != nil {
 			// Notify about rate limit abort
 			if statusCb != nil {
-				statusCb.OnRateLimit(time.Second) 
+				statusCb.OnRateLimit(time.Second)
 			}
 			return nil, fmt.Errorf("rate limit aborted: %w", err)
 		}
