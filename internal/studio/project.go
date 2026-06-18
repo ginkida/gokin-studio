@@ -702,7 +702,7 @@ func (p *Project) SendMessage(wailsCtx context.Context, message string, settings
 				ProjectID: p.ID,
 				SessionID: sid,
 				Text: fmt.Sprintf(
-					"Budget reached: spent $%.4f of $%.2f limit. Raise the budget in the project's budget editor, disable strict enforcement, or reset usage to continue.",
+					"Budget reached: spent $%.4f of $%.2f limit. To continue, raise the budget or disable strict enforcement in the project's budget editor; clearing or deleting a session also lowers its recorded usage.",
 					spent, budget),
 			})
 			return
@@ -1716,6 +1716,21 @@ func (p *Project) bumpTotalCostUSD(delta float64) {
 		p.costSeeded = true
 	}
 	p.cachedTotalCostUSD += delta
+}
+
+// invalidateCostCache forces the next totalCostUSD() to re-derive the cumulative
+// cost from ProjectUsageStats (the in-memory per-session usage). The cost cache
+// is otherwise monotonic-increasing for the app's lifetime, so without this a
+// strict-budget block would stay stuck at the old high-water mark even after the
+// user REMOVES usage by clearing a session's history or deleting a session. Call
+// AFTER the removal has taken effect (session.usage zeroed / session dropped from
+// p.sessions) so the re-seed sums the reduced state. Uses costMu only — never
+// call while holding p.mu or session.mu is fine (costMu is a leaf lock).
+func (p *Project) invalidateCostCache() {
+	p.costMu.Lock()
+	p.costSeeded = false
+	p.cachedTotalCostUSD = 0
+	p.costMu.Unlock()
 }
 
 // ToConfig converts to persistable config.

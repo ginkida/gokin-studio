@@ -1014,6 +1014,9 @@ func (s *Studio) DeleteChatSession(projectID, sessionID string) error {
 	_ = s.ClearDraft(projectID, sessionID)
 	// Same for pinned messages — pins anchor to a session that no longer exists.
 	removeSessionPins(projectID, sessionID)
+	// The deleted session is gone from p.sessions; re-derive the project cost
+	// cache so its usage no longer counts toward a strict-budget block.
+	p.invalidateCostCache()
 	return nil
 }
 
@@ -1085,6 +1088,10 @@ func (s *Studio) ClearHistory(projectID, sessionID string) error {
 	session.Stop()
 	session.mu.Lock()
 	session.history = nil
+	// The session's recorded usage was attributed to the history we're deleting,
+	// so clear it too — otherwise the cumulative cost (and a strict-budget block)
+	// would keep counting tokens from a conversation that no longer exists.
+	session.usage = nil
 	session.mu.Unlock()
 	DeleteHistory(projectID + "_" + sid)
 	// Any in-flight replay buffer references a history we just wiped — drop
@@ -1103,6 +1110,9 @@ func (s *Studio) ClearHistory(projectID, sessionID string) error {
 		wt.Reset()
 	}
 	p.mu.Unlock()
+	// We just zeroed this session's usage; re-derive the project cost cache so
+	// the strict-budget gate reflects the reduction instead of staying stuck.
+	p.invalidateCostCache()
 	return nil
 }
 

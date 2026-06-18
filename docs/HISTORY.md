@@ -7,6 +7,38 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## What's Done (iter 1233+ — budget cost cache re-derives after clear/delete; honest budget-block message)
+
+From a fresh adversarial reliability re-audit (4 dimensions: agent-loop cancel/persist, tool/streaming
+accumulation, concurrency/lock-order, fresh gokin diff — 3 of 4 came back CLEAN after refutation, a good
+signal those hardened paths are solid). One confirmed bug:
+
+**The project cost cache (`cachedTotalCostUSD`) was monotonic-increasing for the app's lifetime** — seeded
+once from `ProjectUsageStats`, only ever incremented by `bumpTotalCostUSD`, never reset. So once a strict
+budget block tripped (`EnforceBudget` + cumulative cost ≥ `BudgetUSD`), the in-app escapes were only
+"raise budget" / "disable enforcement". Worse, the block's error message told the user to "reset usage to
+continue" — but **no reset action existed**, and `/clear` (ClearHistory) / deleting the expensive session
+left the gate stuck (and diverged from the usage modal, which re-sums live sessions). Only an app restart
+cleared it. Severity LOW (the two real escapes work), but a genuinely misleading instruction + stuck gate.
+
+- **`ClearHistory`** (`app.go`): now also zeroes `session.usage` (the usage was attributed to the history
+  being deleted) and calls the new `p.invalidateCostCache()`.
+- **`DeleteChatSession`** (`app.go`): calls `p.invalidateCostCache()` after the session is dropped.
+- **`invalidateCostCache()`** (`project.go`): resets `costSeeded=false` + `cachedTotalCostUSD=0` (under the
+  leaf `costMu`) so the next `totalCostUSD()` re-derives from `ProjectUsageStats` — which now sums the
+  reduced state. Durable: clear/delete remove the history files, so a restart re-derives the same lowered
+  total.
+- **Error message** (`project.go:705`): dropped the non-existent "reset usage" promise; now points at the
+  two real non-destructive escapes (raise budget / disable enforcement) and notes that clearing/deleting a
+  session lowers its recorded usage.
+- **Tests** (`budget_cost_reset_test.go`, +3): ClearHistory zeroes usage + cost re-derives to 0;
+  DeleteChatSession drops the deleted session's cost; `invalidateCostCache` forces a re-seed past a stale
+  value. Full `-race ./internal/studio/` green, `go vet` clean.
+- **Honest value**: low-severity correctness/UX fix — the budget gate now reflects reality after a
+  clear/delete (no stuck block, no divergence from the usage modal) and the error message no longer points
+  at a phantom action. Not a data-loss/deadlock class bug; the re-audit confirms the core agent-loop /
+  streaming / concurrency paths are clean.
+
 ## What's Done (iter 1232+ — GLM cache visibility: surface the implicit prompt-cache savings in the UI)
 
 Directly answers the user's question "is GLM's cache used?" — now they can SEE it. The backend already
