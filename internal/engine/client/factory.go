@@ -39,6 +39,28 @@ const (
 	thinkingBudgetMax int32 = 65536
 )
 
+// ThinkingDisabledSentinel is the ThinkingBudget value the application layer
+// sets to explicitly turn Extended Thinking OFF. It suppresses the per-provider
+// auto-enable fallback in the factories below (which fires on the zero-value
+// budget), so a user who disables thinking on a provider that auto-enables it —
+// GLM (the default), Kimi, DeepSeek — actually gets it off instead of having the
+// factory silently turn it back on. A negative budget never reaches a request
+// body: anthropic.go gates the thinking block on budget > 0.
+const ThinkingDisabledSentinel int32 = -1
+
+// DefaultThinkingBudget returns the thinking budget the application layer
+// applies when a user enables thinking without specifying a budget. It mirrors
+// each provider's effective auto-mode budget so toggling a project from auto to
+// explicitly-enabled keeps the budget stable: GLM 8192 (its newGLMClient
+// factory canon), every other provider 4096. normalizeThinkingBudget still
+// clamps out-of-range values at the factory.
+func DefaultThinkingBudget(provider string) int32 {
+	if provider == "glm" {
+		return defaultGLMThinkingBudget
+	}
+	return 4096
+}
+
 // normalizeThinkingBudget repairs a configured budget before an API call.
 // 0 → autoDefault (unset — use provider default); any value outside
 // [thinkingBudgetMin, thinkingBudgetMax] → autoDefault (hand-edited typo).
@@ -336,10 +358,15 @@ func newGLMClient(cfg *config.Config, modelID string) (Client, error) {
 	// GLM/Z.AI needs longer timeouts — server is slower than Anthropic.
 	streamIdleTimeout, httpTimeout := resolveProviderTimeouts(cfg, "glm", 180*time.Second, 5*time.Minute)
 
-	// GLM 4.7+ supports extended thinking — enable by default if user hasn't explicitly configured it
+	// GLM 4.7+ supports extended thinking — enable by default if the user hasn't
+	// explicitly configured it. A budget of ThinkingDisabledSentinel means the
+	// user explicitly turned thinking OFF, so the auto-enable fallback is skipped.
 	enableThinking := cfg.Model.EnableThinking
 	thinkingBudget := cfg.Model.ThinkingBudget
-	if !enableThinking && thinkingBudget == 0 && supportsGLMThinking(modelID) {
+	if thinkingBudget == ThinkingDisabledSentinel {
+		enableThinking = false
+		thinkingBudget = 0
+	} else if !enableThinking && thinkingBudget == 0 && SupportsGLMThinking(modelID) {
 		enableThinking = true
 		thinkingBudget = defaultGLMThinkingBudget
 	}
@@ -369,8 +396,8 @@ func newGLMClient(cfg *config.Config, modelID string) (Client, error) {
 	return NewAnthropicClient(anthropicConfig)
 }
 
-// supportsGLMThinking returns true for GLM models that support extended thinking.
-func supportsGLMThinking(modelID string) bool {
+// SupportsGLMThinking returns true for GLM models that support extended thinking.
+func SupportsGLMThinking(modelID string) bool {
 	m := strings.ToLower(modelID)
 	return strings.HasPrefix(m, "glm-5") || strings.HasPrefix(m, "glm-4.7")
 }
@@ -437,9 +464,14 @@ func newDeepSeekClient(cfg *config.Config, modelID string) (Client, error) {
 
 	// Auto-enable Extended Thinking for V4 / reasoner. deepseek-chat is a
 	// plain chat model and the API rejects thinking blocks on that route (400).
+	// A budget of ThinkingDisabledSentinel means the user explicitly turned
+	// thinking OFF, so the auto-enable fallback is skipped.
 	enableThinking := cfg.Model.EnableThinking
 	dsThinkingBudget := cfg.Model.ThinkingBudget
-	if !enableThinking && dsThinkingBudget == 0 && SupportsDeepSeekThinking(modelID) {
+	if dsThinkingBudget == ThinkingDisabledSentinel {
+		enableThinking = false
+		dsThinkingBudget = 0
+	} else if !enableThinking && dsThinkingBudget == 0 && SupportsDeepSeekThinking(modelID) {
 		enableThinking = true
 		dsThinkingBudget = defaultDeepSeekThinkingBudget
 	}
@@ -559,10 +591,15 @@ func newKimiClient(cfg *config.Config, modelID string) (Client, error) {
 	streamIdleTimeout, httpTimeout := resolveProviderTimeouts(cfg, "kimi", 120*time.Second, 5*time.Minute)
 
 	// Kimi Coding Plan (K2.6+) supports Extended Thinking. Auto-enable when
-	// the user hasn't explicitly configured it — mirrors the GLM path.
+	// the user hasn't explicitly configured it — mirrors the GLM path. A budget
+	// of ThinkingDisabledSentinel means the user explicitly turned thinking OFF,
+	// so the auto-enable fallback is skipped.
 	enableThinking := cfg.Model.EnableThinking
 	kimiThinkingBudget := cfg.Model.ThinkingBudget
-	if !enableThinking && kimiThinkingBudget == 0 && SupportsKimiThinking(modelID) {
+	if kimiThinkingBudget == ThinkingDisabledSentinel {
+		enableThinking = false
+		kimiThinkingBudget = 0
+	} else if !enableThinking && kimiThinkingBudget == 0 && SupportsKimiThinking(modelID) {
 		enableThinking = true
 		kimiThinkingBudget = defaultKimiThinkingBudget
 	}

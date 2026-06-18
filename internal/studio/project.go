@@ -563,26 +563,9 @@ func (p *Project) initClient(settings Settings) error {
 		cfg.API.OllamaBaseURL = firstNonEmpty(settings.OllamaURL, os.Getenv("OLLAMA_HOST"), "http://localhost:11434")
 	}
 
-	// Apply thinking configuration. ThinkingMode="" (auto) defaults to enabled
-	// for Kimi coding models and for DeepSeek V4 (pro + flash) and legacy
-	// reasoner — these support Extended Thinking on their Anthropic-compat
-	// endpoint. All other providers/models stay off in auto mode.
-	switch p.ThinkingMode {
-	case "enabled":
-		cfg.Model.EnableThinking = true
-		cfg.Model.ThinkingBudget = p.ThinkingBudget
-		if cfg.Model.ThinkingBudget <= 0 {
-			cfg.Model.ThinkingBudget = 4096
-		}
-	case "disabled":
-		// Explicitly off — nothing to set.
-	default: // "" auto
-		if (provider == "kimi" && client.SupportsKimiThinking(model)) ||
-			(provider == "deepseek" && client.SupportsDeepSeekThinking(model)) {
-			cfg.Model.EnableThinking = true
-			cfg.Model.ThinkingBudget = 4096
-		}
-	}
+	// Map the project's thinking mode + budget to the (enable, budget) pair the
+	// client factory consumes. Pure helper so the policy is unit-testable.
+	cfg.Model.EnableThinking, cfg.Model.ThinkingBudget = resolveThinkingConfig(p.ThinkingMode, provider, model, p.ThinkingBudget)
 
 	// NewClientNoPool (not NewClient): each project owns a dedicated client
 	// instance. The shared connection pool is keyed only by provider:model, so
@@ -1779,6 +1762,44 @@ const askBeforeChangesDirective = "\n\n## Permission mode: ask before changes\n"
 	"intend to do and get confirmation. Read-only operations (reading files, " +
 	"search, git status/diff, running tests) do NOT need confirmation. Batch " +
 	"related changes into a single confirmation rather than asking per file."
+
+// resolveThinkingConfig maps a project's ThinkingMode + user-set budget to the
+// (EnableThinking, ThinkingBudget) pair passed to the client factory. Kept as a
+// pure function so the policy is unit-testable without building a real client.
+//
+//   - "enabled":  thinking on. With no explicit user budget, fall back to the
+//     provider's tuned default (client.DefaultThinkingBudget: GLM 8192, others
+//     4096) so toggling a GLM project auto→enabled doesn't silently halve its
+//     budget — auto-mode GLM also runs at 8192.
+//   - "disabled": thinking OFF via the explicit-disable sentinel. GLM (the
+//     default provider), Kimi and DeepSeek auto-enable thinking one layer down
+//     in the factory when the budget is the zero value; the sentinel suppresses
+//     that so "disabled" is actually honored instead of silently re-enabled.
+//   - "" (auto):  enable for the providers that support Extended Thinking on
+//     their Anthropic-compatible endpoint — GLM, Kimi coding models, DeepSeek V4
+//     (pro + flash) / legacy reasoner — each at its tuned default. Others stay off.
+func resolveThinkingConfig(mode, provider, model string, userBudget int32) (enable bool, budget int32) {
+	switch mode {
+	case "enabled":
+		budget = userBudget
+		if budget <= 0 {
+			budget = client.DefaultThinkingBudget(provider)
+		}
+		return true, budget
+	case "disabled":
+		return false, client.ThinkingDisabledSentinel
+	default: // "" auto
+		switch {
+		case provider == "glm" && client.SupportsGLMThinking(model):
+			return true, client.DefaultThinkingBudget(provider)
+		case provider == "kimi" && client.SupportsKimiThinking(model):
+			return true, client.DefaultThinkingBudget(provider)
+		case provider == "deepseek" && client.SupportsDeepSeekThinking(model):
+			return true, client.DefaultThinkingBudget(provider)
+		}
+		return false, 0
+	}
+}
 
 // permissionDirective returns the system-prompt addendum for a permission mode.
 // Only "ask" adds anything; "" / "auto" return the empty string.

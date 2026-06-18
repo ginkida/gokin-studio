@@ -1154,8 +1154,9 @@ func TestInitClient_KimiModelMigration(t *testing.T) {
 }
 
 // TestInitClient_ThinkingModeEnabled verifies that ThinkingMode="enabled" with a
-// zero ThinkingBudget causes the budget to be clamped to 4096 inside initClient
-// (lines 394-399). Uses GLM provider with no key so NewClient fails fast.
+// zero ThinkingBudget resolves to the provider's default budget inside initClient
+// (GLM → 8192 via client.DefaultThinkingBudget). Uses GLM provider with no key so
+// NewClient fails fast — the assertion here is only that initClient errors.
 func TestInitClient_ThinkingModeEnabled(t *testing.T) {
 	_ = withTempHistoryDir(t)
 	prevKey := os.Getenv("GLM_API_KEY")

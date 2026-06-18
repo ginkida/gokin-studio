@@ -7,6 +7,44 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## What's Done (iter 1228+ — GLM thinking-config correctness: honor "disabled", consistent budget, testable policy)
+
+Driven by a multi-agent GLM-support audit (5 dimensions × adversarial verification). The audit's
+top-ranked confirmed finding: on GLM (the **default** provider) the "disabled" thinking mode was
+**silently ignored** — every turn still ran Extended Thinking. Root cause: `project.go initClient`'s
+`case "disabled":` did nothing (left `EnableThinking=false`, `ThinkingBudget=0`), and the GLM factory
+fallback `if !enableThinking && thinkingBudget == 0 && SupportsGLMThinking(model)` then force-enabled
+thinking at budget 8192. The same structural bug affected Kimi and DeepSeek (same factory pattern).
+
+- **Explicit-disable sentinel** (`factory.go`): new `ThinkingDisabledSentinel int32 = -1`. The studio
+  layer sets it for `ThinkingMode="disabled"`; the GLM/Kimi/DeepSeek factory auto-enable guards now
+  short-circuit on it (`if thinkingBudget == ThinkingDisabledSentinel { enableThinking = false; ... }`)
+  so a user who turns thinking OFF actually gets it off. A negative budget never reaches a request body
+  (anthropic.go gates the thinking block on `budget > 0`), so it's inert downstream.
+- **Provider-aware explicit-enable budget** (`factory.go DefaultThinkingBudget`): `ThinkingMode="enabled"`
+  with no user budget previously hardcoded 4096 — but GLM auto-mode runs at 8192 (its factory canon), so
+  toggling a GLM project auto→enabled silently HALVED the budget. New `DefaultThinkingBudget(provider)`
+  returns 8192 for GLM, 4096 for others; auto and explicit-enable now match per provider.
+- **Exported `SupportsGLMThinking`** (`factory.go`): was unexported, which is why GLM auto-enable was
+  implicit-only (left to the factory) while Kimi/DeepSeek were explicit in `project.go`. Now exported so
+  `project.go` makes GLM auto-enable explicit and co-located with the others — one authoritative policy
+  site; the factory fallback remains as defense-in-depth for direct callers.
+- **`resolveThinkingConfig` pure helper** (`project.go`): the inline `ThinkingMode` switch became a pure
+  `func resolveThinkingConfig(mode, provider, model string, userBudget int32) (enable bool, budget int32)`,
+  separating policy from client-wiring so it's unit-testable without a key/network. `initClient` now calls it.
+- **Tests** (+9): client `factory_provider_test.go` — `TestSupportsGLMThinking`,
+  `TestNewGLMClient_AutoEnablesThinking`, `TestNewGLMClient_RespectsExplicitDisable` (the regression),
+  `TestNewKimiClient_RespectsExplicitDisable`, `TestNewDeepSeekClient_RespectsExplicitDisable`,
+  `TestNewGLMClient_ExplicitEnableUsesUserBudget`, `TestDefaultThinkingBudget`; studio
+  `thinking_config_test.go` — `TestResolveThinkingConfig` (16 sub-cases) +
+  `TestResolveThinkingConfig_GLMAutoVsEnabledConsistent`. Full `-race ./internal/engine/client/
+  ./internal/studio/` green, `go vet` clean.
+- **Honest value**: the "disabled" fix is a real correctness bug on the default provider (wasted
+  tokens/cost/latency against explicit user intent) — medium/high. The budget-consistency + comment +
+  helper-extraction are low-value correctness/clarity, but they remove a genuine surprise (auto→enabled
+  halving) and make the whole policy regression-tested. No behavior change for Kimi/DeepSeek users
+  (their auto and explicit budgets were already both 4096).
+
 ## What's Done (iter 1227+ — test fixup for SetTurnContext behavior change)
 
 - **Test updates** (`agent_loop_test.go`, `permission_mode_test.go`): batch 25 switched pinned context delivery from system instruction injection to `SetTurnContext`, but three existing tests (`TestSendMessage_PinnedContextApplied`, `TestSendMessage_NoPinNoSystemInstructionUpdate`, `TestSendMessage_AskAndPinnedCombined`) still asserted the old behavior (pin in `lastSystemInstruction`). Updated: `TestSendMessage_PinnedContextApplied` now checks `lastTurnContext` contains the pin and `lastSystemInstruction` does NOT; `TestSendMessage_NoPinNoSystemInstructionUpdate` also checks `lastTurnContext == ""`; `TestSendMessage_AskAndPinnedCombined` now verifies ask directive in system instruction + pin in turn context. Added `lastTurnContext` capture field to `mockClient.SetTurnContext`.

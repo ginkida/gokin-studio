@@ -308,3 +308,150 @@ func TestNewDeepSeekClient_MissingKey(t *testing.T) {
 		t.Fatal("expected error for missing DeepSeek key")
 	}
 }
+
+// newGLMTestConfig mirrors newKimiTestConfig for the GLM factory path — a
+// minimal config that lets newGLMClient build without network calls.
+func newGLMTestConfig() *config.Config {
+	return &config.Config{
+		API: config.APIConfig{
+			GLMKey: "glm-test-key-for-unit-test-12345",
+		},
+		Model: config.ModelConfig{
+			Name:            "glm-5.2",
+			MaxOutputTokens: 8192,
+		},
+	}
+}
+
+// TestSupportsGLMThinking pins the model-prefix match used to auto-enable
+// Extended Thinking for GLM. GLM is the default provider, so drift here changes
+// reasoning behavior for most users — keep the cases explicit.
+func TestSupportsGLMThinking(t *testing.T) {
+	cases := map[string]bool{
+		"glm-5.2":         true,
+		"glm-5.1":         true,
+		"glm-5":           true,
+		"glm-5-turbo":     true,
+		"glm-4.7":         true,
+		"GLM-5.2":         true, // case-insensitive
+		"glm-4.5":         false,
+		"glm-4-plus":      false,
+		"kimi-for-coding": false,
+		"":                false,
+	}
+	for model, want := range cases {
+		if got := SupportsGLMThinking(model); got != want {
+			t.Errorf("SupportsGLMThinking(%q) = %v, want %v", model, got, want)
+		}
+	}
+}
+
+// TestNewGLMClient_AutoEnablesThinking confirms the factory flips thinking on
+// for glm-5.2 when the user hasn't configured it. GLM is the default provider,
+// so this is the most-exercised auto-enable path.
+func TestNewGLMClient_AutoEnablesThinking(t *testing.T) {
+	cfg := newGLMTestConfig()
+	c, err := newGLMClient(cfg, "glm-5.2")
+	if err != nil {
+		t.Fatalf("newGLMClient: %v", err)
+	}
+	ac, ok := c.(*AnthropicClient)
+	if !ok {
+		t.Fatalf("expected *AnthropicClient, got %T", c)
+	}
+	if !ac.config.EnableThinking {
+		t.Error("EnableThinking should auto-flip to true for glm-5.2 when user hasn't configured it")
+	}
+	if ac.config.ThinkingBudget != defaultGLMThinkingBudget {
+		t.Errorf("ThinkingBudget = %d, want %d (auto-default)", ac.config.ThinkingBudget, defaultGLMThinkingBudget)
+	}
+}
+
+// TestNewGLMClient_RespectsExplicitDisable is the regression for the audit's
+// top finding: a user who explicitly disables thinking (studio sets the
+// ThinkingDisabledSentinel budget) must NOT have it silently re-enabled by the
+// factory auto-enable fallback. Before the fix, disabled was ignored on GLM.
+func TestNewGLMClient_RespectsExplicitDisable(t *testing.T) {
+	cfg := newGLMTestConfig()
+	cfg.Model.EnableThinking = false
+	cfg.Model.ThinkingBudget = ThinkingDisabledSentinel
+	c, err := newGLMClient(cfg, "glm-5.2")
+	if err != nil {
+		t.Fatalf("newGLMClient: %v", err)
+	}
+	ac := c.(*AnthropicClient)
+	if ac.config.EnableThinking {
+		t.Error("explicit-disable sentinel must keep thinking OFF on GLM, but factory re-enabled it")
+	}
+	if ac.config.ThinkingBudget > 0 {
+		t.Errorf("disabled ThinkingBudget should be <= 0, got %d", ac.config.ThinkingBudget)
+	}
+}
+
+// TestNewKimiClient_RespectsExplicitDisable: the sentinel must suppress Kimi
+// auto-enable too (the same structural bug affected all three providers).
+func TestNewKimiClient_RespectsExplicitDisable(t *testing.T) {
+	cfg := newKimiTestConfig()
+	cfg.Model.EnableThinking = false
+	cfg.Model.ThinkingBudget = ThinkingDisabledSentinel
+	c, err := newKimiClient(cfg, "kimi-for-coding")
+	if err != nil {
+		t.Fatalf("newKimiClient: %v", err)
+	}
+	if c.(*AnthropicClient).config.EnableThinking {
+		t.Error("explicit-disable sentinel must keep thinking OFF on Kimi")
+	}
+}
+
+// TestNewDeepSeekClient_RespectsExplicitDisable: same for DeepSeek V4.
+func TestNewDeepSeekClient_RespectsExplicitDisable(t *testing.T) {
+	cfg := newDeepSeekTestConfig()
+	cfg.Model.EnableThinking = false
+	cfg.Model.ThinkingBudget = ThinkingDisabledSentinel
+	c, err := newDeepSeekClient(cfg, "deepseek-v4-pro")
+	if err != nil {
+		t.Fatalf("newDeepSeekClient: %v", err)
+	}
+	if c.(*AnthropicClient).config.EnableThinking {
+		t.Error("explicit-disable sentinel must keep thinking OFF on DeepSeek")
+	}
+}
+
+// TestNewGLMClient_ExplicitEnableUsesUserBudget verifies a user-set budget is
+// preserved on explicit enable (the application layer passes the resolved
+// budget through; the factory only normalizes out-of-range values).
+func TestNewGLMClient_ExplicitEnableUsesUserBudget(t *testing.T) {
+	cfg := newGLMTestConfig()
+	cfg.Model.EnableThinking = true
+	cfg.Model.ThinkingBudget = 16384
+	c, err := newGLMClient(cfg, "glm-5.2")
+	if err != nil {
+		t.Fatalf("newGLMClient: %v", err)
+	}
+	ac := c.(*AnthropicClient)
+	if !ac.config.EnableThinking {
+		t.Error("explicit EnableThinking=true should be preserved on GLM")
+	}
+	if ac.config.ThinkingBudget != 16384 {
+		t.Errorf("explicit ThinkingBudget=16384 should be preserved, got %d", ac.config.ThinkingBudget)
+	}
+}
+
+// TestDefaultThinkingBudget pins the application-layer explicit-enable default:
+// GLM gets its 8192 canon (so auto→enabled doesn't halve the budget), every
+// other provider gets 4096.
+func TestDefaultThinkingBudget(t *testing.T) {
+	cases := map[string]int32{
+		"glm":      defaultGLMThinkingBudget, // 8192
+		"kimi":     4096,
+		"deepseek": 4096,
+		"minimax":  4096,
+		"ollama":   4096,
+		"":         4096,
+	}
+	for provider, want := range cases {
+		if got := DefaultThinkingBudget(provider); got != want {
+			t.Errorf("DefaultThinkingBudget(%q) = %d, want %d", provider, got, want)
+		}
+	}
+}
