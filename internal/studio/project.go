@@ -1060,6 +1060,13 @@ func (p *Project) SendMessage(wailsCtx context.Context, message string, settings
 	// truncationContinuations counts auto-continues fired so far this turn.
 	truncationContinuations := 0
 
+	// incompleteWorkStuck counts consecutive outer-loop iterations where the
+	// model stopped with unfinished todos but ran NO new tool since the last
+	// nudge. Resets whenever a tool executes between nudges (progress made).
+	incompleteWorkStuck := 0
+	toolsExecutedThisTurn := 0
+	toolsExecutedAtLastNudge := 0
+
 	// Agent loop: send -> stream -> if tool calls: execute -> send results -> repeat.
 	// The outer loop handles retries / multi-message sessions (turns cap = 50).
 	// The inner tool loop keeps executing tool-call rounds without re-entering
@@ -1120,6 +1127,7 @@ outer:
 			}
 
 			// Execute tools and collect responses.
+			toolsExecutedThisTurn += len(collected.FunctionCalls)
 			var funcParts []*genai.Part
 			for _, fc := range collected.FunctionCalls {
 				if ctx.Err() != nil {
@@ -1347,6 +1355,31 @@ outer:
 			))
 			session.mu.Unlock()
 			continue
+		}
+
+		// Incomplete-work continuation: model returned text with no tool calls
+		// but its OWN todo list still has unfinished items — it announced the
+		// next step without taking it. Nudge it to act rather than ending the
+		// turn silently. Skip when FinishReason == MaxTokens (already handled
+		// by the truncation block above). Progress-aware: if a tool ran since
+		// the last nudge, reset the stuck counter so genuine multi-step work
+		// is never capped by MaxIncompleteWorkContinuations.
+		if collected != nil && collected.FinishReason != genai.FinishReasonMaxTokens {
+			if n, summary := tools.IncompleteTodoSummary(reg); n > 0 {
+				if toolsExecutedThisTurn > toolsExecutedAtLastNudge {
+					incompleteWorkStuck = 0
+				}
+				if incompleteWorkStuck < tools.MaxIncompleteWorkContinuations {
+					incompleteWorkStuck++
+					toolsExecutedAtLastNudge = toolsExecutedThisTurn
+					session.mu.Lock()
+					session.history = append(session.history, genai.NewContentFromText(
+						tools.IncompleteWorkContinuationPrompt(n, summary), genai.RoleUser,
+					))
+					session.mu.Unlock()
+					continue
+				}
+			}
 		}
 		break
 	}

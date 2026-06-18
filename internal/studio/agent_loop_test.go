@@ -1822,3 +1822,116 @@ func TestAgentLoop_TruncationContinuation_BudgetExhausted(t *testing.T) {
 		t.Error("chat:complete not emitted after exhausting truncation budget")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Incomplete-work continuation (iter 1205)
+// ---------------------------------------------------------------------------
+
+// TestAgentLoop_IncompleteWorkContinuation verifies that when the model
+// returns text with no tool calls but the todo list still has unfinished items,
+// the agent appends the continuation prompt and re-sends; and that once the
+// model marks the todo complete (via tool call), the loop exits normally.
+func TestAgentLoop_IncompleteWorkContinuation(t *testing.T) {
+	// Response 1: text only → incomplete-work check fires → continuation nudge
+	// Response 2: model calls the todo tool to mark items complete
+	// Response 3 (after tool execution): text "Done!" → no more todos → break
+	mc := &mockClient{
+		responses: []mockResp{
+			{text: "I will now write the code..."},
+			{funcCalls: []*genai.FunctionCall{{
+				Name: "todo",
+				ID:   "todo-1",
+				Args: map[string]any{
+					"todos": []any{
+						map[string]any{"content": "write the function", "status": "completed"},
+					},
+				},
+			}}},
+			{text: "Done!"},
+		},
+	}
+
+	// Register a todo tool with an unfinished item.
+	reg := tools.NewRegistry()
+	tt := tools.NewTodoTool()
+	_ = reg.Register(tt)
+	_, _ = tt.Execute(nil, map[string]any{
+		"todos": []any{
+			map[string]any{"content": "write the function", "status": "pending"},
+		},
+	})
+
+	p, rec := newTestProject(t, mc, reg)
+	runAgent(p, "implement foo")
+
+	mc.mu.Lock()
+	calls := mc.callCount
+	mc.mu.Unlock()
+
+	// Three LLM calls: initial → nudge continuation → function response.
+	if calls != 3 {
+		t.Errorf("callCount = %d, want 3 (initial + 1 continuation + 1 function response)", calls)
+	}
+
+	// The continuation prompt should be in session history.
+	p.sessions["default"].mu.RLock()
+	hist := p.sessions["default"].history
+	p.sessions["default"].mu.RUnlock()
+	foundPrompt := false
+	for _, h := range hist {
+		if h.Role == "user" {
+			for _, part := range h.Parts {
+				if part != nil && strings.Contains(part.Text, "unfinished item") {
+					foundPrompt = true
+				}
+			}
+		}
+	}
+	if !foundPrompt {
+		t.Error("incomplete-work continuation prompt not found in session history")
+	}
+
+	// chat:complete must fire so the session ends.
+	if len(rec.find(EventChatComplete)) == 0 {
+		t.Error("chat:complete not emitted after incomplete-work continuation")
+	}
+}
+
+// TestAgentLoop_IncompleteWorkContinuation_BudgetExhausted verifies the loop
+// still exits after MaxIncompleteWorkContinuations consecutive no-action turns.
+func TestAgentLoop_IncompleteWorkContinuation_BudgetExhausted(t *testing.T) {
+	// 4 responses, all text-only — more than the 3-nudge budget.
+	mc := &mockClient{
+		responses: []mockResp{
+			{text: "I will start soon..."},
+			{text: "Almost there..."},
+			{text: "Just one more moment..."},
+			{text: "Finishing up..."},
+		},
+	}
+
+	reg := tools.NewRegistry()
+	tt := tools.NewTodoTool()
+	_ = reg.Register(tt)
+	_, _ = tt.Execute(nil, map[string]any{
+		"todos": []any{
+			map[string]any{"content": "pending task", "status": "pending"},
+		},
+	})
+
+	p, rec := newTestProject(t, mc, reg)
+	runAgent(p, "do the task")
+
+	mc.mu.Lock()
+	calls := mc.callCount
+	mc.mu.Unlock()
+
+	// 1 initial + 3 nudges (budget) = 4 total calls.
+	if calls != tools.MaxIncompleteWorkContinuations+1 {
+		t.Errorf("callCount = %d, want %d", calls, tools.MaxIncompleteWorkContinuations+1)
+	}
+
+	if len(rec.find(EventChatComplete)) == 0 {
+		t.Error("chat:complete not emitted after exhausting incomplete-work budget")
+	}
+}
