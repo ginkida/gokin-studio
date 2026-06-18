@@ -1059,6 +1059,11 @@ func (p *Project) SendMessage(wailsCtx context.Context, message string, settings
 
 	// truncationContinuations counts auto-continues fired so far this turn.
 	truncationContinuations := 0
+	// carriedText accumulates partial text across max_tokens auto-continuations
+	// so that chat:complete.Text (used for OS notification preview) reflects the
+	// FULL combined response rather than just the last segment (ported from
+	// gokin executor.go carriedText pattern).
+	var carriedText string
 
 	// incompleteWorkStuck counts consecutive outer-loop iterations where the
 	// model stopped with unfinished todos but ran NO new tool since the last
@@ -1372,6 +1377,7 @@ outer:
 			collected.Text != "" &&
 			truncationContinuations < maxTruncationContinuations {
 			truncationContinuations++
+			carriedText += collected.Text // accumulate for chat:complete.Text
 			session.mu.Lock()
 			session.history = append(session.history, genai.NewContentFromText(
 				truncationContinuationPrompt, genai.RoleUser,
@@ -1468,6 +1474,14 @@ outer:
 	// budget cache (bumpTotalCostUSD) is bumped in lockstep with the on-disk
 	// usage save inside the persist block, so the two never desync.
 	persisted := ctx.Err() != context.Canceled
+	// Stitch carriedText prefix (from max_tokens continuations) into the final
+	// text so chat:complete.Text (OS notification preview) reflects the full
+	// combined response, not just the last segment.
+	if carriedText != "" && finalText != "" {
+		finalText = carriedText + finalText
+	} else if carriedText != "" {
+		finalText = carriedText
+	}
 	p.emitEvent(wailsCtx, EventChatComplete, ChatCompleteEvent{
 		ProjectID:            p.ID,
 		SessionID:            sid,

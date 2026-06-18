@@ -1790,6 +1790,19 @@ func TestAgentLoop_TruncationContinuation(t *testing.T) {
 	if contCount != 3 {
 		t.Errorf("truncation continuation prompt in history = %d, want 3", contCount)
 	}
+
+	// chat:complete.Text must be the COMBINED text from all continuations (iter
+	// 1209 carriedText fix), not just the last segment.
+	completes := rec.find(EventChatComplete)
+	if len(completes) != 1 {
+		t.Fatalf("expected 1 chat:complete, got %d", len(completes))
+	}
+	completeText := completes[0].data.(ChatCompleteEvent).Text
+	for _, part := range []string{"Part 1", "Part 2", "Part 3", "Part 4 done"} {
+		if !strings.Contains(completeText, part) {
+			t.Errorf("chat:complete.Text missing %q; got %q", part, completeText)
+		}
+	}
 }
 
 // TestAgentLoop_TruncationContinuation_BudgetExhausted verifies that when all
