@@ -1928,18 +1928,22 @@ func (c *AnthropicClient) buildAssistantMessage(parts []*genai.Part) map[string]
 	}
 
 	for _, part := range parts {
-		// Thinking (extended reasoning) blocks — preserve on round-trip so
-		// strict providers (Kimi; Anthropic native when thinking is enabled)
-		// don't reject subsequent assistant messages with tool_use.
+		// Thinking (extended reasoning) blocks — only preserve SIGNED thoughts
+		// on round-trip. Unsigned thinking can't be replayed to strict providers
+		// (Kimi, Anthropic native) and is silently dropped here; the turn-level
+		// canSerialiseAssistantForProvider guard already filters whole turns for
+		// providers that enforce thinking-block replay.
 		if part.Thought && part.Text != "" {
-			block := map[string]interface{}{
-				"type":     "thinking",
-				"thinking": part.Text,
+			if len(part.ThoughtSignature) == 0 {
+				logging.Warn("dropping unsigned thinking part from assistant history",
+					"text_len", len(part.Text))
+				continue
 			}
-			if len(part.ThoughtSignature) > 0 {
-				block["signature"] = string(part.ThoughtSignature)
-			}
-			content = append(content, block)
+			content = append(content, map[string]interface{}{
+				"type":      "thinking",
+				"thinking":  part.Text,
+				"signature": string(part.ThoughtSignature),
+			})
 			continue
 		}
 		if part.Text != "" {
@@ -2092,9 +2096,33 @@ func fallbackToolID(name string, ordinal int) string {
 	return fmt.Sprintf("fallback_%s_%d", sanitizeToolIDComponent(name), ordinal)
 }
 
+// orderToolResultsFirst reorders user message content so tool_result blocks
+// precede any text blocks. Strict providers (Anthropic native, Kimi) require
+// tool_result entries to appear before other content in a user message when
+// both are present; sending text first causes a 400 validation error.
+func orderToolResultsFirst(content []map[string]interface{}) []map[string]interface{} {
+	if len(content) <= 1 {
+		return content
+	}
+	toolResults := make([]map[string]interface{}, 0)
+	other := make([]map[string]interface{}, 0, len(content))
+	for _, block := range content {
+		if stringFromMap(block, "type") == "tool_result" {
+			toolResults = append(toolResults, block)
+		} else {
+			other = append(other, block)
+		}
+	}
+	if len(toolResults) == 0 {
+		return content
+	}
+	return append(toolResults, other...)
+}
+
 // mergeConsecutiveMessages ensures strict user/assistant role alternation
 // required by Anthropic-compatible APIs (Anthropic, MiniMax, DeepSeek, etc.).
 // Consecutive messages with the same role are merged by combining their content arrays.
+// After merging, user messages have their tool_result blocks reordered to appear first.
 func mergeConsecutiveMessages(messages []map[string]interface{}) []map[string]interface{} {
 	if len(messages) <= 1 {
 		return messages
@@ -2111,13 +2139,23 @@ func mergeConsecutiveMessages(messages []map[string]interface{}) []map[string]in
 		currRole := stringFromMap(curr, "role")
 
 		if prevRole == currRole {
-			// Merge content arrays
 			prevContent := extractContentArray(prev["content"])
 			currContent := extractContentArray(curr["content"])
-			prev["content"] = append(prevContent, currContent...)
+			combined := append(prevContent, currContent...)
+			if prevRole == "user" {
+				combined = orderToolResultsFirst(combined)
+			}
+			prev["content"] = combined
 			logging.Debug("merged consecutive messages", "role", prevRole, "index", i)
 		} else {
 			merged = append(merged, curr)
+		}
+	}
+
+	// Final pass: ensure all user messages have tool_results first.
+	for _, msg := range merged {
+		if stringFromMap(msg, "role") == "user" {
+			msg["content"] = orderToolResultsFirst(extractContentArray(msg["content"]))
 		}
 	}
 
