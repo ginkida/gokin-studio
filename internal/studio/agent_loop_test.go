@@ -62,6 +62,10 @@ type mockClient struct {
 	lastSystemInstruction string
 	// Captured by SetTurnContext.
 	lastTurnContext string
+	// Every SetSystemInstruction / SetTurnContext arg in call order — used by
+	// the GLM cache-stability test to assert the cached prefix doesn't drift.
+	systemInstructionCalls []string
+	turnContextCalls       []string
 }
 
 func (m *mockClient) pop() mockResp {
@@ -180,11 +184,13 @@ func (m *mockClient) GetRawClient() any                { return nil }
 func (m *mockClient) SetSystemInstruction(s string) {
 	m.mu.Lock()
 	m.lastSystemInstruction = s
+	m.systemInstructionCalls = append(m.systemInstructionCalls, s)
 	m.mu.Unlock()
 }
 func (m *mockClient) SetTurnContext(s string) {
 	m.mu.Lock()
 	m.lastTurnContext = s
+	m.turnContextCalls = append(m.turnContextCalls, s)
 	m.mu.Unlock()
 }
 func (m *mockClient) SetThinkingBudget(_ int32) {}

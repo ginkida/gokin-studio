@@ -7,6 +7,30 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## What's Done (iter 1230+ — GLM implicit-cache prefix-stability regression lock)
+
+The user asked whether GLM's context cache is actually used. It IS: GLM caches the system+tools prefix
+implicitly server-side (no `cache_control` markers — `supportsPromptCaching` is false for GLM, by design),
+and the cache hits as long as that prefix stays byte-stable across turns. The GLM-support audit's cache
+dimension found NO drift in studio — studio has no question-trim (unlike gokin's PromptBuilder, which it
+doesn't use), and batch 25 already moved pinned context out of the system instruction into a turn-context
+block on the last user message (outside the cached prefix). So the cache already works. But nothing
+*locked* it — a future change re-injecting per-turn content into the system prompt (a timestamp, file list,
+moving the pin back) would silently re-bill the whole prefix every turn with no test to catch it.
+
+- **Regression lock** (`glm_cache_stability_test.go`, +3 tests):
+  - `TestGLMCachePrefix_NotMutatedPerTurnInAutoMode` — across 3 turns in the common case (auto perm mode,
+    no pin) the agent loop must NOT re-apply `SetSystemInstruction` at all; the init-time prefix stands.
+  - `TestGLMCachePrefix_StableAcrossTurnsInAskMode` — when ask mode DOES re-assert the directive each turn,
+    the bytes must be identical turn-to-turn (re-applying the same prefix is cache-safe; drift is not).
+  - `TestGLMCachePrefix_PinnedContextNeverInSystemInstruction` — a pin added between turns must reach
+    `SetTurnContext` (outside the prefix), never the system instruction.
+- **Mock plumbing** (`agent_loop_test.go`): added additive `systemInstructionCalls` / `turnContextCalls`
+  slices to `mockClient` recording every call in order (existing `last*` fields unchanged).
+- **Honest value**: no production behavior change — this codifies an already-correct, user-relevant
+  property (GLM token/latency savings from the implicit cache) as a guard so it can't silently regress.
+  Medium value as a durable invariant on the default provider's hot path.
+
 ## What's Done (iter 1229+ — GLM client-layer stability ports: signature guard, error-body cap, think-flush)
 
 Three verified client-layer ports from fresh gokin, surfaced by the same GLM-support audit. All in
