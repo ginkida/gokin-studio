@@ -375,6 +375,29 @@ func supportsGLMThinking(modelID string) bool {
 	return strings.HasPrefix(m, "glm-5") || strings.HasPrefix(m, "glm-4.7")
 }
 
+// SupportsKimiThinking returns true for Kimi models that implement Extended
+// Thinking on the Coding Plan endpoint. kimi-for-coding and the kimi-k2* prefix
+// cover current and future K2.x variants. (Ported from gokin.)
+func SupportsKimiThinking(modelID string) bool {
+	m := strings.ToLower(modelID)
+	return strings.HasPrefix(m, "kimi-for-coding") ||
+		strings.HasPrefix(m, "kimi-k2")
+}
+
+// SupportsDeepSeekThinking reports whether a DeepSeek model supports Extended
+// Thinking. V4 (pro + flash) and the legacy reasoner do; deepseek-chat does
+// not — it's a pure chat model and the API rejects thinking blocks on that route.
+// (Ported from gokin; empirically confirmed April 2026.)
+func SupportsDeepSeekThinking(modelID string) bool {
+	m := strings.ToLower(modelID)
+	if m == "deepseek-chat" {
+		return false
+	}
+	return strings.HasPrefix(m, "deepseek-v4") ||
+		strings.HasPrefix(m, "deepseek-reasoner") ||
+		m == "deepseek"
+}
+
 // newDeepSeekClient creates a DeepSeek client using Anthropic-compatible API.
 func newDeepSeekClient(cfg *config.Config, modelID string) (Client, error) {
 	// Load API key from environment or config via registry

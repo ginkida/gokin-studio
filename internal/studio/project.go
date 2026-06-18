@@ -564,9 +564,9 @@ func (p *Project) initClient(settings Settings) error {
 	}
 
 	// Apply thinking configuration. ThinkingMode="" (auto) defaults to enabled
-	// for Kimi (always reasoning) and for DeepSeek V4 Pro (the pro variant's
-	// distinguishing feature — flash variant doesn't support thinking, so
-	// auto stays off there). All other providers/models off in auto mode.
+	// for Kimi coding models and for DeepSeek V4 (pro + flash) and legacy
+	// reasoner — these support Extended Thinking on their Anthropic-compat
+	// endpoint. All other providers/models stay off in auto mode.
 	switch p.ThinkingMode {
 	case "enabled":
 		cfg.Model.EnableThinking = true
@@ -577,7 +577,8 @@ func (p *Project) initClient(settings Settings) error {
 	case "disabled":
 		// Explicitly off — nothing to set.
 	default: // "" auto
-		if provider == "kimi" || (provider == "deepseek" && model == "deepseek-v4-pro") {
+		if (provider == "kimi" && client.SupportsKimiThinking(model)) ||
+			(provider == "deepseek" && client.SupportsDeepSeekThinking(model)) {
 			cfg.Model.EnableThinking = true
 			cfg.Model.ThinkingBudget = 4096
 		}

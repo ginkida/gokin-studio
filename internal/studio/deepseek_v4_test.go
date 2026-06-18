@@ -5,8 +5,8 @@ import (
 )
 
 // TestLookupPricing_DeepSeekV4 verifies iter 940+ pricing entries for
-// the V4 lineup. Pro is the flagship with thinking; flash is the
-// economical non-thinking variant. Both share cache pricing tier.
+// the V4 lineup. Both Pro and Flash support Extended Thinking; Flash is
+// the economical variant. Both share the same cache pricing tier.
 func TestLookupPricing_DeepSeekV4(t *testing.T) {
 	cases := []struct {
 		model          string
