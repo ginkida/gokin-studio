@@ -7,6 +7,14 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## What's Done (iter 1223+ — streaming panic barriers + Ollama rune-safe truncation, ported from gokin)
+
+- **Anthropic streaming goroutine panic barrier** (`anthropic.go`): the outer streaming `go func()` had no `recover()`. A panic in the SSE scan loop (e.g. a nil pointer in the chunk accumulator, a driver-level crash) would bring down the whole studio process rather than delivering an error to the UI. Added `defer func() { recover → log + send error ResponseChunk }()` between `defer close(chunks)` and `defer close(done)` — LIFO ordering ensures `chunks` is still open when the barrier fires. The error chunk reaches `ProcessStream` and surfaces as a `chat:error` event. Ported from gokin (batch-13 equivalent).
+- **Scanner goroutine panic barrier** (same file): the inner `go func()` that feeds SSE lines via `scanner.Scan()` also lacked recovery. Added a simpler `recover → log` barrier (no error chunk — the outer goroutine detects the closed `scanCh` and terminates gracefully). Ported from gokin.
+- **Ollama streaming goroutine panic barrier** (`ollama.go`): same pattern — `go func()` calling `c.client.Chat(...)` with no recovery. Panic would crash studio. Added `defer func() { recover → log + send error ResponseChunk }()`. Ported from gokin.
+- **Ollama retry reason rune-safe truncation** (`ollama.go`, line 267): `reason[:47]` byte-slice truncation was present (same pre-fix pattern as batch 21 for `anthropic.go`). Fixed to `[]rune(reason)` slicing so Cyrillic/CJK Ollama error messages don't produce invalid UTF-8 in the retry UI banner.
+- **Honest value**: The panic barriers are pure reliability — normal paths are unaffected. Without them, any panic in the SSE parser or Ollama driver (pointer bugs, unexpected response format, driver update) would terminate the entire studio process silently. With them, the turn ends with a visible error and the app keeps running.
+
 ## What's Done (from improvement phases)
 
 - Markdown rendering in chat (react-markdown + rehype-highlight for assistant messages)

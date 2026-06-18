@@ -235,7 +235,7 @@ func (c *OllamaClient) streamChat(ctx context.Context, req *api.ChatRequest) (*S
 
 		if err := rateLimiter.AcquireWithContext(ctx, estimatedTokens); err != nil {
 			if statusCb != nil {
-				statusCb.OnRateLimit(time.Second) 
+				statusCb.OnRateLimit(time.Second)
 			}
 			return nil, fmt.Errorf("rate limit aborted: %w", err)
 		}
@@ -263,8 +263,8 @@ func (c *OllamaClient) streamChat(ctx context.Context, req *api.ChatRequest) (*S
 						reason = "Ollama not running"
 					} else if strings.Contains(reason, "timeout") {
 						reason = "timeout"
-					} else if len(reason) > 50 {
-						reason = reason[:47] + "..."
+					} else if runes := []rune(reason); len(runes) > 50 {
+						reason = string(runes[:47]) + "..."
 					}
 				}
 				cb.OnRetry(attempt, c.config.MaxRetries, delay, reason)
@@ -317,6 +317,15 @@ func (c *OllamaClient) doStreamChat(ctx context.Context, req *api.ChatRequest) (
 
 	go func() {
 		defer close(chunks)
+		defer func() {
+			if r := recover(); r != nil {
+				logging.Error("panic in ollama streaming goroutine", "panic", r)
+				select {
+				case chunks <- ResponseChunk{Error: fmt.Errorf("internal panic: %v", r), Done: true}:
+				default:
+				}
+			}
+		}()
 		defer close(done)
 
 		var inputTokens, outputTokens int

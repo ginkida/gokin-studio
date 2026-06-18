@@ -997,6 +997,15 @@ func (c *AnthropicClient) doStreamRequest(ctx context.Context, requestBody map[s
 	// Process stream in goroutine
 	go func() {
 		defer close(chunks)
+		defer func() {
+			if r := recover(); r != nil {
+				logging.Error("panic in anthropic streaming goroutine", "panic", r)
+				select {
+				case chunks <- ResponseChunk{Error: fmt.Errorf("internal panic: %v", r), Done: true}:
+				default:
+				}
+			}
+		}()
 		defer close(done)
 		defer closeBody.Do(closeBodyFn)
 
@@ -1021,6 +1030,11 @@ func (c *AnthropicClient) doStreamRequest(ctx context.Context, requestBody map[s
 		// Exits when: scanner ends, context cancelled, or stopScan closed (scanLoop exited).
 		go func() {
 			defer close(scanCh)
+			defer func() {
+				if r := recover(); r != nil {
+					logging.Error("panic in scanner goroutine", "panic", r)
+				}
+			}()
 			for {
 				ok := scanner.Scan()
 				select {
