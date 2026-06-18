@@ -969,8 +969,10 @@ func (c *AnthropicClient) doStreamRequest(ctx context.Context, requestBody map[s
 
 	// Stream idle timeout (configurable, default 30s between chunks)
 	streamIdleTimeout := c.config.StreamIdleTimeout
-	// Stream idle warning - half of idle timeout
-	streamIdleWarning := streamIdleTimeout / 2
+	// Stream idle warning: cap at 30s so providers with relaxed timeouts
+	// (GLM 180s, Kimi/DeepSeek 120s) still give the user timely UI feedback
+	// rather than waiting 90s before showing "still waiting...".
+	streamIdleWarning := min(streamIdleTimeout/2, 30*time.Second)
 
 	// Capture status callback and thinking config for goroutine.
 	// Reading EnableThinking in the goroutine without the lock is a data race

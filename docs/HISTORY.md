@@ -7,6 +7,11 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## What's Done (iter 1225+ — streamIdleWarning cap at 30 s, ported from gokin)
+
+- **`streamIdleWarning` cap** (`anthropic.go`): previously `streamIdleWarning = streamIdleTimeout / 2`. With studio's long stream idle timeouts for thinking providers (GLM: 180 s, Kimi/DeepSeek: 120 s), the first "still waiting..." UI feedback wouldn't appear until 90 s / 60 s respectively — too long. Changed to `min(streamIdleTimeout/2, 30*time.Second)`, matching gokin. Now the warning fires at most 30 s after the stream goes idle regardless of configured timeout, giving timely feedback while the generous timeout still prevents premature kills. Default 30 s timeout: no change (warning was already 15 s). GLM: warning moves from 90 s → 30 s.
+- **Honest value**: pure UX — the long timeouts are still there to prevent killing legitimate slow thinking requests. The cap just makes the "still waiting" indicator appear sooner.
+
 ## What's Done (iter 1224+ — thinking-idle timeout extension + OnThinkingIdle interface, ported from gokin)
 
 - **Thinking-idle timeout extension** (`anthropic.go`): when Extended Thinking is enabled and the stream idle timer fires with NO content received yet (the model is in its silent reasoning phase), the timeout is extended ONCE by `streamIdleTimeout` (default 30 s → effective 60 s) before giving up with `ErrStreamIdleTimeout`. Previously, a GLM-5.2 or Kimi model doing a long think would be killed at exactly 30 s even though it was working normally. Now it gets a second 30 s window. `logging.Info("extending idle timeout for thinking model — no content yet")` records the extension. Ported from gokin.
