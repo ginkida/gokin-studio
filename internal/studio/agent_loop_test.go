@@ -28,15 +28,16 @@ import (
 // Otherwise the response streams text and/or function calls followed by a Done chunk.
 type mockResp struct {
 	text         string
-	thinking     string             // emitted as Thinking chunk before text
+	thinking     string // emitted as Thinking chunk before text
 	funcCalls    []*genai.FunctionCall
 	parts        []*genai.Part      // emitted as a Parts chunk (e.g. Thought:true)
 	inputTokens  int                // reported on Done chunk
 	outputTokens int                // reported on Done chunk
+	finishReason genai.FinishReason // reported on Done chunk; "" → FinishReasonStop
 	err          error
-	nilResp      bool               // return (nil, nil) — no error, no stream
-	streamErr    error              // emit an error chunk inside the stream
-	cancelProj   *Project           // if set, cancel session context before returning
+	nilResp      bool     // return (nil, nil) — no error, no stream
+	streamErr    error    // emit an error chunk inside the stream
+	cancelProj   *Project // if set, cancel session context before returning
 }
 
 // mockClient implements client.Client using a pre-loaded queue of responses.
@@ -93,7 +94,7 @@ func makeStream(r mockResp) *client.StreamingResponse {
 	if len(r.parts) > 0 {
 		ch <- client.ResponseChunk{Parts: r.parts}
 	}
-	ch <- client.ResponseChunk{Done: true, InputTokens: r.inputTokens, OutputTokens: r.outputTokens}
+	ch <- client.ResponseChunk{Done: true, InputTokens: r.inputTokens, OutputTokens: r.outputTokens, FinishReason: r.finishReason}
 	close(ch)
 	return &client.StreamingResponse{Chunks: ch}
 }
@@ -165,22 +166,22 @@ func (m *mockClient) SendMessage(_ context.Context, _ string) (*client.Streaming
 	}
 	return makeStream(*r), nil
 }
-func (m *mockClient) SetTools(_ []*genai.Tool)     {}
-func (m *mockClient) SetRateLimiter(_ any)         {}
+func (m *mockClient) SetTools(_ []*genai.Tool) {}
+func (m *mockClient) SetRateLimiter(_ any)     {}
 func (m *mockClient) CountTokens(_ context.Context, _ []*genai.Content) (*genai.CountTokensResponse, error) {
 	return nil, nil
 }
-func (m *mockClient) GetModel() string               { return "test-model" }
-func (m *mockClient) SetModel(_ string)              {}
+func (m *mockClient) GetModel() string                 { return "test-model" }
+func (m *mockClient) SetModel(_ string)                {}
 func (m *mockClient) WithModel(_ string) client.Client { return m }
-func (m *mockClient) GetRawClient() any              { return nil }
+func (m *mockClient) GetRawClient() any                { return nil }
 func (m *mockClient) SetSystemInstruction(s string) {
 	m.mu.Lock()
 	m.lastSystemInstruction = s
 	m.mu.Unlock()
 }
-func (m *mockClient) SetThinkingBudget(_ int32)      {}
-func (m *mockClient) Close() error                   { return nil }
+func (m *mockClient) SetThinkingBudget(_ int32) {}
+func (m *mockClient) Close() error              { return nil }
 
 // ---------------------------------------------------------------------------
 // Mock tool
@@ -382,7 +383,7 @@ func TestAgentLoop_ToolCall(t *testing.T) {
 	fc := &genai.FunctionCall{ID: "call-1", Name: "echo", Args: map[string]any{"input": "pong"}}
 	mc := &mockClient{responses: []mockResp{
 		{funcCalls: []*genai.FunctionCall{fc}}, // round 1: one tool call
-		{text: "All done."},                     // round 2: final text
+		{text: "All done."},                    // round 2: final text
 	}}
 	reg := tools.NewRegistry()
 	reg.MustRegister(&echoTool{})
@@ -1091,12 +1092,12 @@ func TestInitClient_EmptyProviderFallback(t *testing.T) {
 
 	rec := &recorder{}
 	p := &Project{
-		ID:        "tp-empty-provider",
-		Name:      "Test",
-		Directory: t.TempDir(),
-		Provider:  "", // empty — must fall back to settings
-		Model:     "", // empty — must fall back to settings
-		sessions:  map[string]*ChatSession{"default": NewChatSession("Chat 1")},
+		ID:          "tp-empty-provider",
+		Name:        "Test",
+		Directory:   t.TempDir(),
+		Provider:    "", // empty — must fall back to settings
+		Model:       "", // empty — must fall back to settings
+		sessions:    map[string]*ChatSession{"default": NewChatSession("Chat 1")},
 		testEmitter: rec.emit,
 	}
 	p.SendMessage(context.Background(), "hello", Settings{
@@ -1126,12 +1127,12 @@ func TestInitClient_KimiModelMigration(t *testing.T) {
 
 	rec := &recorder{}
 	p := &Project{
-		ID:        "tp-kimi-migrate",
-		Name:      "Test",
-		Directory: t.TempDir(),
-		Provider:  "kimi",
-		Model:     "kimi-latest", // legacy model name → must be rewritten to "kimi-for-coding"
-		sessions:  map[string]*ChatSession{"default": NewChatSession("Chat 1")},
+		ID:          "tp-kimi-migrate",
+		Name:        "Test",
+		Directory:   t.TempDir(),
+		Provider:    "kimi",
+		Model:       "kimi-latest", // legacy model name → must be rewritten to "kimi-for-coding"
+		sessions:    map[string]*ChatSession{"default": NewChatSession("Chat 1")},
 		testEmitter: rec.emit,
 	}
 	p.SendMessage(context.Background(), "hello", Settings{
@@ -1734,5 +1735,90 @@ func TestAgentLoop_HistorySearchViaContext(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("history_search result should contain 'needle'; events: %+v", results)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Truncation continuation (iter 1204)
+// ---------------------------------------------------------------------------
+
+// TestAgentLoop_TruncationContinuation verifies that a max_tokens TEXT
+// response with no tool calls triggers an auto-continuation: the agent
+// appends a user nudge to session history and re-sends to the LLM, up to
+// maxTruncationContinuations times.
+func TestAgentLoop_TruncationContinuation(t *testing.T) {
+	// Three truncated responses followed by a final clean response.
+	mc := &mockClient{
+		responses: []mockResp{
+			{text: "Part 1", finishReason: genai.FinishReasonMaxTokens},
+			{text: "Part 2", finishReason: genai.FinishReasonMaxTokens},
+			{text: "Part 3", finishReason: genai.FinishReasonMaxTokens},
+			{text: "Part 4 done", finishReason: genai.FinishReasonStop},
+		},
+	}
+	p, rec := newTestProject(t, mc, nil)
+	runAgent(p, "write a long response")
+
+	// All four LLM calls should have been made.
+	mc.mu.Lock()
+	calls := mc.callCount
+	mc.mu.Unlock()
+	if calls != 4 {
+		t.Errorf("callCount = %d, want 4 (3 continuations + 1 final)", calls)
+	}
+
+	// All four text chunks should have been emitted.
+	texts := rec.find(EventChatText)
+	if len(texts) != 4 {
+		t.Errorf("chat:text events = %d, want 4", len(texts))
+	}
+
+	// The session history should contain the continuation prompt turns.
+	p.sessions["default"].mu.RLock()
+	hist := p.sessions["default"].history
+	p.sessions["default"].mu.RUnlock()
+	contCount := 0
+	for _, h := range hist {
+		if h.Role == "user" {
+			for _, part := range h.Parts {
+				if part != nil && part.Text == truncationContinuationPrompt {
+					contCount++
+				}
+			}
+		}
+	}
+	if contCount != 3 {
+		t.Errorf("truncation continuation prompt in history = %d, want 3", contCount)
+	}
+}
+
+// TestAgentLoop_TruncationContinuation_BudgetExhausted verifies that when all
+// maxTruncationContinuations are used up the loop still exits cleanly rather
+// than looping forever.
+func TestAgentLoop_TruncationContinuation_BudgetExhausted(t *testing.T) {
+	// Four truncated responses — one more than the max allowed.
+	mc := &mockClient{
+		responses: []mockResp{
+			{text: "Part 1", finishReason: genai.FinishReasonMaxTokens},
+			{text: "Part 2", finishReason: genai.FinishReasonMaxTokens},
+			{text: "Part 3", finishReason: genai.FinishReasonMaxTokens},
+			// 4th call: also truncated — budget (3) exhausted after this
+			{text: "Part 4", finishReason: genai.FinishReasonMaxTokens},
+		},
+	}
+	p, rec := newTestProject(t, mc, nil)
+	runAgent(p, "write a really long response")
+
+	// Exactly maxTruncationContinuations+1 calls (1 initial + 3 continuations).
+	mc.mu.Lock()
+	calls := mc.callCount
+	mc.mu.Unlock()
+	if calls != maxTruncationContinuations+1 {
+		t.Errorf("callCount = %d, want %d", calls, maxTruncationContinuations+1)
+	}
+
+	// chat:complete should still fire — loop exits cleanly.
+	if len(rec.find(EventChatComplete)) == 0 {
+		t.Error("chat:complete not emitted after exhausting truncation budget")
 	}
 }

@@ -21,6 +21,17 @@ import (
 	"google.golang.org/genai"
 )
 
+// maxTruncationContinuations bounds how many times a max_tokens-truncated
+// TEXT response is auto-continued per turn. Ported from upstream gokin
+// (tools/max_tokens.go). Exported as a package constant so tests can verify
+// the budget without hard-coding the magic number.
+const maxTruncationContinuations = 3
+
+// truncationContinuationPrompt is the user-role nudge appended to history
+// when auto-continuing a truncated response. The model must resume without
+// repeating already-emitted text and must call the next tool if one is needed.
+const truncationContinuationPrompt = "Continue exactly where the previous assistant message stopped. Do not repeat already-written text. If the next needed action is a tool call, call the tool now; otherwise finish the answer."
+
 // Project represents a single project workspace.
 type Project struct {
 	ID             string
@@ -1046,6 +1057,9 @@ func (p *Project) SendMessage(wailsCtx context.Context, message string, settings
 		}
 	}
 
+	// truncationContinuations counts auto-continues fired so far this turn.
+	truncationContinuations := 0
+
 	// Agent loop: send -> stream -> if tool calls: execute -> send results -> repeat.
 	// The outer loop handles retries / multi-message sessions (turns cap = 50).
 	// The inner tool loop keeps executing tool-call rounds without re-entering
@@ -1314,7 +1328,26 @@ outer:
 			recordResponse(collected)
 		}
 
-		// Tool loop exited — no more FCs (or toolRound cap hit). Done.
+		// Auto-continue if the model hit the output-token limit mid-text.
+		// The partial text is already in session.history from recordResponse;
+		// appending a user nudge and continuing the outer loop lets the model
+		// resume exactly where it stopped. Only fires when there are no tool
+		// calls (a max_tokens WITH tool calls continues naturally through the
+		// tool path on the next round). Bounded by maxTruncationContinuations
+		// so a pathologically verbose model can't loop indefinitely.
+		if collected != nil &&
+			collected.FinishReason == genai.FinishReasonMaxTokens &&
+			len(collected.FunctionCalls) == 0 &&
+			collected.Text != "" &&
+			truncationContinuations < maxTruncationContinuations {
+			truncationContinuations++
+			session.mu.Lock()
+			session.history = append(session.history, genai.NewContentFromText(
+				truncationContinuationPrompt, genai.RoleUser,
+			))
+			session.mu.Unlock()
+			continue
+		}
 		break
 	}
 
