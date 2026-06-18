@@ -3127,6 +3127,23 @@
   border-color: var(--warning);
 }
 
+/* Prompt-cache hit chip — shows how much of last turn's input was served from
+   the provider's prompt cache (GLM's implicit prefix cache). Success accent
+   signals the cost/latency savings. */
+.chat-cache {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-family: 'Geist Mono', 'SF Mono', 'Cascadia Code', monospace;
+  font-size: 10.5px;
+  color: var(--success);
+  padding: 3px 8px;
+  border-radius: 10px;
+  background: var(--success-subtle);
+  border: 1px solid var(--success);
+  cursor: help;
+}
+
 /* ============================================
    Message Actions (hover)
    ============================================ */

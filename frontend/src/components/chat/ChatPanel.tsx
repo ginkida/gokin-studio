@@ -1578,6 +1578,15 @@ function ChatPanelBody({
   const usingProviderTokens = providerInputTokens > 0
   const contextPct = Math.min(100, (estimatedTokens / contextWindow) * 100)
   const showContextWarning = contextPct > 75
+  // Prompt-cache visibility: the provider reports input_tokens (full-price) and
+  // cache_read_input_tokens (discounted) as complementary fields. GLM caches the
+  // system+tools prefix implicitly, so on repeat turns most input is served from
+  // cache. Surface the last turn's hit rate so the savings are visible.
+  const lastCacheRead = (liveUsage?.lastCacheReadTokens ?? 0) || (lastTurnUsage?.lastCacheReadTokens ?? 0)
+  const lastFullInput = (liveUsage?.lastInputTokens ?? 0) || (lastTurnUsage?.lastInputTokens ?? 0)
+  const cacheHitPct = lastCacheRead + lastFullInput > 0
+    ? Math.round((lastCacheRead / (lastCacheRead + lastFullInput)) * 100)
+    : 0
 
   // Total estimated cost for the session: sum of every completed assistant
   // turn's `estimatedCostUSD`. Cheap recomputation on messages-changed; the
@@ -1951,6 +1960,14 @@ function ChatPanelBody({
             >
               {usingProviderTokens ? '' : '~'}
               {formatTokens(estimatedTokens)}/{formatTokens(contextWindow)}
+            </span>
+          )}
+          {lastCacheRead > 0 && (
+            <span
+              className="chat-cache"
+              title={`${lastCacheRead.toLocaleString()} of ${(lastCacheRead + lastFullInput).toLocaleString()} input tokens served from the provider's prompt cache last turn (${cacheHitPct}%) — lower cost and latency`}
+            >
+              <Zap size={11} /> {cacheHitPct}% cached
             </span>
           )}
           {thisSessionActive ? (
@@ -3011,6 +3028,12 @@ function ChatPanelBody({
                     <div className="usage-stats-total-label">Output tokens</div>
                     <div className="usage-stats-total-value">{formatTokens(usageStats.totalOutputTokens || 0)}</div>
                   </div>
+                  {(usageStats.totalCacheTokens || 0) > 0 && (
+                    <div className="usage-stats-total-cell" title="Tokens handled via the provider's prompt cache. GLM caches the system+tools prefix implicitly, so repeat turns are billed at a steep discount — direct cost savings reflected in the total above.">
+                      <div className="usage-stats-total-label">Cached tokens</div>
+                      <div className="usage-stats-total-value">{formatTokens(usageStats.totalCacheTokens || 0)}</div>
+                    </div>
+                  )}
                   <div className="usage-stats-total-cell">
                     <div className="usage-stats-total-label">Turns</div>
                     <div className="usage-stats-total-value">{usageStats.totalTurns || 0}</div>

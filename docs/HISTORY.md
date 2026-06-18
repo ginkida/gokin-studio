@@ -7,6 +7,32 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## What's Done (iter 1232+ — GLM cache visibility: surface the implicit prompt-cache savings in the UI)
+
+Directly answers the user's question "is GLM's cache used?" — now they can SEE it. The backend already
+recorded cache-read tokens end-to-end (`recordResponse` → `totalCacheRead` → `chat:usage`/`chat:complete`
+events → chatStore `totalCacheReadTokens`/`lastCacheReadTokens` → persisted `ProjectUsageStatsInfo
+.TotalCacheTokens`), and `EstimateCost` already prices cache reads at the discounted rate — but **none of
+it was displayed**. GLM caches the system+tools prefix implicitly server-side (input_tokens and
+cache_read_input_tokens are complementary fields — on a hit, input drops ~1032→32 while cache_read rises
+to ~2816), so the savings were real but invisible.
+
+- **Live cache-hit chip** (`ChatPanel.tsx`): next to the context-window indicator, a `⚡ N% cached` chip
+  shows the last turn's prompt-cache hit rate, computed precisely from cache READS:
+  `lastCacheRead / (lastCacheRead + lastInput)` (the two are complementary per the provider's usage). Only
+  renders when `lastCacheReadTokens > 0`, so non-caching providers (Ollama) show nothing. Tooltip explains
+  the token split and the cost/latency benefit.
+- **"Cached tokens" total** (`ChatPanel.tsx` usage-stats modal): a new cell shows the persisted cumulative
+  `totalCacheTokens` across all sessions (only when > 0). Tooltip is honest that this is read+write combined
+  and that the discount is already reflected in the cost total above.
+- **Style** (`App.css`): `.chat-cache` chip in the success accent (signals savings), mirroring `.chat-context`.
+- **Verification**: `tsc --noEmit` clean, `vite build` clean. No backend change (pure surfacing of existing
+  data), so Go suites unaffected. JSX additions are plain derived consts + conditional chips — no hooks
+  added or reordered.
+- **Honest value**: medium — a real, user-facing visibility feature that directly answers the user's stated
+  question and makes GLM's implicit-cache savings legible per-turn and in aggregate. No new
+  correctness/reliability; it surfaces data that was tracked but hidden.
+
 ## What's Done (iter 1231+ — frontend thinking indicator reflects GLM/DeepSeek auto-thinking, drift-free)
 
 Closing the loop on iter 1228 at the UI layer. The "Extended thinking" badge in the StatusBar and the
