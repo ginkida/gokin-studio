@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/ginkida/gokin-studio/internal/engine/cache"
 	"github.com/ginkida/gokin-studio/internal/engine/git"
+	"github.com/ginkida/gokin-studio/internal/engine/logging"
 	"github.com/ginkida/gokin-studio/internal/engine/security"
 )
 
@@ -429,6 +431,14 @@ searchLoop:
 		go func(f string) {
 			defer wg.Done()
 			defer func() { <-semaphore }()
+			defer func() {
+				if r := recover(); r != nil {
+					logging.Error("grep goroutine panic",
+						"file", f,
+						"panic", r,
+						"stack", string(debug.Stack()))
+				}
+			}()
 
 			matches := t.searchFile(f, re, contextLines)
 
@@ -658,6 +668,14 @@ func (t *GrepTool) ExecuteStreaming(ctx context.Context, args map[string]any) (*
 
 	go func() {
 		defer complete()
+		defer func() {
+			if r := recover(); r != nil {
+				logging.Error("panic in streaming grep goroutine",
+					"panic", r,
+					"stack", string(debug.Stack()))
+				errChan <- fmt.Errorf("internal panic: %v", r)
+			}
+		}()
 
 		const maxMatches = 500
 		matchCount := 0
