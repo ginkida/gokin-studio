@@ -3099,6 +3099,12 @@
   border-radius: 12px;
 }
 
+/* Stream-liveness hint (model thinking / stream stalled) — amber so the user
+   reads it as "still working, just slow" rather than a normal generating state. */
+.chat-stream-hint {
+  color: var(--warning);
+}
+
 .chat-elapsed {
   font-family: 'Geist Mono', 'SF Mono', 'Cascadia Code', monospace;
   font-size: 10px;

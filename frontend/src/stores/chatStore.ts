@@ -33,6 +33,12 @@ export interface RetryStatus {
   startedAt: number
 }
 
+export interface StreamStatus {
+  status: 'thinking' | 'stalled'  // a 'resumed' signal clears this (stored as null)
+  provider?: string
+  elapsedMs?: number
+}
+
 export interface AskUserQuestion {
   questionID: string
   question: string
@@ -65,6 +71,7 @@ interface ChatState {
   thinkingStream: Record<string, string>   // chatKey → live reasoning text (for thinking-capable models)
   sessionActive: Record<string, boolean>   // chatKey → is agent running in this session
   retrying: Record<string, RetryStatus | null>  // chatKey → current retry state, null if none
+  streamStatus: Record<string, StreamStatus | null>  // chatKey → live stream-liveness hint (thinking/stalled), null if none
   drafts: Record<string, string>           // chatKey → unsent input draft
   currentUsage: Record<string, TokenUsage | null>  // chatKey → live usage for the in-progress turn
   lastTurnUsage: Record<string, TokenUsage | null>  // chatKey → usage from the most recently completed turn
@@ -95,6 +102,7 @@ interface ChatStore extends ChatState {
   addDispatchResult: (chatKey: string, target: string, success: boolean, content: string) => void
   setSessionActive: (chatKey: string, active: boolean) => void
   setRetrying: (chatKey: string, status: RetryStatus | null) => void
+  setStreamStatus: (chatKey: string, status: StreamStatus | null) => void
   setDraft: (chatKey: string, draft: string) => void
   setCurrentUsage: (chatKey: string, usage: TokenUsage | null) => void
   finalizeUsage: (chatKey: string, usage: TokenUsage | null) => void
@@ -127,6 +135,7 @@ export const useChatStore = create<ChatStore>((set) => ({
   thinkingStream: {},
   sessionActive: {},
   retrying: {},
+  streamStatus: {},
   drafts: {},
   currentUsage: {},
   lastTurnUsage: {},
@@ -178,6 +187,11 @@ export const useChatStore = create<ChatStore>((set) => ({
       retrying: { ...s.retrying, [chatKey]: status },
     })),
 
+  setStreamStatus: (chatKey, status) =>
+    set((s) => ({
+      streamStatus: { ...s.streamStatus, [chatKey]: status },
+    })),
+
   setDraft: (chatKey, draft) =>
     set((s) => ({
       drafts: { ...s.drafts, [chatKey]: draft },
@@ -225,6 +239,8 @@ export const useChatStore = create<ChatStore>((set) => ({
         [projectId]: (s.streaming[projectId] || '') + text,
       },
       retrying: { ...s.retrying, [projectId]: null },
+      // Text is flowing again → clear any stalled/thinking hint.
+      streamStatus: { ...s.streamStatus, [projectId]: null },
     })),
 
   appendThinkingStream: (projectId, text) =>
@@ -363,6 +379,7 @@ export const useChatStore = create<ChatStore>((set) => ({
         currentUsage: { ...s.currentUsage, [projectId]: null },
         lastTurnUsage: { ...s.lastTurnUsage, [projectId]: null },
         retrying: { ...s.retrying, [projectId]: null },
+        streamStatus: { ...s.streamStatus, [projectId]: null },
         drafts: { ...s.drafts, [projectId]: '' },
         sessionActive: { ...s.sessionActive, [projectId]: false },
         unread: nextUnread,
@@ -379,6 +396,7 @@ export const useChatStore = create<ChatStore>((set) => ({
         thinkingStream: del(s.thinkingStream),
         sessionActive: del(s.sessionActive),
         retrying: del(s.retrying),
+        streamStatus: del(s.streamStatus),
         drafts: del(s.drafts),
         currentUsage: del(s.currentUsage),
         lastTurnUsage: del(s.lastTurnUsage),
@@ -411,6 +429,7 @@ export const useChatStore = create<ChatStore>((set) => ({
         thinkingStream: drop(s.thinkingStream),
         sessionActive: drop(s.sessionActive),
         retrying: drop(s.retrying),
+        streamStatus: drop(s.streamStatus),
         drafts: drop(s.drafts),
         currentUsage: drop(s.currentUsage),
         lastTurnUsage: drop(s.lastTurnUsage),

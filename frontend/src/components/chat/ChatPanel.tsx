@@ -66,6 +66,7 @@ function ChatPanelBody({
   const streamingText = useChatStore((s) => chatKey ? s.streaming[chatKey] || '' : '')
   const thinkingStreamText = useChatStore((s) => chatKey ? s.thinkingStream[chatKey] || '' : '')
   const retryStatus = useChatStore((s) => chatKey ? s.retrying[chatKey] : null)
+  const streamStatus = useChatStore((s) => chatKey ? s.streamStatus[chatKey] : null)
   const persistedDraft = useChatStore((s) => chatKey ? s.drafts[chatKey] || '' : '')
   const setDraft = useChatStore((s) => s.setDraft)
   const liveUsage = useChatStore((s) => chatKey ? s.currentUsage[chatKey] : null)
@@ -1973,7 +1974,13 @@ function ChatPanelBody({
           {thisSessionActive ? (
             <span className="chat-generating">
               <Loader2 size={12} className="tool-spinner" />
-              <span>Generating</span>
+              <span className={streamStatus ? 'chat-stream-hint' : undefined}>
+                {streamStatus?.status === 'thinking'
+                  ? `Thinking${streamStatus.provider ? ` (${streamStatus.provider})` : ''}…`
+                  : streamStatus?.status === 'stalled'
+                    ? 'Stream is slow — still waiting…'
+                    : 'Generating'}
+              </span>
               <span className="chat-elapsed">{formatElapsed(elapsedMs)}</span>
               {(() => {
                 // Live output-so-far uses per-turn total (accumulated across

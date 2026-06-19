@@ -7,6 +7,30 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## What's Done (iter 1240+ — surface stream-liveness so a GLM stall shows "still working…" not a frozen UI)
+
+Complements iter 1239. The client already fires `OnThinkingIdle` / `OnStreamIdle` / `OnStreamResume`
+StatusCallback signals during a quiet stream (at ~30s, then every 10s), but **studio never wired a
+StatusCallback** — so those signals were invisible. During a long pause (a model thinking, or a GLM/Kimi
+Coding-Plan stream stalling mid-response — the exact case 1239's idle-extension now tolerates up to two
+idle windows) the UI just showed a frozen-looking "Generating" with zero indication the app was still alive.
+
+- **Backend** (`stream_status.go`, `project.go`, `events.go`): a `streamStatusCallback` (embeds the no-op
+  `DefaultStatusCallback`) maps `OnThinkingIdle`→"thinking", `OnStreamIdle`→"stalled", `OnStreamResume`→
+  "resumed" to a new `chat:stream_status` event. Wired per-turn via a `SetStatusCallback` type-assertion on
+  the client (so it's attributed to the right session; clients without the method just skip it). Retries
+  (chat:retry) and errors (chat:error) keep their own channels — only the liveness hints flow here.
+- **Frontend** (`useWailsEvents.ts`, `chatStore.ts`, `ChatPanel.tsx`, `App.css`): new `streamStatus` map
+  (set on the event, cleared on "resumed", on the next text delta — `appendStreamText` — and on
+  complete/error/clear/drop). The "Generating" chip now shows "Thinking (glm)…" or "Stream is slow — still
+  waiting…" in amber when a hint is active, reverting to "Generating" when data flows again.
+- **Tests** (`stream_status_test.go`): `streamStatusCallback` interface-satisfaction + signal→status
+  mapping (and that OnRetry/OnRateLimit/OnError stay no-ops) + elapsed forwarding. Full `-race`
+  studio+client green, `go vet` clean, `tsc --noEmit` + `vite build` clean.
+- **Honest value**: medium — a real perceived-stability / UX win on a common GLM scenario. The underlying
+  signals already existed and were correct; this makes them visible so a slow/stalled GLM stream reads as
+  "still working" instead of a hang. No change to the streaming/retry logic itself.
+
 ## What's Done (iter 1239+ — GLM stream-stall tolerance + 1308 quota error, from fresh gokin v0.100.36)
 
 Reviewed the new gokin GLM commits (v0.100.31–39). Most are TUI-only (lipgloss/CC-style rendering, command

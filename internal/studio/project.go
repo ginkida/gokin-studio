@@ -794,6 +794,24 @@ func (p *Project) SendMessage(wailsCtx context.Context, message string, settings
 	// working memory changes. Passing "" clears any context from the prior turn.
 	c.SetTurnContext(pinnedCtx)
 
+	// Surface stream-liveness hints (thinking / stalled / resumed) to the UI so a
+	// long quiet pause — a model thinking, or a GLM/Kimi Coding-Plan stream
+	// pausing mid-response — shows "still working…" instead of a frozen view. Set
+	// per-turn so the event is attributed to this session; clients that don't
+	// support a status callback (the type assertion fails) just skip it.
+	if setter, ok := c.(interface {
+		SetStatusCallback(client.StatusCallback)
+	}); ok {
+		setter.SetStatusCallback(&streamStatusCallback{
+			emit: func(status, provider string, elapsedMs int) {
+				p.emitEvent(wailsCtx, EventChatStreamStatus, ChatStreamStatusEvent{
+					ProjectID: p.ID, SessionID: sid,
+					Status: status, Provider: provider, ElapsedMs: elapsedMs,
+				})
+			},
+		})
+	}
+
 	// Re-apply the "ask before changes" permission directive each turn so it
 	// reflects any change the user made since initClient ran.
 	if permMode == "ask" {

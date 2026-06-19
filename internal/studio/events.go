@@ -9,10 +9,14 @@ const (
 	EventChatToolCall      = "chat:tool_call"
 	EventChatToolProgress  = "chat:tool_progress"
 	EventChatToolResult    = "chat:tool_result"
-	EventChatComplete   = "chat:complete"
-	EventChatError      = "chat:error"
-	EventChatRetry      = "chat:retry"
-	EventChatUsage      = "chat:usage"
+	EventChatComplete      = "chat:complete"
+	EventChatError         = "chat:error"
+	EventChatRetry         = "chat:retry"
+	EventChatUsage         = "chat:usage"
+	// EventChatStreamStatus surfaces stream-liveness hints (the model is thinking,
+	// or a slow/stall-prone provider's stream has gone quiet, or it resumed) so the
+	// UI can show "still working…" instead of looking frozen during a long pause.
+	EventChatStreamStatus = "chat:stream_status"
 
 	EventTerminalOutput = "terminal:output"
 	EventTerminalExit   = "terminal:exit"
@@ -79,6 +83,18 @@ type ChatRetryEvent struct {
 	Max       int    `json:"max"`
 	DelayMs   int    `json:"delayMs"`
 	Reason    string `json:"reason"`
+}
+
+// ChatStreamStatusEvent surfaces a stream-liveness hint to the UI during a long
+// pause. Status is one of: "thinking" (model in its silent reasoning phase),
+// "stalled" (a slow/stall-prone provider's stream has gone quiet mid-response),
+// or "resumed" (data started flowing again — clear the hint).
+type ChatStreamStatusEvent struct {
+	ProjectID string `json:"projectID"`
+	SessionID string `json:"sessionID"`
+	Status    string `json:"status"`
+	Provider  string `json:"provider,omitempty"`
+	ElapsedMs int    `json:"elapsedMs,omitempty"`
 }
 
 // ChatCompleteEvent is emitted when the agent finishes. InputTokens/OutputTokens

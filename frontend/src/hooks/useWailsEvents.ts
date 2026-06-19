@@ -82,6 +82,7 @@ export function useWailsEvents() {
         // the status set if the next stream chunk arrives as a tool call
         // (which doesn't flow through appendStreamText).
         store.setRetrying(key, null)
+        store.setStreamStatus(key, null)
         // Clear any stale ask_user card. If the agent goroutine's ctx was
         // cancelled while the user was deliberating, the handler returned
         // without resolving the question — the card would otherwise linger.
@@ -176,6 +177,7 @@ export function useWailsEvents() {
         const key = chatKey(data); if (!key) return
         const store = useChatStore.getState()
         store.setRetrying(key, null)
+        store.setStreamStatus(key, null)
         // Same stale-card protection as chat:complete — a fatal error aborts
         // the agent before it can resolve a pending ask_user question.
         store.setAskUser(key, null)
@@ -233,6 +235,20 @@ export function useWailsEvents() {
           reason: data.reason,
           startedAt: Date.now(),
         })
+      }),
+      EventsOn('chat:stream_status', (data: any) => {
+        const key = chatKey(data); if (!key) return
+        const store = useChatStore.getState()
+        // "resumed" clears the hint; "thinking"/"stalled" set it.
+        if (data.status === 'resumed') {
+          store.setStreamStatus(key, null)
+        } else {
+          store.setStreamStatus(key, {
+            status: data.status,
+            provider: data.provider,
+            elapsedMs: data.elapsedMs,
+          })
+        }
       }),
       EventsOn('session:renamed', (data: any) => {
         // App.tsx owns the sessions list; emit a DOM event it can listen to.
