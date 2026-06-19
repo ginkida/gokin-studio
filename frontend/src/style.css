@@ -3,13 +3,15 @@
    ============================================ */
 :root,
 [data-theme="dark"] {
-  /* Background layers (from deepest to highest) */
-  --bg-deepest: #0b0b0f;
-  --bg-deep: #131319;
-  --bg-panel: #1b1b22;
-  --bg-surface: #23232c;
-  --bg-hover: #2a2a34;
-  --bg-active: #34343f;
+  /* Background layers (from deepest to highest) — neutral near-black ramp
+     matching the target mockup (less blue-gray tint, cards a touch lighter
+     than the app floor). Monotonic luminance: 13→19→22→29→38→48. */
+  --bg-deepest: #0d0d0f;
+  --bg-deep: #131316;
+  --bg-panel: #16161a;
+  --bg-surface: #1d1d22;
+  --bg-hover: #26262b;
+  --bg-active: #303036;
   /* Aliases referenced ~20× across App.css (e.g. .sidebar-search) that were
      never defined, so those surfaces silently rendered transparent. Anchor
      them to the ramp: --bg-deeper = app floor, --bg-input = field surface. */
@@ -39,9 +41,10 @@
   --error: #f87171;
   --error-subtle: rgba(248, 113, 113, 0.12);
 
-  /* Message bubbles */
-  --user-bubble: #2b2b3a;
-  --assistant-bubble: #1c1c24;
+  /* Message bubbles — neutralized in lockstep with the bg ramp so they don't
+     sit half-violet on the neutral chat bg (assistant matches the card layer). */
+  --user-bubble: #26262b;
+  --assistant-bubble: #16161a;
   --msg-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
 
   /* Shadows */

@@ -25,6 +25,29 @@ First minor release since v1.0.0 (97 commits). Headlines:
 
 ---
 
+## What's Done (iter 1247+ — Redesign pass #2: neutralize the dark bg ramp toward near-black [palette foundation complete])
+
+Plan iter 2 (completes the palette foundation begun in iter 1246). Retuned the dark-theme background
+elevation ramp from a faintly blue-gray scale to the mockup's neutral near-black, and neutralized the two
+message-bubble tokens in lockstep so bubbles don't read half-violet on a now-neutral chat bg:
+
+- `--bg-deepest` `#0b0b0f`→`#0d0d0f`, `--bg-deep` `#131319`→`#131316`, `--bg-panel` `#1b1b22`→`#16161a`,
+  `--bg-surface` `#23232c`→`#1d1d22`, `--bg-hover` `#2a2a34`→`#26262b`, `--bg-active` `#34343f`→`#303036`.
+- `--user-bubble` `#2b2b3a`→`#26262b`, `--assistant-bubble` `#1c1c24`→`#16161a` (now matches the card layer).
+
+Validated the new ramp is monotonically increasing in luminance with every step ≥3 (13→19→22→29→38→48), so
+adjacent layers (card-on-panel, hover-on-surface) stay perceptibly distinct — the plan's flagged risk
+(flattening two near-equal layers) was checked numerically before applying. Light theme left untouched (it
+was already neutral). No selectors changed — pure token-value tuning, so every existing `var(--bg-*)`
+consumer re-skins at once. CSS-only → JSX-hook audit N/A. Verified: no stray old-bg hex literals remain in
+App.css, `tsc` + `vite build` clean.
+
+Palette foundation (iters 1246+1247) is now complete: the whole app is blue-accented on a neutral
+near-black ramp matching the mockup, with the two previously-transparent surfaces repaired. Remaining plan
+iterations are visual region work (right-panel cards, compact tool-lines + file chips, composer polish,
+sidebar chrome) and the two structural/higher-risk ones (full-width top bar shell, inset window chrome),
+sequenced last.
+
 ## What's Done (iter 1246+ — Redesign pass #1: blue accent + repair two undefined bg tokens [palette foundation])
 
 New design direction: the user supplied a target mockup (task-centric sidebar + right Git/Goal/Progress
