@@ -146,7 +146,7 @@ func (s *Studio) AddProject(name, directory string) (*ProjectInfo, error) {
 		return nil, fmt.Errorf("project name cannot be empty")
 	}
 	if len(name) > 60 {
-		name = name[:60]
+		name = truncateUTF8(name, 60)
 	}
 	abs, err := filepath.Abs(directory)
 	if err != nil {
@@ -672,7 +672,7 @@ func (s *Studio) RenameChatSession(projectID, sessionID, newName string) error {
 		return fmt.Errorf("session name cannot be empty")
 	}
 	if len(newName) > 60 {
-		newName = newName[:60]
+		newName = truncateUTF8(newName, 60)
 	}
 	s.mu.RLock()
 	p, ok := s.projects[projectID]
@@ -890,7 +890,7 @@ func (s *Studio) ForkChatSession(projectID, sessionID string, userIndexFromEnd i
 		}
 	}
 	if len(name) > 60 {
-		name = name[:60]
+		name = truncateUTF8(name, 60)
 	}
 
 	p.mu.Lock()
@@ -1802,7 +1802,7 @@ func (s *Studio) RenameProject(id, newName string) error {
 		return fmt.Errorf("name cannot be empty")
 	}
 	if len(newName) > 60 {
-		newName = newName[:60]
+		newName = truncateUTF8(newName, 60)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

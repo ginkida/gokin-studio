@@ -102,7 +102,7 @@ func (s *Studio) SaveUserPromptTemplate(name, description, prompt string) (strin
 		return "", fmt.Errorf("name cannot be empty")
 	}
 	if len(name) > UserPromptNameMaxBytes {
-		name = name[:UserPromptNameMaxBytes]
+		name = truncateUTF8(name, UserPromptNameMaxBytes)
 	}
 	prompt = strings.TrimRight(prompt, " \t\r\n") // keep leading whitespace intact (might be intentional indentation)
 	if strings.TrimSpace(prompt) == "" {

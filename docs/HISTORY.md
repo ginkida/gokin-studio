@@ -7,6 +7,33 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## What's Done (iter 1235+ — rune-safe name truncation: stop config.yaml !!binary corruption on multibyte names)
+
+From a fresh adversarial audit of UNCOVERED surfaces (persistence/crash-recovery, terminal/PTY, backup/
+restore/archive, export/import — 7 findings → 4 distinct bugs after dedup/refutation). Top-ranked (medium):
+
+**Project/session/template name caps used raw byte slicing (`name = name[:60]`), violating the documented
+`truncateUTF8` rune-safe invariant.** When a multibyte rune (CJK/emoji) straddles byte 60, the slice cuts
+mid-rune → invalid UTF-8. The verifier *empirically reproduced* the worst case: for PROJECT names, that
+invalid string reaches `config.yaml` via yaml.v3, which serializes it as a `!!binary` base64 blob —
+corrupting the display name (returns as U+FFFD on reload). Session/template names degrade to U+FFFD in
+their history/JSON. Reachable by a user typing such a name OR an attacker-supplied import `name` field.
+
+- **Fix** (7 call sites): replaced every `name = name[:60]` / `newName = newName[:60]` /
+  `name = name[:UserPromptNameMaxBytes]` with `truncateUTF8(name, N)` — the same rune-safe helper drafts
+  and pins already use. Sites: `app.go` (AddProject:149, RenameChatSession:675, ForkChatSession:893,
+  RenameProject:1805), `project_export.go:176`, `session_export.go:163`, `user_prompt_templates.go:105`.
+- **Tests** (`name_truncation_test.go`, +3): `AddProject` / `RenameProject` with a name whose rune crosses
+  byte 60 persists valid UTF-8 and `config.yaml` contains NO `!!binary` node (round-trips clean via
+  LoadConfig); a direct check that the old byte-slice IS invalid at the boundary while `truncateUTF8` is
+  valid (non-vacuous). Full `-race ./internal/studio/` green, `go vet` clean.
+- **Honest value**: medium — a real correctness/corruption bug that violates a *documented* reliability
+  invariant, with a realistic trigger (any CJK/emoji title at the cap, or a malicious import). Bounded to
+  the display name (no chat/usage data loss), but it corrupts the persisted config and the on-screen name.
+- **Remaining from this audit (low, deferred)**: B1 import/restore leaves configDir 0755 instead of 0700
+  (directory-metadata exposure on multi-user hosts); B2 staging dir leaked on final-swap failure; B3 manual
+  Cleanup can sweep a live import-staging dir; B4 a corrupt history JSON silently drops the session tab.
+
 ## What's Done (iter 1234+ — tool-layer correctness from a fresh gokin diff: grep cache count + fuzzy-edit lock)
 
 Re-diffed fresh gokin `internal/tools/` for unported correctness fixes (the prior re-audit's gokin-diff
