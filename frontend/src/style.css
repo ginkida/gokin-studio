@@ -63,6 +63,12 @@
      readable. Light theme overrides this to a dark value because we use
      github-dark-dimmed whose token colours have poor contrast on light bg. */
   --code-bg: var(--bg-deepest);
+
+  /* Monospace stack for code, token counts, file paths, elapsed times, etc.
+     This token was referenced ~49× across App.css but never defined, so every
+     `font-family: var(--font-mono)` silently fell back to the sans-serif body
+     font. Mirrors the literal stack used in the few direct declarations. */
+  --font-mono: 'Geist Mono', 'SF Mono', 'JetBrains Mono', 'Cascadia Code', 'Fira Code', ui-monospace, monospace;
 }
 
 /* ============================================

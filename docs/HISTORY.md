@@ -7,6 +7,29 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## What's Done (iter 1242+ — UX/UI pass #1: restore monospace rendering + reveal hover-hidden controls)
+
+First iteration of a UX/UI loop (multi-agent review → verified, ranked backlog across a11y / states /
+consistency / feedback). Took the top value-per-effort CSS wins (pure CSS, no markup/hooks):
+
+- **`--font-mono` was undefined but used 49× across App.css** — so every `font-family: var(--font-mono)`
+  silently fell back to the sans-serif body font: code blocks, token/cost counts, file paths, elapsed
+  chips, diffs all rendered in the WRONG font app-wide. Defined the token in `style.css :root` to the
+  monospace stack the few literal declarations already use (`'Geist Mono', 'SF Mono', 'JetBrains Mono',
+  'Cascadia Code', 'Fira Code', ui-monospace, monospace`). One line fixes all 49 — the highest
+  value-per-effort find. (Theme-independent → in the shared `:root` so both themes get it.)
+- **Hover-hidden action clusters were invisible to keyboard focus** — `.msg-actions` (Copy/Edit/Re-run),
+  `.code-copy-btn`, and `.tab-close` sit at `opacity:0` and only revealed on `:hover`/`.focused`, so a
+  keyboard user Tabbing in focused a fully-transparent button (the focus ring drew on nothing). Added a
+  `:focus-within` reveal alongside each `:hover` rule.
+- **Code-block Copy was undiscoverable** (opacity:0 until hover — invisible on trackpad/touch). Now faintly
+  visible at rest (`opacity:0.5`), solidifying on hover/focus.
+- **Verification**: `tsc --noEmit` clean, `vite build` clean. Pure CSS — no JS/JSX/hook changes.
+- **Honest value**: high for the `--font-mono` fix (a real, glaring app-wide visual regression fixed in one
+  line); medium for the keyboard-reveal + copy-discoverability (genuine a11y/usability papercuts). More UX
+  backlog items (icon-button aria-labels, modal focus/dialog roles, dispatch-card keyboard selection,
+  hardcoded-color→token, empty/error states) queued for subsequent iterations.
+
 ## What's Done (iter 1241+ — preserve the model's partial output when a stream dies mid-response)
 
 Completes the GLM-stability arc (1239 tolerate stalls → 1240 show stalls → 1241 don't lose work when a
