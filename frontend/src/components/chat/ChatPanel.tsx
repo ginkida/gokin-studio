@@ -4424,6 +4424,18 @@ function formatElapsed(ms: number): string {
   return remMin > 0 ? `${hours}h ${remMin}m` : `${hours}h`
 }
 
+// activateOnKey makes a div-acting-as-button keyboard-operable: it fires the
+// toggle on Enter/Space (and preventDefaults Space so it doesn't scroll the
+// page). Plain helper, not a hook — safe to use inline as an onKeyDown prop.
+function activateOnKey(toggle: () => void) {
+  return (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault()
+      toggle()
+    }
+  }
+}
+
 // iter 1030+: keep only the last N lines of a streaming output blob so the
 // preview area stays a fixed visual size during long builds. Trims from the
 // FRONT (oldest lines drop) so the user always sees the most recent activity
@@ -4840,7 +4852,11 @@ function GrepView({ content, pattern }: { content: string; pattern?: string }) {
           <div key={g.file} className="grep-group">
             <div
               className="grep-file"
+              role="button"
+              tabIndex={0}
+              aria-expanded={!isCollapsed}
               onClick={() => setCollapsed((s) => ({ ...s, [g.file]: !isCollapsed }))}
+              onKeyDown={activateOnKey(() => setCollapsed((s) => ({ ...s, [g.file]: !isCollapsed })))}
             >
               <ChevronRight size={10} className={`tool-chevron ${isCollapsed ? '' : 'expanded'}`} />
               <span className="grep-file-path">{g.file}</span>
@@ -5054,7 +5070,7 @@ function MessageBubbleInner({ message, onRerun, canEdit, onEditSubmit, changedFi
     const wordCount = message.content.trim().split(/\s+/).length
     return (
       <div className={`message thinking ${focused ? 'focused' : ''}`} data-msg-id={message.id} onContextMenu={onContextMenu}>
-        <div className="thinking-chip" onClick={() => setExpanded(!expanded)}>
+        <div className="thinking-chip" role="button" tabIndex={0} aria-expanded={expanded} onClick={() => setExpanded(!expanded)} onKeyDown={activateOnKey(() => setExpanded(!expanded))}>
           <Brain size={12} className="thinking-icon" />
           <span className="thinking-label">
             {expanded ? 'Thinking' : `Thought · ${wordCount} words`}
@@ -5117,7 +5133,7 @@ function MessageBubbleInner({ message, onRerun, canEdit, onEditSubmit, changedFi
     return (
       <div className={`message tool ${focused ? 'focused' : ''}`} data-msg-id={message.id} onContextMenu={onContextMenu}>
         <div className={`tool-card tool-rail-${railState} ${expanded ? 'expanded' : ''}`}>
-          <div className="tool-header" onClick={() => setExpanded(!expanded)}>
+          <div className="tool-header" role="button" tabIndex={0} aria-expanded={expanded} onClick={() => setExpanded(!expanded)} onKeyDown={activateOnKey(() => setExpanded(!expanded))}>
             <span className="tool-icon-wrap">{toolIcon}</span>
             <span className="tool-name">{toolName}</span>
             {primary && (
@@ -5518,7 +5534,7 @@ function PlanToolCard({ message, focused, onContextMenu }: { message: ChatMessag
   return (
     <div className={`message tool ${focused ? 'focused' : ''}`} data-msg-id={message.id} onContextMenu={onContextMenu}>
       <div className="plan-card">
-        <div className="plan-card-header" onClick={() => setExpanded(!expanded)}>
+        <div className="plan-card-header" role="button" tabIndex={0} aria-expanded={expanded} onClick={() => setExpanded(!expanded)} onKeyDown={activateOnKey(() => setExpanded(!expanded))}>
           <ListChecks size={14} className="plan-icon" />
           <span className="plan-label">{toolLabel}</span>
           {title && <span className="plan-title">{title}</span>}
@@ -5597,7 +5613,7 @@ function MemoryToolCard({ message, focused, onContextMenu }: { message: ChatMess
   return (
     <div className={`message tool ${focused ? 'focused' : ''}`} data-msg-id={message.id} onContextMenu={onContextMenu}>
       <div className="memory-card">
-        <div className="memory-card-header" onClick={() => setExpanded(!expanded)}>
+        <div className="memory-card-header" role="button" tabIndex={0} aria-expanded={expanded} onClick={() => setExpanded(!expanded)} onKeyDown={activateOnKey(() => setExpanded(!expanded))}>
           <Database size={12} className="memory-icon" />
           <span className="memory-label">{toolLabel}</span>
           {key && <span className="memory-key">{key}</span>}

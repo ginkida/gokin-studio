@@ -7,6 +7,26 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## What's Done (iter 1244+ — UX/UI pass #3: keyboard-operable collapsible tool/plan/memory cards)
+
+Next UX-backlog item — the strongest remaining FUNCTIONAL accessibility gap. The expand/collapse headers on
+tool-call cards, thinking chips, plan cards, memory cards, and grep file-groups were all plain
+`<div onClick={() => setExpanded(!expanded)}>` — non-focusable, no keyboard handler, no `aria-expanded`. A
+keyboard-only user literally could NOT expand a tool result to inspect what the agent ran/returned (core to
+a coding-agent IDE), and a screen reader announced nothing interactive or any collapsed/expanded state.
+
+- **Fix** (`ChatPanel.tsx`): added a module-level `activateOnKey(toggle)` plain helper (fires the toggle on
+  Enter/Space and `preventDefault`s Space so it doesn't scroll the page — not a hook). Added
+  `role="button" tabIndex={0} aria-expanded={…} onKeyDown={activateOnKey(…)}` to all 5 collapsible headers:
+  `.thinking-chip` (5057), `.tool-header` (5120), `.plan-card-header` (5521), `.memory-card-header` (5600),
+  and the grep `.grep-file` group (4853). The global `:focus-visible` ring already covers role=button divs.
+- **Verification**: `tsc --noEmit` clean, `vite build` clean; grep confirms 5 `aria-expanded` and zero
+  collapsible-div onClick toggles left without `role="button"`. JSX-hook audit: `activateOnKey` is a
+  module-level function (not a hook); used inline as an `onKeyDown` prop; no new hooks.
+- **Honest value**: high for functional accessibility — removes a real keyboard/screen-reader block on a
+  core IDE action (inspecting tool results), with `aria-expanded` giving assistive tech the disclosure
+  state. Zero behavior change for mouse users. The helper makes the pattern reusable for future toggles.
+
 ## What's Done (iter 1243+ — UX/UI pass #2: stop the welcome screen flashing before history loads)
 
 Next UX-backlog item. On a session switch (or initial load) to a session whose history wasn't yet in the
