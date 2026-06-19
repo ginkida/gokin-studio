@@ -7,6 +7,27 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## What's Done (iter 1238+ — cleanup grace window so a live import-staging dir isn't swept mid-extract)
+
+Audit finding B3 (low) — the last item in the persistence/PTY/backup backlog. `cleanup.go` swept
+`.gokin-studio.import-staging-*` dirs with `ageDays = 0` (always remove, no mtime guard). But
+`extractArchiveToConfigDir` creates a staging dir and extracts into it for the duration of an import. A
+manual Cleanup (Settings → Cleanup) racing an active import could `os.RemoveAll` the live extract target
+mid-flight — failing the import, or worse, promoting a partial tree as the live config (old config is
+preserved at the pre-backup path, so recoverable, but still a corrupt outcome).
+
+- **Fix** (`cleanup.go`): added `stagingGraceWindow = time.Hour`; staging dirs younger than the window are
+  skipped (treated as a possible in-progress import). An import completes in seconds, so an hour is a
+  generous margin that still reaps genuinely-orphaned staging dirs on the next pass. Snapshot dirs keep
+  their `PreImportDays` gate (logic restructured into an explicit isStaging / isSnapshot branch).
+- **Tests** (`cleanup_old_data_test.go`): updated `…RemovesOrphanStagingDirs` to age the staging dir past
+  the window (still removed); added `…PreservesFreshStagingDir` (a fresh staging dir is NOT swept). Full
+  `-race ./internal/studio/` green, `go vet` clean.
+- **Honest value**: low — narrow trigger (a user clicking Cleanup *during* an active import; startup
+  auto-cleanup can't overlap since it runs before the UI is up), and the existing rollback prevents
+  unrecoverable loss. But it's a real race with a clean, low-risk fix that closes the audit backlog.
+- **Persistence/PTY/backup audit backlog now EXHAUSTED**: A1 (1235), B1+B2 (1236), B4 (1237), B3 (1238).
+
 ## What's Done (iter 1237+ — quarantine corrupt session history instead of silently dropping the tab)
 
 Audit finding B4 (low). A corrupt/truncated `history/{project}_{sid}.json` (disk fault or an interrupted

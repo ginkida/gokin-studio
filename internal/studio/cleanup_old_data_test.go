@@ -136,12 +136,17 @@ func TestCleanupOldData_RemovesOrphanStagingDirs(t *testing.T) {
 	cfgDir := configDir()
 	parent := filepath.Dir(cfgDir)
 
-	// Even a fresh staging dir (left from a crashed import) should be cleared.
+	// An ORPHANED staging dir (older than the grace window — a crashed import
+	// from a while ago) should be cleared.
 	staging := filepath.Join(parent, ".gokin-studio.import-staging-1234")
 	if err := os.MkdirAll(staging, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(staging, "partial.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-stagingGraceWindow - time.Hour)
+	if err := os.Chtimes(staging, old, old); err != nil {
 		t.Fatal(err)
 	}
 
@@ -155,6 +160,36 @@ func TestCleanupOldData_RemovesOrphanStagingDirs(t *testing.T) {
 	}
 	if _, err := os.Stat(staging); !os.IsNotExist(err) {
 		t.Errorf("staging dir not removed: err=%v", err)
+	}
+}
+
+// TestCleanupOldData_PreservesFreshStagingDir is the regression for the audit
+// race: a freshly-created import-staging dir is the live extract target of an
+// in-progress import. Cleanup must NOT sweep it within the grace window, or a
+// manual Cleanup racing an active import could RemoveAll it mid-extract.
+func TestCleanupOldData_PreservesFreshStagingDir(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	parent := filepath.Dir(configDir())
+
+	// Fresh staging dir (mtime ~now) — simulates an import currently extracting.
+	staging := filepath.Join(parent, ".gokin-studio.import-staging-9999")
+	if err := os.MkdirAll(staging, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(staging, "partial.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewStudio()
+	result, err := s.CleanupOldData(DefaultCleanupParams())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.StagingDirsRemoved != 0 {
+		t.Errorf("StagingDirsRemoved=%d, want 0 (a fresh staging dir may be a live import)", result.StagingDirsRemoved)
+	}
+	if _, err := os.Stat(staging); err != nil {
+		t.Errorf("fresh staging dir was swept (could abort a live import): %v", err)
 	}
 }
 

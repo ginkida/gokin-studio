@@ -16,9 +16,9 @@ import (
 // (continues on most errors so a single permission issue doesn't stop the
 // whole sweep).
 type CleanupResult struct {
-	StaleReplaysRemoved  int      `json:"staleReplaysRemoved"`
-	PreImportDirsRemoved int      `json:"preImportDirsRemoved"`
-	StagingDirsRemoved   int      `json:"stagingDirsRemoved"`
+	StaleReplaysRemoved  int `json:"staleReplaysRemoved"`
+	PreImportDirsRemoved int `json:"preImportDirsRemoved"`
+	StagingDirsRemoved   int `json:"stagingDirsRemoved"`
 	// iter 930+: excess auto-backup files beyond AutoBackupRetention (7).
 	// Enforced here regardless of Settings.AutoBackupEnabled so disabling
 	// auto-backup after accumulating 7 backups still gets retention
@@ -30,12 +30,18 @@ type CleanupResult struct {
 }
 
 // CleanupParams controls what CleanupOldData touches. Zero/negative ages
+// stagingGraceWindow is how recently a .gokin-studio.import-staging-* dir must
+// have been touched to be treated as a possible in-progress import (and thus
+// skipped by cleanup). An import completes in seconds; an hour is a generous
+// margin that still reaps genuinely-orphaned staging dirs on the next pass.
+const stagingGraceWindow = time.Hour
+
 // disable the corresponding category (e.g. ReplayAgeDays=0 means skip
 // replays entirely). DryRun=true previews without modifying anything.
 type CleanupParams struct {
-	ReplayAgeDays   int  `json:"replayAgeDays"`   // delete *.replay.jsonl older than N days
-	PreImportDays   int  `json:"preImportDays"`   // delete .gokin-studio.pre-import-* dirs older than N days
-	DryRun          bool `json:"dryRun"`
+	ReplayAgeDays int  `json:"replayAgeDays"` // delete *.replay.jsonl older than N days
+	PreImportDays int  `json:"preImportDays"` // delete .gokin-studio.pre-import-* dirs older than N days
+	DryRun        bool `json:"dryRun"`
 }
 
 // DefaultCleanupParams returns the recommended defaults: replays after 7
@@ -141,15 +147,22 @@ func (s *Studio) CleanupOldData(params CleanupParams) (*CleanupResult, error) {
 			if statErr != nil {
 				continue
 			}
-			// Snapshot dirs: gate by age. Staging dirs: always remove
-			// (they're orphans if they exist).
-			ageDays := params.PreImportDays
+			// Snapshot dirs: gate by PreImportDays. Staging dirs are orphans
+			// once an import finishes — BUT an import in progress holds a
+			// freshly-created staging dir as its live extract target. Apply a
+			// short grace window so a manual Cleanup racing an active import
+			// can't RemoveAll the dir mid-extract (which would fail/corrupt the
+			// import). An import takes seconds; anything older than the window is
+			// safely an orphan, and the next cleanup will still reap it.
 			if isStaging {
-				ageDays = 0 // always remove
-			}
-			cutoff := now.Add(-time.Duration(ageDays) * 24 * time.Hour)
-			if isSnapshot && info.ModTime().After(cutoff) {
-				continue
+				if info.ModTime().After(now.Add(-stagingGraceWindow)) {
+					continue // likely an in-progress import — leave it alone
+				}
+			} else { // isSnapshot
+				cutoff := now.Add(-time.Duration(params.PreImportDays) * 24 * time.Hour)
+				if info.ModTime().After(cutoff) {
+					continue
+				}
 			}
 			size := dirSize(full)
 			result.BytesFreed += size
