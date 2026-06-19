@@ -25,6 +25,37 @@ First minor release since v1.0.0 (97 commits). Headlines:
 
 ---
 
+## What's Done (iter 1250+ — Redesign pass #5: filetype file chips + green/red diff counts on write/edit lines)
+
+Plan iter 5 — completes the mockup's "Wrote index.html, app.js +733" vocabulary on top of the flattened
+tool rows from iter 1249.
+
+- ChatPanel.tsx: added `fileTypeClass(path)` (extension → color class: html/css/js/ts/json/md/go/py/rs/sh/yaml)
+  + `getFileTypeIcon(path)` (a small colored `FileText` glyph). Added `diffCounts(old,new)` reusing the
+  existing bounded `computeLineDiff` (coarse O(n) above 400 lines, so cheap even on large edits). In the
+  ToolCard header, write/edit success rows now render `.tool-diff-counts` after the path: green `+N` / red
+  `-N`. A WRITE counts all its lines directly (`writeContent.replace(/\n$/,'').split('\n').length`, no diff
+  pass — a new file adds all its lines); an EDIT diffs `editArgsToDiff(old→new)`. Prefixed each
+  `.changed-file-btn` in the per-message `.changed-files` strip with `getFileTypeIcon(f)` + wrapped the name
+  in `.changed-file-name` (ellipsis).
+- App.css: added `.tool-diff-counts` / `.diff-adds` (green) / `.diff-dels` (red) with tabular-nums; `.file-ic`
+  + `.ft-*` color classes; made `.changed-file-btn` an inline-flex (icon + name). While here, token-ized the
+  two hardcoded green literals on the changed-file chips (`rgba(74,222,128,0.08)` → `var(--success-subtle)`
+  on BOTH `.changed-file-btn` and the more-specific `.changed-file .mono`, which would otherwise override the
+  token) — light-theme-correct, consistent with iters 1245-1247.
+
+PRESERVED: the @-mention insert on chip click, all expand/output behavior. JSX-hook audit: clean — the three
+helpers are pure module-level; `toolDiffCounts` is a derived const gated to write/edit only (non-write/edit
+tools pay nothing); the new JSX is plain conditional rendering + a function call returning static JSX.
+
+HONEST value: medium-high — the green `+N`/`-N` and colored file chips are a recognizable mockup detail and
+genuinely informative (diff size at a glance without expanding). Caveats: (1) the count is an approximation
+for multi-edit (concatenated old/new) and for line-range edits where the old text is unknown (shown as pure
+additions) — honest "size" signal, not a git-exact stat; (2) filetype is conveyed by COLOR on a single
+FileText glyph, not distinct per-type icons (kept to avoid icon-import bloat); (3) the aggregate `+733` across
+multiple files in the `.changed-files` summary strip is still NOT shown (no per-file diff data there) — only
+per-row write/edit counts, which is honest rather than faked. Verified: `tsc` + `vite build` clean.
+
 ## What's Done (iter 1249+ — Redesign pass #4: flatten tool-call cards → compact inline Ran/Wrote/Updated lines)
 
 Plan iter 4 — the mockup's most recognizable center-column signature. Collapsed tool rows were bordered

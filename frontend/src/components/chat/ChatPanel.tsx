@@ -4557,6 +4557,32 @@ function getToolIcon(name: string) {
   return <Zap size={12} />
 }
 
+// Map a file path's extension to a color class so changed-file chips read at a
+// glance (html=orange, css=blue, js=yellow, ts=blue, …). Color carries the
+// filetype signal; the glyph stays a single FileText to avoid icon-import bloat.
+function fileTypeClass(path: string): string {
+  const ext = (path.split('.').pop() || '').toLowerCase()
+  switch (ext) {
+    case 'html': case 'htm': return 'ft-html'
+    case 'css': case 'scss': case 'sass': case 'less': return 'ft-css'
+    case 'js': case 'jsx': case 'mjs': case 'cjs': return 'ft-js'
+    case 'ts': case 'tsx': return 'ft-ts'
+    case 'json': return 'ft-json'
+    case 'md': case 'mdx': return 'ft-md'
+    case 'go': return 'ft-go'
+    case 'py': return 'ft-py'
+    case 'rs': return 'ft-rs'
+    case 'sh': case 'bash': case 'zsh': return 'ft-sh'
+    case 'yml': case 'yaml': case 'toml': return 'ft-yaml'
+    default: return 'ft-default'
+  }
+}
+
+// A small colored filetype glyph for a path (used on changed-file chips).
+function getFileTypeIcon(path: string) {
+  return <FileText size={11} className={`file-ic ${fileTypeClass(path)}`} />
+}
+
 // Extract the primary argument to display inline in the tool pill.
 function getToolPrimary(name: string, args: Record<string, unknown> | undefined): string | null {
   if (!args) return null
@@ -4702,6 +4728,19 @@ function computeLineDiff(oldText: string, newText: string): DiffHunk[] {
   while (i < n) { push('remove', a[i]); i++ }
   while (j < m) { push('add', b[j]); j++ }
   return hunks
+}
+
+// Sum +added / -removed lines for an edit's collapsed summary chip. Reuses
+// computeLineDiff, which already drops to a coarse O(n) path above 400 lines,
+// so this stays cheap even on large edits. (Writes are counted directly from
+// their line count — a new file adds all its lines — without a diff pass.)
+function diffCounts(oldText: string, newText: string): { adds: number; dels: number } {
+  let adds = 0, dels = 0
+  for (const h of computeLineDiff(oldText, newText)) {
+    if (h.kind === 'add') adds += h.lines.length
+    else if (h.kind === 'remove') dels += h.lines.length
+  }
+  return { adds, dels }
 }
 
 // Collapse long equal-context runs to keep the diff readable. Show up to
@@ -5149,6 +5188,11 @@ function MessageBubbleInner({ message, onRerun, canEdit, onEditSubmit, changedFi
     const isGlob = toolName === 'glob' && message.toolSuccess === true && !!message.content
     const editDiff = isEdit ? editArgsToDiff(message.toolArgs as any) : null
     const writeContent = isWrite ? String((message.toolArgs as any)?.content ?? '') : ''
+    // Compact +adds/-dels for the collapsed write/edit row (mockup "Wrote … +733").
+    // A write adds all its lines (cheap line count); an edit diffs old→new.
+    const toolDiffCounts = isWrite
+      ? { adds: writeContent ? writeContent.replace(/\n$/, '').split('\n').length : 0, dels: 0 }
+      : (isEdit && editDiff ? diffCounts(editDiff.oldText, editDiff.newText) : null)
 
     // iter 740+: left accent rail state — pending/success/failure drives a
     // colored left border on .tool-card so status is visible at a glance
@@ -5164,6 +5208,12 @@ function MessageBubbleInner({ message, onRerun, canEdit, onEditSubmit, changedFi
             <span className="tool-verb">{verbLabel(toolName) || toolName.replace(/_/g, ' ')}</span>
             {primary && (
               <span className="tool-primary">{shortenForPill(String(primary))}</span>
+            )}
+            {toolDiffCounts && (toolDiffCounts.adds > 0 || toolDiffCounts.dels > 0) && (
+              <span className="tool-diff-counts">
+                {toolDiffCounts.adds > 0 && <span className="diff-adds">+{toolDiffCounts.adds}</span>}
+                {toolDiffCounts.dels > 0 && <span className="diff-dels">-{toolDiffCounts.dels}</span>}
+              </span>
             )}
             {isPending ? (
               <>
@@ -5373,7 +5423,8 @@ function MessageBubbleInner({ message, onRerun, canEdit, onEditSubmit, changedFi
                       window.dispatchEvent(new CustomEvent('gokin:insert-file-ref', { detail: { path: f } }))
                     }}
                   >
-                    {f}
+                    {getFileTypeIcon(f)}
+                    <span className="changed-file-name">{f}</span>
                   </button>
                 </span>
               ))}

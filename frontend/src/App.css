@@ -2480,6 +2480,33 @@
 .tool-status-word { font-size: 11px; font-weight: 600; flex-shrink: 0; }
 .tool-status-word.fail { color: var(--error); }
 
+/* Compact +adds / -dels on a write/edit row (mockup "Wrote index.html +733"). */
+.tool-diff-counts {
+  display: inline-flex;
+  gap: 6px;
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+.diff-adds { color: var(--success); font-weight: 600; }
+.diff-dels { color: var(--error); font-weight: 600; }
+
+/* Filetype-colored chip glyph. Color carries the type; the glyph is one icon. */
+.file-ic { flex-shrink: 0; }
+.ft-html { color: #e8743b; }
+.ft-css { color: #3b82f6; }
+.ft-js { color: #e8c54b; }
+.ft-ts { color: #4d9fe8; }
+.ft-json { color: #d9a13a; }
+.ft-md { color: #9aa0aa; }
+.ft-go { color: #4dc8e8; }
+.ft-py { color: #4b8be8; }
+.ft-rs { color: #e8884b; }
+.ft-sh { color: #6cc04a; }
+.ft-yaml { color: #c04ac0; }
+.ft-default { color: var(--text-muted); }
+
 /* iter 1030+: live streaming output preview on pending tool cards. Sits
    between the tool header and the expanded detail. Auto-cleared when the
    tool resolves (streamingOutput is dropped in addToolResult).
@@ -3003,25 +3030,29 @@
 .changed-file .mono {
   font-size: 10.5px;
   color: var(--text-primary);
-  background: rgba(74, 222, 128, 0.08);
+  background: var(--success-subtle);
   padding: 1px 5px;
   border-radius: 3px;
 }
 
 .changed-file-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   font-family: 'Geist Mono', 'SF Mono', 'Cascadia Code', monospace;
   font-size: 10.5px;
   color: var(--text-primary);
-  background: rgba(74, 222, 128, 0.08);
+  background: var(--success-subtle);
   padding: 1px 6px;
   border-radius: 3px;
   border: 1px solid transparent;
   cursor: pointer;
   transition: all 0.12s;
 }
+.changed-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
 
 .changed-file-btn:hover {
-  background: rgba(74, 222, 128, 0.16);
+  background: var(--success-subtle);
   border-color: var(--success);
 }
 
