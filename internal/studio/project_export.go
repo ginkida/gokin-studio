@@ -28,16 +28,16 @@ const ImportPayloadMaxBytes = 5 * 1024 * 1024
 // export. The project Directory is intentionally NOT included — paths
 // don't transfer between machines, so the importer picks a fresh one.
 type ProjectExportEnvelope struct {
-	Version      int                       `json:"version"`
-	ExportedAt   int64                     `json:"exportedAt"`
-	Name         string                    `json:"name"`
-	SystemPrompt string                    `json:"systemPrompt,omitempty"`
-	Provider     string                    `json:"provider,omitempty"`
-	Model        string                    `json:"model,omitempty"`
-	Temperature  float32                   `json:"temperature,omitempty"`
-	MaxTokens    int                       `json:"maxTokens,omitempty"`
-	BudgetUSD    float64                   `json:"budgetUSD,omitempty"`
-	Sessions     []SessionExportEnvelope   `json:"sessions"`
+	Version      int                     `json:"version"`
+	ExportedAt   int64                   `json:"exportedAt"`
+	Name         string                  `json:"name"`
+	SystemPrompt string                  `json:"systemPrompt,omitempty"`
+	Provider     string                  `json:"provider,omitempty"`
+	Model        string                  `json:"model,omitempty"`
+	Temperature  float32                 `json:"temperature,omitempty"`
+	MaxTokens    int                     `json:"maxTokens,omitempty"`
+	BudgetUSD    float64                 `json:"budgetUSD,omitempty"`
+	Sessions     []SessionExportEnvelope `json:"sessions"`
 }
 
 // ExportProjectJSON snapshots the project + every session into one JSON

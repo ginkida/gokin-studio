@@ -36,10 +36,10 @@ import (
 // returned to the frontend. Mirrors ChatMessage's text-only fields plus
 // a stable Pin ID and timestamp.
 type PinnedMessage struct {
-	ID        string `json:"id"`        // stable pin ID, generated on Pin()
-	Role      string `json:"role"`      // "user" | "assistant"
-	Content   string `json:"content"`   // full message text snapshot
-	PinnedAt  int64  `json:"pinnedAt"`  // unix millis
+	ID        string `json:"id"`                  // stable pin ID, generated on Pin()
+	Role      string `json:"role"`                // "user" | "assistant"
+	Content   string `json:"content"`             // full message text snapshot
+	PinnedAt  int64  `json:"pinnedAt"`            // unix millis
 	MessageID string `json:"messageID,omitempty"` // frontend message ID at pin time (best-effort jump target)
 }
 

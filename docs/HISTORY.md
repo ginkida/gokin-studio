@@ -7,6 +7,24 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## Release v1.1.0 (2026-06-19)
+
+First minor release since v1.0.0 (97 commits). Headlines:
+- **GLM-5.2 as the default/primary provider** — 1M context, auto-thinking, implicit prompt-cache
+  prefix-stability; honor "disabled" thinking; mid-stream stall tolerance + 1308 quota error; cache-savings
+  + stream-liveness ("still working…") surfaced in the UI; partial-output preservation on a dead stream.
+- **Reliability hardening** — adversarial audits of the agent loop, streaming, concurrency, persistence/
+  crash-recovery, PTY, backup/restore/archive, and the tools layer; fixes for budget cost-cache reset,
+  config.yaml `!!binary` name corruption (rune-safe truncation), import/restore 0700 perms + staging
+  leak/GC, corrupt-history quarantine, grep cached-count inflation. ~90% studio coverage, race-clean.
+- **UX/UI** — fixed a missing `--font-mono` token (49 sites), keyboard reveal of hover-hidden controls,
+  no-flash session switch, keyboard-operable collapsible tool/plan/memory cards.
+
+`Version` const → 1.1.0. Verified for release: `-race` studio/client/tools green, `go test ./...` green,
+`go vet` clean, `tsc` + `vite build` clean.
+
+---
+
 ## What's Done (iter 1244+ — UX/UI pass #3: keyboard-operable collapsible tool/plan/memory cards)
 
 Next UX-backlog item — the strongest remaining FUNCTIONAL accessibility gap. The expand/collapse headers on

@@ -12,7 +12,7 @@ import (
 
 // Version is the current release version of Gokin Studio.
 // Bumped on each release. Surfaced in About panel and diagnostics exports.
-const Version = "1.0.0"
+const Version = "1.1.0"
 
 // BuildInfo describes the running binary: version + runtime environment.
 // Used by the About panel and "Copy diagnostics" reports so support requests
@@ -39,16 +39,16 @@ type HealthCheck struct {
 // dir health, totals across projects/sessions/history bytes, and the set of
 // health checks. Designed to be one-shot copyable into a bug report.
 type DiagnosticsInfo struct {
-	Build          BuildInfo     `json:"build"`
-	ConfigDir      string        `json:"configDir"`
-	ConfigDirOK    bool          `json:"configDirOK"`
-	ConfigDirSize  int64         `json:"configDirSize"`
-	TotalProjects  int           `json:"totalProjects"`
-	TotalSessions  int           `json:"totalSessions"`
-	HistoryBytes   int64         `json:"historyBytes"`
-	StaleReplays   int           `json:"staleReplays"`
-	Checks         []HealthCheck `json:"checks"`
-	GeneratedAtMs  int64         `json:"generatedAtMs"`
+	Build         BuildInfo     `json:"build"`
+	ConfigDir     string        `json:"configDir"`
+	ConfigDirOK   bool          `json:"configDirOK"`
+	ConfigDirSize int64         `json:"configDirSize"`
+	TotalProjects int           `json:"totalProjects"`
+	TotalSessions int           `json:"totalSessions"`
+	HistoryBytes  int64         `json:"historyBytes"`
+	StaleReplays  int           `json:"staleReplays"`
+	Checks        []HealthCheck `json:"checks"`
+	GeneratedAtMs int64         `json:"generatedAtMs"`
 }
 
 // GetBuildInfo returns the build metadata exposed to the frontend.

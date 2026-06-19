@@ -17,19 +17,19 @@ import (
 func seedConfigDirForArchive(t *testing.T, dir string) {
 	t.Helper()
 	files := map[string]string{
-		"config.yaml":                          "projects: []\nsettings:\n  theme: dark\n",
-		"history/p1_default.json":              `{"version":2,"name":"Chat 1","entries":[]}`,
-		"history/p1_default.replay.jsonl":      `{"type":"user","text":"hello"}` + "\n",
-		"drafts/p1_default.txt":                "unsent typing…",
-		"pins/p1_default.json":                 `[{"id":"x","role":"user","content":"pinned"}]`,
-		"session-pins/p1.json":                 `["default"]`,
-		"session-order/p1.json":                `["default"]`,
-		"user_prompt_templates.json":           `[]`,
-		"user_snippets.json":                   `[]`,
-		"memory/abc123.json":                   `[]`,
+		"config.yaml":                     "projects: []\nsettings:\n  theme: dark\n",
+		"history/p1_default.json":         `{"version":2,"name":"Chat 1","entries":[]}`,
+		"history/p1_default.replay.jsonl": `{"type":"user","text":"hello"}` + "\n",
+		"drafts/p1_default.txt":           "unsent typing…",
+		"pins/p1_default.json":            `[{"id":"x","role":"user","content":"pinned"}]`,
+		"session-pins/p1.json":            `["default"]`,
+		"session-order/p1.json":           `["default"]`,
+		"user_prompt_templates.json":      `[]`,
+		"user_snippets.json":              `[]`,
+		"memory/abc123.json":              `[]`,
 		// These should be skipped:
-		".gokin-write-probe":                   "ok",
-		"history/.DS_Store":                    "junk",
+		".gokin-write-probe": "ok",
+		"history/.DS_Store":  "junk",
 	}
 	for rel, content := range files {
 		full := filepath.Join(dir, rel)

@@ -113,7 +113,7 @@ func TestWriteConfigArchive_HeaderSizeMatchesContent(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("GOKIN_CONFIG_DIR", tmp)
 	contents := map[string]string{
-		"config.yaml":   strings.Repeat("a", 100),
+		"config.yaml":    strings.Repeat("a", 100),
 		"history/x.json": strings.Repeat("b", 250),
 		"drafts/y.txt":   strings.Repeat("c", 50),
 	}
