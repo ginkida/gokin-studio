@@ -9,5 +9,11 @@
   "author": {
     "name": "",
     "email": ""
+  },
+  "info": {
+    "productName": "Gokin Studio",
+    "productVersion": "1.1.0",
+    "copyright": "Copyright © 2026",
+    "comments": "Multi-provider LLM agent desktop IDE"
   }
 }
