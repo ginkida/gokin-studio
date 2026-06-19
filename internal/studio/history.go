@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"google.golang.org/genai"
 )
@@ -99,6 +100,24 @@ func historyPath(projectID string) string {
 	return filepath.Join(historyDir(), projectID+".json")
 }
 
+// quarantineCorruptHistory renames an unreadable history file aside (to a
+// ".corrupt-<stamp>" suffix that ListHistoryFilesForProject won't match, since
+// it only accepts an exact ".json" suffix). This stops a corrupt file from
+// shadowing its session slot on every restart while preserving the bytes for
+// manual recovery — far better than silently dropping the session. Serialized
+// under the per-file history lock so it can't race a concurrent write/rename.
+// Returns the new base name, or "" if the rename failed (best-effort).
+func quarantineCorruptHistory(projectID string) string {
+	src := historyPath(projectID)
+	unlock := lockHistoryFile(src) // same key the Save* paths use
+	defer unlock()
+	dst := src + ".corrupt-" + time.Now().Format("20060102-150405.000")
+	if err := os.Rename(src, dst); err != nil {
+		return ""
+	}
+	return filepath.Base(dst)
+}
+
 // HistoryEntry is a JSON-serializable representation of a single chat turn.
 type HistoryEntry struct {
 	Role string `json:"role"`
@@ -129,6 +148,7 @@ type SessionUsage struct {
 // Fields added over time without a schema bump (Go's JSON is forgiving):
 //   - ParentSessionID (iter 310+) for fork lineage
 //   - Usage (iter 360+) for per-session usage stats
+//
 // Old files without these fields unmarshal with the zero value, which
 // matches the "absent" semantic for both.
 type historyFile struct {

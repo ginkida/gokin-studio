@@ -7,6 +7,30 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## What's Done (iter 1237+ — quarantine corrupt session history instead of silently dropping the tab)
+
+Audit finding B4 (low). A corrupt/truncated `history/{project}_{sid}.json` (disk fault or an interrupted
+external edit — studio's own writes are atomic) made the project-load loop (`NewProject`, project.go:178)
+bare-`continue`: the session tab vanished with no warning, and because `ListHistoryFilesForProject` still
+saw the file, the slot stayed shadowed on EVERY boot with the data never surfaced or cleaned.
+
+- **Quarantine** (`history.go` `quarantineCorruptHistory`): on a `LoadHistory` error during restore, rename
+  the file to `…_{sid}.json.corrupt-<stamp>` (a suffix `ListHistoryFilesForProject` won't match, since it
+  requires an exact `.json`). This frees the session slot AND preserves the user's bytes for manual
+  recovery — strictly better than the silent drop. Serialized under the same per-file history lock the
+  Save* paths use. `NewProject` now distinguishes a corrupt file (`err != nil` → quarantine) from a valid
+  empty one (`hist == nil` → skip).
+- **Surface it** (`project.go` `corruptHistory` field + `app.go` Startup): `NewProject` records quarantined
+  sessions; Startup logs them to the event log (warn/`history`) AFTER the log is ready (NewProject runs too
+  early to log), so the user sees it in Diagnostics → View Logs with the recovery filename.
+- **Test** (`corrupt_history_test.go`): a project with one healthy + one malformed history file loads the
+  healthy session, does NOT surface the corrupt one as a live tab, records it in `corruptHistory`, moves
+  the `.json` aside to a `.corrupt-*` file, and the quarantined file is not re-listed as a session. Full
+  `-race ./internal/studio/` green, `go vet` clean.
+- **Honest value**: low — the user's data was never lost by studio (atomic writes; the file stays on disk),
+  so this is a defensive/UX upgrade: a flagged, recoverable, self-clearing failure instead of a silent,
+  permanently-shadowed vanished tab. Trigger requires external corruption.
+
 ## What's Done (iter 1236+ — import/restore keeps configDir at 0700 + no staging-dir leak on swap failure)
 
 Two adjacent fixes in `data_archive.go` from the same audit (findings B1 + B2, both low).

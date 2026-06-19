@@ -73,6 +73,18 @@ func (s *Studio) Startup(ctx context.Context) {
 	}
 	s.eventLog.SetPersistPath(eventLogPath)
 
+	// Surface any session-history files quarantined during project load (a
+	// corrupt/unreadable file was moved aside rather than silently dropping the
+	// session tab). Done here, after the event log is ready — NewProject runs
+	// too early to log. Visible in Diagnostics → View Logs so the user knows a
+	// session was affected and where the recoverable bytes went.
+	for _, p := range s.projects {
+		for _, q := range p.corruptHistory {
+			s.LogEvent("warn", "history", fmt.Sprintf("quarantined corrupt session history in %q: %s", p.Name, q))
+		}
+		p.corruptHistory = nil
+	}
+
 	// iter 790+: background auto-cleanup pass — once per 24h, conservative
 	// thresholds (replays >30d, pre-import >90d). Runs in a goroutine so a
 	// slow file walk on a giant config dir doesn't block UI bring-up. Errors

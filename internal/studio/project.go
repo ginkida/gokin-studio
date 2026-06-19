@@ -70,6 +70,11 @@ type Project struct {
 	sessions   map[string]*ChatSession // sessionID → session
 	lastUsedAt int64                   // unix millis, bumped on every agent turn
 
+	// corruptHistory records sessions whose on-disk history was unreadable and
+	// got quarantined during load (see NewProject). Surfaced to the event log by
+	// Startup once the log is ready — NewProject itself has no Studio ref yet.
+	corruptHistory []string
+
 	// Long-lived memory and plan state, shared across all sessions of this
 	// project. Lazy-initialized on first client setup so they only exist for
 	// projects that actually run the agent.
@@ -177,7 +182,19 @@ func NewProject(pc ProjectConfig) *Project {
 	defaultOnDisk := false
 	for _, sid := range diskSessions {
 		hist, err := LoadHistory(pc.ID + "_" + sid)
-		if err != nil || hist == nil {
+		if err != nil {
+			// Corrupt/unreadable history (disk fault or an interrupted external
+			// edit; studio's own writes are atomic so it won't produce this).
+			// Quarantine the file aside instead of bare-continue: that frees the
+			// session slot (otherwise the bad file shadows it on EVERY boot with
+			// the tab silently absent) and preserves the bytes for manual
+			// recovery. Recorded for the event log, which isn't ready this early.
+			if moved := quarantineCorruptHistory(pc.ID + "_" + sid); moved != "" {
+				p.corruptHistory = append(p.corruptHistory, sid+" → "+moved)
+			}
+			continue
+		}
+		if hist == nil {
 			continue
 		}
 		name := LoadHistoryName(pc.ID + "_" + sid)
