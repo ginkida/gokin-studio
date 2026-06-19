@@ -28,6 +28,7 @@ func TestClassifyGLMErrorCode(t *testing.T) {
 		{"1211", "balance low", false, ""},
 		{"1213", "balance low", false, ""},
 		{"1212", "quota exceeded", false, ""},
+		{"1308", "balance exhausted", false, ""},
 		{"1214", "auth failed", false, ""},
 		{"1215", "auth failed", false, ""},
 		// Unknown code with message — use raw message
@@ -97,5 +98,84 @@ func TestClassifyGLMErrorCode_UnknownCodeFallback(t *testing.T) {
 	_, _, desc = classifyGLMErrorCode("8888", "")
 	if !strings.HasPrefix(desc, "GLM error") {
 		t.Errorf("unknown code without message: got %q, want 'GLM error ...'", desc)
+	}
+}
+
+// TestClassifyGLMErrorCode_1308Actionable pins that GLM quota/balance code 1308
+// surfaces an actionable recovery hint (top up / switch provider) instead of a
+// raw code — ported from gokin v0.100.36.
+func TestClassifyGLMErrorCode_1308Actionable(t *testing.T) {
+	retryable, _, desc := classifyGLMErrorCode("1308", "balance exhausted")
+	if retryable {
+		t.Error("1308 (quota/balance) must be non-retryable")
+	}
+	if !strings.Contains(desc, "top up") && !strings.Contains(desc, "switch provider") {
+		t.Errorf("1308 description should be actionable (top up / switch provider), got %q", desc)
+	}
+}
+
+// TestStreamStallProneProvider pins the {kimi, glm} stall-prone set used to grant
+// extra stream-idle tolerance — ported from gokin v0.100.36 (generalized Kimi's
+// tolerance to GLM, which stalls mid-stream the same way).
+func TestStreamStallProneProvider(t *testing.T) {
+	cases := map[string]bool{
+		"kimi": true, "glm": true, "GLM": true, " Kimi ": true,
+		"deepseek": false, "minimax": false, "ollama": false, "anthropic": false, "": false,
+	}
+	for provider, want := range cases {
+		if got := streamStallProneProvider(provider); got != want {
+			t.Errorf("streamStallProneProvider(%q) = %v, want %v", provider, got, want)
+		}
+	}
+}
+
+// TestAdaptiveStreamRetryPolicyGLMDefaults verifies GLM now gets the same extra
+// stream-stall tolerance Kimi had (MaxRetries>=3, MaxPartialRetries>=2) for a
+// healthy/new session — the generalization from gokin v0.100.36.
+func TestAdaptiveStreamRetryPolicyGLMDefaults(t *testing.T) {
+	policy := AdaptiveStreamRetryPolicy("glm")
+	if policy.MaxRetries < 3 {
+		t.Errorf("glm MaxRetries = %d, want >= 3 (stall-prone tolerance)", policy.MaxRetries)
+	}
+	if policy.MaxPartialRetries < 2 {
+		t.Errorf("glm MaxPartialRetries = %d, want >= 2 (stall-prone tolerance)", policy.MaxPartialRetries)
+	}
+}
+
+// TestShouldExtendStreamIdle pins the one-shot idle-timeout extension decision:
+// a thinking model with no content yet (silent reasoning) OR a stall-prone
+// provider (GLM/Kimi) that stalled after partial content gets one extra window;
+// everything else fails normally; and a stream already extended never extends
+// again. This is the studio-appropriate adaptation of gokin v0.100.36's GLM
+// stream-stall tolerance (studio streams live, can't resume-by-continuation).
+func TestShouldExtendStreamIdle(t *testing.T) {
+	cases := []struct {
+		name           string
+		alreadyExt     bool
+		contentRecv    bool
+		thinking       bool
+		provider       string
+		wantExtend     bool
+		wantThinkPhase bool
+	}{
+		{"thinking, no content yet → extend (thinking phase)", false, false, true, "glm", true, true},
+		{"glm stalled after partial content → extend (stall)", false, true, false, "glm", true, false},
+		{"kimi stalled after partial content → extend (stall)", false, true, false, "kimi", true, false},
+		{"deepseek stalled after partial content → NO extend", false, true, false, "deepseek", false, false},
+		{"glm no content, thinking off → NO extend", false, false, false, "glm", false, false},
+		{"minimax after content → NO extend", false, true, true, "minimax", false, false},
+		{"already extended (thinking) → NO extend", true, false, true, "glm", false, false},
+		{"already extended (stall) → NO extend", true, true, false, "glm", false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			extend, thinkPhase := shouldExtendStreamIdle(c.alreadyExt, c.contentRecv, c.thinking, c.provider)
+			if extend != c.wantExtend {
+				t.Errorf("extend = %v, want %v", extend, c.wantExtend)
+			}
+			if thinkPhase != c.wantThinkPhase {
+				t.Errorf("thinkingPhase = %v, want %v", thinkPhase, c.wantThinkPhase)
+			}
+		})
 	}
 }

@@ -208,10 +208,12 @@ func AdaptiveStreamRetryPolicy(provider string) StreamRetryPolicy {
 		base.MaxDelay = 60 * time.Second
 	}
 
-	// Kimi's Coding Plan endpoint is prone to long silent reasoning/tool phases.
-	// Give healthy/new Kimi sessions one extra cold retry and one extra partial
-	// retry so transient stream stalls don't surface to the user immediately.
-	if strings.EqualFold(strings.TrimSpace(provider), "kimi") && h.Score >= 0 {
+	// Some Coding-Plan endpoints are prone to long silent reasoning/tool phases
+	// mid-stream (a bit of data, then a pause that trips the stream-idle timeout
+	// "after partial response"). Give healthy/new sessions one extra cold retry
+	// and one extra partial retry so a transient stall doesn't surface to the
+	// user immediately.
+	if streamStallProneProvider(provider) && h.Score >= 0 {
 		if base.MaxRetries < 3 {
 			base.MaxRetries = 3
 		}
@@ -229,6 +231,19 @@ func AdaptiveStreamRetryPolicy(provider string) StreamRetryPolicy {
 	}
 
 	return base
+}
+
+// streamStallProneProvider reports whether a provider's endpoint is prone to
+// mid-stream silent stalls (partial data, then a pause before more) — warranting
+// extra stream-idle tolerance. The Kimi AND GLM Coding-Plan endpoints both do
+// this; keep them in ONE set so a fix for one covers both. (Ported from gokin
+// v0.100.36, which generalized Kimi's tolerance to GLM.)
+func streamStallProneProvider(provider string) bool {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "kimi", "glm":
+		return true
+	}
+	return false
 }
 
 // CalculateBackoff calculates exponential backoff with jitter.

@@ -868,6 +868,26 @@ func (c *AnthropicClient) streamRequest(ctx context.Context, requestBody map[str
 	return nil, fmt.Errorf("max retries (%d) exceeded: %w", c.config.MaxRetries, lastErr)
 }
 
+// shouldExtendStreamIdle decides whether to grant a stalled SSE stream ONE more
+// idle window before failing the turn, and reports whether the stall is a
+// thinking-silent phase (which warrants an OnThinkingIdle UI hint). Two cases:
+//   - thinking enabled and NO content yet: the model is in its silent reasoning
+//     phase; killing it at the idle timeout would abort a legitimate long think.
+//   - a stall-prone provider (GLM / Kimi Coding-Plan endpoints pause mid-stream)
+//     that stalled AFTER emitting partial content: give the known-alive stream a
+//     second window to resume rather than failing — studio streams live and
+//     can't resume-by-continuation, so one extra window is the safe equivalent.
+//
+// alreadyExtended caps this at one extension per stream.
+func shouldExtendStreamIdle(alreadyExtended, contentReceived, thinkingEnabled bool, provider string) (extend, thinkingPhase bool) {
+	if alreadyExtended {
+		return false, false
+	}
+	thinkingPhase = !contentReceived && thinkingEnabled
+	midStreamStall := contentReceived && streamStallProneProvider(provider)
+	return thinkingPhase || midStreamStall, thinkingPhase
+}
+
 // classifyGLMErrorCode maps Z.AI / GLM error codes (returned as `{error:{code,message}}`
 // in SSE events with HTTP 200) to retryability and a user-friendly description.
 // Returns (retryable, keyword, description). keyword is embedded in the returned
@@ -879,6 +899,7 @@ func (c *AnthropicClient) streamRequest(ctx context.Context, requestBody map[str
 //	1210: too-many-requests         → retryable
 //	1211/1213: insufficient balance → non-retryable (user must top up)
 //	1212: quota exceeded            → non-retryable
+//	1308: quota / balance exhausted → non-retryable (actionable hint)
 //	1214/1215: auth failure         → non-retryable
 //	1301: concurrency limit         → retryable
 //	1302/1303: throughput limit     → retryable
@@ -900,6 +921,11 @@ func classifyGLMErrorCode(code, message string) (retryable bool, keyword, descri
 		return false, "", "GLM account balance insufficient — top up or switch provider"
 	case "1212":
 		return false, "", "GLM quota exceeded — check billing"
+	case "1308":
+		// Quota / insufficient balance (commonly seen when a Coding-Plan key hits
+		// its cap). Non-retryable; the only recovery is topping up or switching
+		// provider, so say that instead of leaking a raw code.
+		return false, "", "GLM quota/balance exhausted — top up your GLM plan or switch provider"
 	case "1214", "1215":
 		return false, "", "GLM authentication failed — check API key"
 	}
@@ -1115,7 +1141,7 @@ func (c *AnthropicClient) doStreamRequest(ctx context.Context, requestBody map[s
 
 		eventCount := 0
 		contentReceived := false
-		initialTimeoutExtended := false // tracks whether we've already extended once for a thinking model
+		idleExtended := false // we extend the idle timeout at most ONCE per stream
 		idleTimer := time.NewTimer(streamIdleTimeout)
 		defer idleTimer.Stop()
 
@@ -1161,17 +1187,27 @@ func (c *AnthropicClient) doStreamRequest(ctx context.Context, requestBody map[s
 					continue waitLoop
 
 				case <-idleTimer.C:
-					// If thinking is enabled and no content has arrived yet, the model
-					// is likely in its silent reasoning phase. Extend the timeout once
-					// to avoid killing a legitimate (just slow) thinking turn. Without
-					// this, a GLM-5.2 / Kimi model doing a long think would be killed
-					// at 30 s even though it was still working.
-					if !contentReceived && !initialTimeoutExtended && enableThinkingSnap {
-						initialTimeoutExtended = true
-						logging.Info("extending idle timeout for thinking model — no content yet",
-							"provider", providerSnap, "original_timeout", streamIdleTimeout)
+					// Extend the idle timeout ONCE before giving up, in two cases:
+					//   - thinking enabled and NO content yet: the model is likely in
+					//     its silent reasoning phase; without this a long GLM-5.2 / Kimi
+					//     think would be killed mid-thought.
+					//   - a stall-prone provider (GLM / Kimi Coding-Plan endpoints pause
+					//     mid-stream — a bit of data, then a silence that trips the idle
+					//     timeout "after partial response") that stalled AFTER partial
+					//     content: give the known-alive-but-stalled stream a second window
+					//     to resume instead of failing the turn. Studio streams live and
+					//     can't resume-by-continuation like the CLI, so one extra idle
+					//     window is the safe equivalent of gokin's extra partial retry.
+					if extend, thinkingPhase := shouldExtendStreamIdle(idleExtended, contentReceived, enableThinkingSnap, providerSnap); extend {
+						idleExtended = true
+						reason := "mid-stream-stall"
+						if thinkingPhase {
+							reason = "thinking-silent-phase"
+						}
+						logging.Info("extending stream idle timeout once",
+							"provider", providerSnap, "partial", contentReceived, "reason", reason)
 						idleTimer.Reset(streamIdleTimeout)
-						if statusCb != nil {
+						if statusCb != nil && thinkingPhase {
 							statusCb.OnThinkingIdle(streamIdleTimeout, providerSnap)
 						}
 						continue waitLoop

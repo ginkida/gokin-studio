@@ -7,6 +7,35 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## What's Done (iter 1239+ — GLM stream-stall tolerance + 1308 quota error, from fresh gokin v0.100.36)
+
+Reviewed the new gokin GLM commits (v0.100.31–39). Most are TUI-only (lipgloss/CC-style rendering, command
+palette) or need infra studio lacks (GLM Coding-Plan web search = a first-party MCP Streamable-HTTP server;
+studio has no MCP transport). Two GLM client-layer items are genuinely portable + stability-relevant:
+
+- **GLM mid-stream stall tolerance** (the live, studio-appropriate adaptation of gokin's `streamStallProne
+  Provider={kimi,glm}`): gokin found GLM's Coding-Plan endpoint pauses mid-stream like Kimi (a bit of data,
+  then a silence that trips the stream-idle timeout "after partial response"). gokin retries via
+  continuation; studio streams live and can't resume-by-continuation without risking duplicate output. So
+  studio's `doStreamRequest` idle-timer now grants ONE extra idle window when a stall-prone provider
+  (GLM/Kimi) stalls AFTER partial content — the known-alive-but-paused stream gets a chance to resume
+  instead of failing the turn. Generalizes the existing thinking-silent-phase extension: the decision is
+  now a pure `shouldExtendStreamIdle(...)` (thinking-no-content OR stall-prone-after-content; one extension
+  per stream). Added `streamStallProneProvider` (kimi/glm) in retry.go and used it in the (engine-only)
+  `AdaptiveStreamRetryPolicy` too for parity.
+- **GLM error 1308 (quota/balance exhausted)** classified with an actionable "top up your GLM plan or switch
+  provider" message instead of leaking the raw code (the live `classifyGLMErrorCode` path, anthropic.go).
+- **Tests** (`glm_error_test.go`): 1308 in the classification table + a focused actionable-message check;
+  `TestStreamStallProneProvider`; `TestAdaptiveStreamRetryPolicyGLMDefaults` (GLM now gets MaxRetries≥3 /
+  MaxPartialRetries≥2); `TestShouldExtendStreamIdle` (8 cases — thinking-phase, glm/kimi stall, non-stall
+  providers, already-extended). Full `-race ./internal/engine/client/` green, `go vet` clean, module builds.
+- **Honest value**: medium for GLM stability — GLM's mid-stream pauses are a real, gokin-confirmed failure
+  mode; before this, a GLM stall after partial output surfaced as a turn-failing error (studio only retried
+  when nothing had been emitted). The extension is low-risk (one extra idle window, same precedent as the
+  existing thinking extension; worst case delays a true error by one window). The 1308 fix is small but
+  clear error-UX. Deliberately did NOT port the TUI/MCP-web-search items (inapplicable to studio's React UI
+  / no MCP transport) — that would be wasted churn.
+
 ## What's Done (iter 1238+ — cleanup grace window so a live import-staging dir isn't swept mid-extract)
 
 Audit finding B3 (low) — the last item in the persistence/PTY/backup backlog. `cleanup.go` swept
