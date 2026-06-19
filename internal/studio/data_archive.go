@@ -259,7 +259,10 @@ func (s *Studio) extractArchiveToConfigDir(r io.Reader, kind, safetyPrefix strin
 	if err := os.RemoveAll(stagingDir); err != nil {
 		return nil, fmt.Errorf("cannot clear staging dir: %w", err)
 	}
-	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
+	// 0700: the staging tree becomes the live config dir (API keys + history),
+	// which is hardened to 0700 everywhere else. Build it private from the start
+	// so there's never even a transient world-traversable window.
+	if err := os.MkdirAll(stagingDir, 0o700); err != nil {
 		return nil, fmt.Errorf("cannot create staging dir: %w", err)
 	}
 
@@ -284,12 +287,12 @@ func (s *Studio) extractArchiveToConfigDir(r io.Reader, kind, safetyPrefix strin
 		target := filepath.Join(stagingDir, clean)
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(target, 0o755); err != nil {
+			if err := os.MkdirAll(target, 0o700); err != nil {
 				_ = os.RemoveAll(stagingDir)
 				return nil, fmt.Errorf("mkdir failed: %w", err)
 			}
 		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 				_ = os.RemoveAll(stagingDir)
 				return nil, fmt.Errorf("mkdir failed: %w", err)
 			}
@@ -337,8 +340,15 @@ func (s *Studio) extractArchiveToConfigDir(r io.Reader, kind, safetyPrefix strin
 		if preBackupPath != "" {
 			_ = os.Rename(preBackupPath, dir)
 		}
+		// Don't leak the fully-extracted staging tree on swap failure (every
+		// other error path above already removes it).
+		_ = os.RemoveAll(stagingDir)
 		return nil, fmt.Errorf("could not swap in imported data: %w", err)
 	}
+	// Re-harden the live config dir to 0700. The staging tree was built 0700, but
+	// a tar dir entry could carry a looser mode, and os.MkdirAll on the existing
+	// dir at next startup won't fix the mode — so enforce it here after the swap.
+	_ = os.Chmod(dir, 0o700)
 
 	s.logf("info", kind, "%s %d files from archive (pre-backup at %s)", kind+"ed", filesImported, preBackupPath)
 

@@ -293,3 +293,30 @@ func TestImportAllDataBase64_DirEntryHandled(t *testing.T) {
 		}
 	}
 }
+
+// TestImportAllDataBase64_RestoresConfigDirTo0700 is the regression for the
+// audit finding: extract built the staging tree 0755 and the swap promoted it
+// into place without re-hardening, silently downgrading the secret-bearing
+// config dir from its 0700 default. Import must leave it 0700.
+func TestImportAllDataBase64_RestoresConfigDirTo0700(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	cfgDir := configDir()
+	seedConfigDirForArchive(t, cfgDir)
+
+	s := NewStudio()
+	result, err := s.ExportAllDataBase64()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ImportAllDataBase64(result.Base64); err != nil {
+		t.Fatalf("ImportAllDataBase64: %v", err)
+	}
+
+	info, err := os.Stat(cfgDir)
+	if err != nil {
+		t.Fatalf("stat config dir: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Errorf("config dir mode after import = %#o, want 0700 (import must not downgrade the secret-bearing dir)", perm)
+	}
+}

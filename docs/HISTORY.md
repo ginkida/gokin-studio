@@ -7,6 +7,31 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## What's Done (iter 1236+ — import/restore keeps configDir at 0700 + no staging-dir leak on swap failure)
+
+Two adjacent fixes in `data_archive.go` from the same audit (findings B1 + B2, both low).
+
+- **B1 — import/restore silently downgraded the secret-bearing config dir from 0700 to 0755.**
+  `extractArchiveToConfigDir` built the staging dir + every extracted subdir at `0o755` and promoted that
+  tree into place via `os.Rename(stagingDir, dir)` with no re-harden. The config dir holds API keys +
+  full chat history and is created `0o700` everywhere else; `MkdirAll` on the existing dir at next startup
+  doesn't fix mode, so the loosened 0755 was permanent — on a multi-user host, directory listing/metadata
+  (project/session IDs, filenames, backup inventory) leaked. (File CONTENTS stay 0600.) Fix: build staging
+  + extracted dirs `0o700` (no transient world-traversable window) and `_ = os.Chmod(dir, 0o700)` right
+  after the swap. Reachable via `ImportAllDataBase64`, `RestoreAutoBackup`, `RestorePreImportBackup`.
+- **B2 — staging dir leaked on final-swap failure.** Every error path in the extract loop removes the
+  staging tree, but the terminal `os.Rename(stagingDir, dir)` failure branch only rolled back the
+  pre-backup and returned — orphaning the fully-extracted tree (self-heals only at next cleanup). Added
+  `_ = os.RemoveAll(stagingDir)` to match the surrounding convention.
+- **Test** (`data_archive_test.go`): `TestImportAllDataBase64_RestoresConfigDirTo0700` — after an
+  export→import round-trip the config dir mode is `0700`, not `0755`. Full `-race ./internal/studio/`
+  green, `go vet` clean.
+- **Honest value**: low — B1 is a genuine, silently-persistent violation of a documented 0700 security
+  invariant (metadata exposure on multi-user POSIX hosts; atypical for a desktop IDE, hence low); B2 is a
+  bounded, self-healing resource leak. Both are correct, low-risk hardening of the import/restore path.
+- **Remaining from the audit (deferred, low)**: B3 manual Cleanup can sweep a live import-staging dir
+  mid-extract; B4 a corrupt history JSON silently drops the session tab on restart.
+
 ## What's Done (iter 1235+ — rune-safe name truncation: stop config.yaml !!binary corruption on multibyte names)
 
 From a fresh adversarial audit of UNCOVERED surfaces (persistence/crash-recovery, terminal/PTY, backup/
