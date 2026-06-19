@@ -7,6 +7,26 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## What's Done (iter 1243+ — UX/UI pass #2: stop the welcome screen flashing before history loads)
+
+Next UX-backlog item. On a session switch (or initial load) to a session whose history wasn't yet in the
+chatStore cache, `GetHistory` is an async round-trip — during the pending window `messages` is empty, so the
+"What can I help with?" welcome screen rendered, then the real conversation popped in: a visible flash on
+every cold session open.
+
+- **Fix** (`ChatPanel.tsx`): added a `hydratedKey` state (KEYED by chatKey, not a bare bool) and derived
+  `historyHydrated = hydratedKey === chatKey`. Keying is the load-bearing detail — a bare boolean would
+  carry the previous session's `true` into the new session's FIRST render and still flash for one frame;
+  with a key, the new session reads un-hydrated until its own load resolves. The GetHistory effect sets
+  `hydratedKey` on the cached-hit path and on resolve/error. The welcome render is gated `!historyHydrated ?
+  null : <welcome>` (the search-empty branch still shows immediately; and the gate only matters when
+  messages are empty, since a populated session never hits the welcome branch).
+- **Verification**: `tsc --noEmit` clean, `vite build` clean. JSX-hook audit: one top-level `useState`
+  added; `historyHydrated` is a derived const, not a hook; no hooks inside conditionals/loops.
+- **Honest value**: medium — a subtle but real polish papercut that every user hits on a cold session open
+  (the flash is brief, bounded by the local IPC round-trip, but visible and slightly jarring). No behavior
+  change to history loading itself; purely suppresses the premature empty-state render.
+
 ## What's Done (iter 1242+ — UX/UI pass #1: restore monospace rendering + reveal hover-hidden controls)
 
 First iteration of a UX/UI loop (multi-agent review → verified, ranked backlog across a11y / states /

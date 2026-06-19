@@ -87,6 +87,13 @@ function ChatPanelBody({
 
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
+  // Tracks WHICH chatKey's persisted history has finished loading (from the
+  // store cache or a GetHistory round-trip). Keyed (not a bare bool) so that on
+  // a session switch the new session reads as un-hydrated on its very FIRST
+  // render — otherwise the welcome screen would flash for one frame before the
+  // on-disk conversation arrives. `historyHydrated` is derived per current key.
+  const [hydratedKey, setHydratedKey] = useState<string | null>(null)
+  const historyHydrated = hydratedKey === chatKey
   const [confirmClear, setConfirmClear] = useState(false)
   const [draggingFile, setDraggingFile] = useState(false)
   const [showTerminal, setShowTerminal] = useState(false)
@@ -370,9 +377,13 @@ function ChatPanelBody({
     }
     const existing = useChatStore.getState().messages[chatKey]
     if (existing && existing.length > 0) {
+      setHydratedKey(chatKey)
       requestAnimationFrame(applyScroll)
       return
     }
+    // Not in the store yet — load from disk. Until this resolves, historyHydrated
+    // (hydratedKey === chatKey) is false, so the welcome screen stays suppressed
+    // and never flashes before the on-disk conversation arrives.
     let cancelled = false
     GetHistory(activeProjectId, currentSessionId).then((hist) => {
       if (cancelled) return
@@ -385,7 +396,8 @@ function ChatPanelBody({
         })))
         requestAnimationFrame(applyScroll)
       }
-    }).catch(() => {})
+      setHydratedKey(chatKey)
+    }).catch(() => { if (!cancelled) setHydratedKey(chatKey) })
     return () => { cancelled = true }
   }, [activeProjectId, chatKey, setMessages, currentSessionId])
 
@@ -3443,7 +3455,7 @@ function ChatPanelBody({
               <Search size={20} style={{ opacity: 0.3, marginBottom: 8 }} />
               <p>No messages match &ldquo;{searchQuery}&rdquo;</p>
             </div>
-          ) : (
+          ) : !historyHydrated ? null : (
             <div className="chat-welcome">
               <div className="chat-welcome-icon">
                 <Zap size={28} />
