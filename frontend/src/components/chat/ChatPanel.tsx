@@ -4623,6 +4623,32 @@ function getToolPrimary(name: string, args: Record<string, unknown> | undefined)
   }
 }
 
+// Friendly past-tense verb for a tool's collapsed line ("Ran git status",
+// "Wrote index.html", "Updated styles.css"). Returns null for tools with no
+// natural verb — the caller then falls back to the humanized tool name
+// (e.g. git_status → "git status"), which reads better than a vague "Ran".
+function verbLabel(name: string): string | null {
+  switch (name) {
+    case 'bash': return 'Ran'
+    case 'write': return 'Wrote'
+    case 'edit': return 'Updated'
+    case 'read': return 'Read'
+    case 'list_dir':
+    case 'tree': return 'Listed'
+    case 'delete': return 'Deleted'
+    case 'mkdir': return 'Created'
+    case 'copy': return 'Copied'
+    case 'move': return 'Moved'
+    case 'grep':
+    case 'glob':
+    case 'web_search': return 'Searched'
+    case 'web_fetch': return 'Fetched'
+    case 'ask_agent': return 'Asked'
+    case 'task': return 'Dispatched'
+    default: return null
+  }
+}
+
 // Shorten long paths/commands for inline display.
 function shortenForPill(s: string, max = 60): string {
   if (s.length <= max) return s
@@ -5135,7 +5161,7 @@ function MessageBubbleInner({ message, onRerun, canEdit, onEditSubmit, changedFi
         <div className={`tool-card tool-rail-${railState} ${expanded ? 'expanded' : ''}`}>
           <div className="tool-header" role="button" tabIndex={0} aria-expanded={expanded} onClick={() => setExpanded(!expanded)} onKeyDown={activateOnKey(() => setExpanded(!expanded))}>
             <span className="tool-icon-wrap">{toolIcon}</span>
-            <span className="tool-name">{toolName}</span>
+            <span className="tool-verb">{verbLabel(toolName) || toolName.replace(/_/g, ' ')}</span>
             {primary && (
               <span className="tool-primary">{shortenForPill(String(primary))}</span>
             )}
@@ -5147,7 +5173,7 @@ function MessageBubbleInner({ message, onRerun, canEdit, onEditSubmit, changedFi
             ) : message.toolSuccess ? (
               <CheckCircle size={12} className="tool-ok" />
             ) : (
-              <XCircle size={12} className="tool-fail" />
+              <span className="tool-status-word fail">Failed</span>
             )}
             <ChevronRight size={10} className={`tool-chevron ${expanded ? 'expanded' : ''}`} />
           </div>

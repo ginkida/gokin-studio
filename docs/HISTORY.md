@@ -25,6 +25,39 @@ First minor release since v1.0.0 (97 commits). Headlines:
 
 ---
 
+## What's Done (iter 1249+ — Redesign pass #4: flatten tool-call cards → compact inline Ran/Wrote/Updated lines)
+
+Plan iter 4 — the mockup's most recognizable center-column signature. Collapsed tool rows were bordered
+pills (`var(--bg-surface)` bg + 1px border + a 3px colored left rail) showing the RAW tool name ("bash",
+"write") + the arg. Now they read as flat inline text in the message flow, like the mockup
+("Ran `git status --short` Failed", "Wrote `index.html`"):
+
+- ChatPanel.tsx: added a pure module-level `verbLabel(name)` mapping tools to friendly past-tense verbs
+  (bash→Ran, write→Wrote, edit→Updated, read→Read, list_dir/tree→Listed, delete→Deleted, mkdir→Created,
+  copy→Copied, move→Moved, grep/glob/web_search→Searched, web_fetch→Fetched, ask_agent→Asked,
+  task→Dispatched). The collapsed-row label now renders `verbLabel(toolName) || toolName.replace(/_/g,' ')`
+  in a `.tool-verb` span — so git_* tools fall back to a humanized "git status" / "git diff" (reads better
+  than a vague "Ran" with a null primary). Replaced the failure `<XCircle>` glyph with a red
+  `.tool-status-word` "Failed"; success keeps a subtle (opacity .85) green check.
+- App.css: `.tool-header` → transparent bg, no border, no rail, `padding:2px 0` so the collapsed row is flat
+  text; removed the three now-dead `.tool-rail-* .tool-header` border-left rules (the colored rail is KEPT on
+  the expanded `.tool-detail` via the existing `.tool-card.tool-rail-*.expanded .tool-detail` rules). Hover
+  is now a subtle color/inline-code-bg shift, not a box. `.tool-primary` restyled to an inline-code chip
+  (`var(--bg-surface)` bg, 3px→4px radius, mono). Added `.tool-verb` (muted leading label) + `.tool-status-word`.
+
+PRESERVED exactly: the chevron + `role=button`/`aria-expanded`/keyboard `onKeyDown` click-to-expand, the
+pending spinner + live `ToolElapsedChip`, the live streaming-stdout preview, and the entire expanded
+`.tool-detail` (bash/tree/git_diff/edit/write/read/grep output + diffs). JSX-hook audit: clean — `verbLabel`
+is pure; the label/status are plain JSX expressions; no hooks added/moved/conditionalized.
+
+HONEST value: high — this is the signature visual change of the mockup's chat column, and the at-a-glance
+status the old left-rail gave is preserved via the red "Failed" word + the (kept) success check + the
+expanded rail. KNOWN remaining divergences: (1) the green `+733`/`-7` diff counts on Wrote/Updated lines are
+plan iter 5, not here; (2) MemoryToolCard / PlanToolCard still render as their own styled cards (`~5096/5107`)
+— they'll look inconsistent with the flat rows until a follow-up gives them a matching flat treatment;
+(3) successful rows keep a subtle check where the mockup shows none — deliberate, to retain the success
+signal the codebase added. Verified: `tsc` + `vite build` clean.
+
 ## What's Done (iter 1248+ — Redesign pass #3: right Git/Goal/Progress panel → raised rounded cards)
 
 Plan iter 3. The right ContextPanel already rendered Git tools → Goal → Progress in the exact mockup order

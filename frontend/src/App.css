@@ -2410,32 +2410,24 @@
      the whole card for expanded. The color reflects pending/success/failure. */
 }
 
+/* iter 1249+: collapsed tool rows read as flat inline text in the message flow
+   (mockup "Ran `git status` Failed" / "Wrote index.html"), not bordered pills.
+   The at-a-glance status that the old left-rail carried now lives in the colored
+   "Failed" word + the success check; the rail itself is kept only on the EXPANDED
+   .tool-detail below so output still gets a status edge. */
 .tool-header {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  padding: 5px 10px 5px 9px;
+  gap: 7px;
+  padding: 2px 0;
   cursor: pointer;
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-secondary);
-  background: var(--bg-surface);
-  border: 1px solid var(--border-subtle);
-  border-left-width: 3px;
-  border-radius: 8px;
-  transition: background 0.15s ease, border-color 0.15s ease;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  transition: color 0.15s ease;
   max-width: 100%;
-}
-
-.tool-rail-pending .tool-header {
-  border-left-color: var(--accent);
-}
-
-.tool-rail-ok .tool-header {
-  border-left-color: var(--success);
-}
-
-.tool-rail-fail .tool-header {
-  border-left-color: var(--error);
 }
 
 /* When the tool card is expanded, extend the rail down the side of the
@@ -2450,10 +2442,8 @@
 .tool-card.tool-rail-ok.expanded .tool-detail { border-left-color: var(--success); }
 .tool-card.tool-rail-fail.expanded .tool-detail { border-left-color: var(--error); }
 
-.tool-header:hover {
-  background: var(--bg-hover);
-  border-color: var(--border);
-}
+.tool-header:hover { color: var(--text-primary); }
+.tool-header:hover .tool-primary { background: var(--bg-hover); }
 
 .tool-icon-wrap {
   display: inline-flex;
@@ -2474,8 +2464,21 @@
   letter-spacing: -0.01em;
 }
 
-.tool-ok { color: var(--success); }
+/* The friendly verb / humanized tool name leading the flattened collapsed row
+   ("Ran" · "Wrote" · "git status"). Muted so the inline-code primary stands out. */
+.tool-verb {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-weight: 500;
+  flex-shrink: 0;
+}
+
+.tool-ok { color: var(--success); opacity: 0.85; flex-shrink: 0; }
 .tool-fail { color: var(--error); }
+
+/* Colored status word on a failed tool row (replaces the old XCircle glyph). */
+.tool-status-word { font-size: 11px; font-weight: 600; flex-shrink: 0; }
+.tool-status-word.fail { color: var(--error); }
 
 /* iter 1030+: live streaming output preview on pending tool cards. Sits
    between the tool header and the expanded detail. Auto-cleared when the
@@ -2544,16 +2547,20 @@
   opacity: 1;
 }
 
-/* Primary argument shown inline in tool pill */
+/* Primary argument shown inline-code style on the flattened tool row
+   (the command / path / pattern), e.g. "Ran `git status --short`". */
 .tool-primary {
-  font-family: 'Geist Mono', 'SF Mono', 'JetBrains Mono', 'Cascadia Code', monospace;
-  font-size: 11px;
+  font-family: var(--font-mono, 'Geist Mono', 'SF Mono', 'JetBrains Mono', 'Cascadia Code', monospace);
+  font-size: 11.5px;
   color: var(--text-secondary);
-  opacity: 0.85;
+  background: var(--bg-surface);
+  padding: 1px 6px;
+  border-radius: 4px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 320px;
+  max-width: 360px;
+  transition: background 0.15s ease;
 }
 
 /* Detail panel shown when tool expanded */
