@@ -7,6 +7,33 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## What's Done (iter 1241+ — preserve the model's partial output when a stream dies mid-response)
+
+Completes the GLM-stability arc (1239 tolerate stalls → 1240 show stalls → 1241 don't lose work when a
+stall fails). When a stream truly died AFTER emitting partial text — a GLM/Kimi stall past the 1239 idle
+extension — both sides discarded the partial: `sendAndStream` returned `nil` (dropping the partial from
+history) and the frontend's `chat:error` replaced the streamed text with the error card. So the model
+"forgot" work the user had just watched it write, and couldn't continue from it.
+
+- **Backend** (`project.go`): `sendAndStream`'s give-up path now returns the partial `collected` alongside
+  the error (was `nil`). A new `preservePartialOnError(collected)` appends the partial **TEXT ONLY** as a
+  model turn to history before each error `break` (both the outer send and the inner tool-round send) — but
+  only on a genuine stream failure, NOT on ctx-cancel (the call sites `break` on `ctx.Err()` first, and a
+  cancel skips the gated save anyway). Text-only is deliberately safe: partial tool calls would be an
+  orphaned `tool_use` (no result); a text-only model turn is always valid history. The gated post-loop save
+  (persists on a non-cancel error) writes it to disk.
+- **Frontend** (`useWailsEvents.ts`): the `chat:error` handler now finalizes the accumulated
+  `streaming[key]` partial as its OWN assistant message BEFORE the error card — mirroring the backend so the
+  view keeps what the user saw. No doubling: `finalizeAssistant` clears `streaming[key]`, so the
+  later-arriving `chat:complete` finalizes nothing.
+- **Tests** (`partial_preserve_test.go` + `makeStream` now emits text before a stream error so the
+  "errored after partial emit" path is reachable): a stall after "partial answer before stall" preserves
+  that text in history; a no-text stream error inserts no empty/junk model turn (no-op). Full `-race
+  ./internal/studio/` green, `go vet` clean, `tsc` + `vite build` clean.
+- **Honest value**: medium — a tail case (most stalls now resume via 1239's extension), but when a stream
+  genuinely dies after partial output, not losing the model's partial work (especially partial code) is a
+  real win, and it keeps backend history + the on-screen view consistent so the model can continue.
+
 ## What's Done (iter 1240+ — surface stream-liveness so a GLM stall shows "still working…" not a frozen UI)
 
 Complements iter 1239. The client already fires `OnThinkingIdle` / `OnStreamIdle` / `OnStreamResume`

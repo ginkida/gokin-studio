@@ -83,16 +83,19 @@ func (m *mockClient) pop() mockResp {
 // makeStream converts a mockResp into a StreamingResponse channel.
 func makeStream(r mockResp) *client.StreamingResponse {
 	ch := make(chan client.ResponseChunk, 16)
-	if r.streamErr != nil {
-		ch <- client.ResponseChunk{Error: r.streamErr}
-		close(ch)
-		return &client.StreamingResponse{Chunks: ch}
-	}
+	// Emit thinking/text BEFORE a stream error so a test can exercise the
+	// "errored after partial emit" path (streamEmitted=true). streamErr-only
+	// responses (no text) behave exactly as before — nothing is emitted first.
 	if r.thinking != "" {
 		ch <- client.ResponseChunk{Thinking: r.thinking}
 	}
 	if r.text != "" {
 		ch <- client.ResponseChunk{Text: r.text}
+	}
+	if r.streamErr != nil {
+		ch <- client.ResponseChunk{Error: r.streamErr}
+		close(ch)
+		return &client.StreamingResponse{Chunks: ch}
 	}
 	for _, fc := range r.funcCalls {
 		ch <- client.ResponseChunk{FunctionCalls: []*genai.FunctionCall{fc}}

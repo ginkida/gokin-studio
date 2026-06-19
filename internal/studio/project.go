@@ -1031,6 +1031,26 @@ func (p *Project) SendMessage(wailsCtx context.Context, message string, settings
 		}
 	}
 
+	// preservePartialOnError appends any partial assistant TEXT the model already
+	// streamed (and the user already saw) to history before a failed turn breaks,
+	// so the model remembers its partial work on the next message instead of it
+	// vanishing — e.g. a GLM/Kimi stream that dies mid-response past the idle
+	// extension. TEXT ONLY: partial tool calls are skipped (they'd be an orphaned
+	// tool_use with no result), and a text-only model turn is always valid
+	// history. No-op when there's nothing to preserve. Only call on a genuine
+	// stream failure (NOT ctx cancel — that path skips the gated history save).
+	preservePartialOnError := func(collected *client.Response) {
+		if collected == nil || collected.Text == "" {
+			return
+		}
+		session.mu.Lock()
+		session.history = append(session.history, &genai.Content{
+			Role:  "model",
+			Parts: []*genai.Part{genai.NewPartFromText(collected.Text)},
+		})
+		session.mu.Unlock()
+	}
+
 	// sendAndStream issues one LLM request and consumes its stream as a single
 	// retryable unit. sendWithRetry alone only covers the pre-stream call, which
 	// returns at the 200 OK BEFORE any token streams; a transient failure that
@@ -1087,7 +1107,9 @@ func (p *Project) SendMessage(wailsCtx context.Context, message string, settings
 				delay *= 2
 				continue
 			}
-			return nil, serr
+			// Give up — return the partial response alongside the error so the
+			// caller can preserve any text already streamed (preservePartialOnError).
+			return collected, serr
 		}
 	}
 
@@ -1143,6 +1165,7 @@ outer:
 			if ctx.Err() != nil {
 				break
 			}
+			preservePartialOnError(collected)
 			p.emitEvent(wailsCtx, EventChatError, ChatTextEvent{
 				ProjectID: p.ID, SessionID: sid, Text: humanizeAPIError(err),
 			})
@@ -1371,6 +1394,7 @@ outer:
 				if ctx.Err() != nil {
 					break outer
 				}
+				preservePartialOnError(collected)
 				p.emitEvent(wailsCtx, EventChatError, ChatTextEvent{
 					ProjectID: p.ID, SessionID: sid, Text: humanizeAPIError(err),
 				})

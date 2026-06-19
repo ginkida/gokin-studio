@@ -187,6 +187,13 @@ export function useWailsEvents() {
         // that never resolved and polluted the next turn.
         const pendingThink = store.thinkingStream[key] || ''
         if (pendingThink) store.addThinking(key, pendingThink)
+        // Preserve any partial assistant text the user already saw streaming in,
+        // as its OWN message BEFORE the error card — otherwise the
+        // finalizeAssistant("Error:") below clears streaming[key] and the partial
+        // vanishes from the view. The backend mirrors this (it keeps the partial
+        // text in history), so the model can continue from it on the next message.
+        const partial = store.streaming[key] || ''
+        if (partial.trim()) store.finalizeAssistant(key, partial)
         // Always render errors with a single "Error: " prefix so the error-card
         // branch in MessageBubble picks them up. Strip any existing "Error: "
         // the backend may already have added via humanizeAPIError before
