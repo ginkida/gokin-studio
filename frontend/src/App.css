@@ -958,7 +958,7 @@
   gap: 4px;
   font-size: 11px;
   font-family: var(--font-mono);
-  color: #4ade80;
+  color: var(--success);
   white-space: nowrap;
   padding: 2px 8px;
   background: rgba(34, 197, 94, 0.08);
@@ -992,7 +992,7 @@
   background: rgba(59, 130, 246, 0.18);
 }
 .chat-header-budget.warn {
-  color: #fbbf24;
+  color: var(--warning);
   background: rgba(251, 191, 36, 0.12);
   border-color: rgba(251, 191, 36, 0.35);
 }
@@ -1000,7 +1000,7 @@
   background: rgba(251, 191, 36, 0.22);
 }
 .chat-header-budget.over {
-  color: #f87171;
+  color: var(--error);
   background: rgba(248, 113, 113, 0.14);
   border-color: rgba(248, 113, 113, 0.4);
 }
@@ -2527,7 +2527,7 @@
   background: rgba(217, 119, 6, 0.08);
 }
 .tool-elapsed-chip.tool-elapsed-red {
-  color: #ef4444;
+  color: var(--error);
   border-color: rgba(239, 68, 68, 0.45);
   background: rgba(239, 68, 68, 0.1);
   font-weight: 600;
@@ -3264,7 +3264,7 @@
 .msg-cost {
   font-size: 10px;
   font-family: var(--font-mono);
-  color: #4ade80;
+  color: var(--success);
   background: rgba(34, 197, 94, 0.08);
   padding: 1px 6px;
   border-radius: 8px;
@@ -4122,7 +4122,7 @@
   align-items: center;
   gap: 6px;
   font-size: 11.5px;
-  color: #f87171;
+  color: var(--error);
   background: rgba(248, 113, 113, 0.08);
   padding: 6px 10px;
   border-radius: 5px;
@@ -4201,7 +4201,7 @@
 }
 
 .toast-warning .toast-icon {
-  color: #fbbf24;
+  color: var(--warning);
 }
 
 .toast-icon {
@@ -4210,11 +4210,11 @@
 }
 
 .toast-success .toast-icon {
-  color: #4ade80;
+  color: var(--success);
 }
 
 .toast-error .toast-icon {
-  color: #f87171;
+  color: var(--error);
 }
 
 .toast-body {
@@ -4487,13 +4487,13 @@
 
 .api-key-health-result.ok {
   background: rgba(34, 197, 94, 0.12);
-  color: #4ade80;
+  color: var(--success);
   border: 1px solid rgba(34, 197, 94, 0.25);
 }
 
 .api-key-health-result.fail {
   background: rgba(248, 113, 113, 0.12);
-  color: #f87171;
+  color: var(--error);
   border: 1px solid rgba(248, 113, 113, 0.25);
 }
 
@@ -4614,7 +4614,7 @@
   gap: 8px;
   padding: 12px 14px;
   background: rgba(239, 68, 68, 0.1);
-  color: #ef4444;
+  color: var(--error);
   border-radius: 8px;
   margin-bottom: 12px;
 }
@@ -4710,15 +4710,15 @@
 }
 
 .diag-check-ok .diag-check-icon {
-  color: #22c55e;
+  color: var(--success);
 }
 
 .diag-check-warn .diag-check-icon {
-  color: #fbbf24;
+  color: var(--warning);
 }
 
 .diag-check-error .diag-check-icon {
-  color: #ef4444;
+  color: var(--error);
 }
 
 .diag-check-body {
@@ -4858,11 +4858,11 @@
 }
 
 .logs-level-warn {
-  color: #fbbf24;
+  color: var(--warning);
 }
 
 .logs-level-error {
-  color: #ef4444;
+  color: var(--error);
 }
 
 .logs-source {
@@ -6078,7 +6078,7 @@
 
 .gs-role-assistant {
   background: rgba(34, 197, 94, 0.12);
-  color: #4ade80;
+  color: var(--success);
 }
 
 .gs-result-session {
@@ -6164,7 +6164,7 @@
 .welcome-git-clean {
   margin-left: auto;
   font-size: 11px;
-  color: #4ade80;
+  color: var(--success);
 }
 
 .welcome-git-suggest-row {
@@ -6537,7 +6537,7 @@
   align-items: center;
   gap: 6px;
   font-size: 12px;
-  color: #f87171;
+  color: var(--error);
   background: rgba(248, 113, 113, 0.08);
   padding: 6px 10px;
   border-radius: 6px;
@@ -6630,7 +6630,7 @@
   align-items: center;
   gap: 6px;
   font-size: 12px;
-  color: #f87171;
+  color: var(--error);
   background: rgba(248, 113, 113, 0.08);
   padding: 6px 10px;
   border-radius: 6px;
@@ -6903,7 +6903,7 @@
 
 .model-switcher-error {
   font-size: 11.5px;
-  color: #f87171;
+  color: var(--error);
   background: rgba(248, 113, 113, 0.08);
   padding: 6px 12px;
   border-bottom: 1px solid rgba(248, 113, 113, 0.25);
@@ -7052,7 +7052,7 @@
 
 .sessions-mgr-error {
   font-size: 12px;
-  color: #f87171;
+  color: var(--error);
   background: rgba(248, 113, 113, 0.08);
   padding: 8px 12px;
   border-radius: 6px;
@@ -7192,7 +7192,7 @@
 .sessions-mgr-confirm-text {
   flex: 1;
   font-size: 12px;
-  color: #f87171;
+  color: var(--error);
   font-weight: 500;
 }
 
@@ -7289,11 +7289,11 @@
 }
 
 .usage-stats-budget-pct.warn {
-  color: #fbbf24;
+  color: var(--warning);
 }
 
 .usage-stats-budget-pct.over {
-  color: #f87171;
+  color: var(--error);
   font-weight: 500;
 }
 
@@ -7408,7 +7408,7 @@
 }
 
 .usage-stats-total-cost {
-  color: #4ade80;
+  color: var(--success);
 }
 
 .usage-stats-table {
@@ -7806,7 +7806,7 @@
 
 .pin-role-assistant {
   background: rgba(34, 197, 94, 0.12);
-  color: #4ade80;
+  color: var(--success);
 }
 
 .pin-ts {
@@ -7854,7 +7854,7 @@
 }
 
 .error-boundary-icon {
-  color: #ef4444;
+  color: var(--error);
   margin-bottom: 8px;
 }
 
@@ -7868,7 +7868,7 @@
 .error-boundary-msg {
   font-family: var(--font-mono);
   font-size: 13px;
-  color: #ef4444;
+  color: var(--error);
   background: rgba(239, 68, 68, 0.08);
   padding: 10px 14px;
   border-radius: 8px;
@@ -8144,12 +8144,12 @@
 
 .onboarding-test-result.ok {
   background: rgba(74, 222, 128, 0.12);
-  color: #4ade80;
+  color: var(--success);
 }
 
 .onboarding-test-result.fail {
   background: rgba(239, 68, 68, 0.12);
-  color: #ef4444;
+  color: var(--error);
 }
 
 .onboarding-error {
@@ -8158,7 +8158,7 @@
   gap: 6px;
   padding: 8px 10px;
   background: rgba(239, 68, 68, 0.1);
-  color: #ef4444;
+  color: var(--error);
   border-radius: 6px;
   font-size: 12px;
 }
@@ -8185,7 +8185,7 @@
 }
 
 .onboarding-success-icon {
-  color: #4ade80;
+  color: var(--success);
   margin-bottom: 6px;
 }
 

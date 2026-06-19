@@ -25,6 +25,30 @@ First minor release since v1.0.0 (97 commits). Headlines:
 
 ---
 
+## What's Done (iter 1245+ — UX/UI pass #4: status text colors → theme-adaptive tokens, light-theme contrast)
+
+Audit item A. The status (green/amber/red) *foreground text* colors in `App.css` were hardcoded to the
+dark-theme literals — `color: #4ade80 / #fbbf24 / #f87171` (and the close shades `#22c55e` / `#ef4444`) —
+instead of the `--success / --warning / --error` tokens, which `style.css` defines per theme
+(`#4ade80`/`#fbbf24`/`#f87171` in dark, the darker `#059669`/`#d97706`/`#dc2626` in light). So in LIGHT
+theme these labels rendered as bright dark-theme colors on light surfaces — low contrast / wrong shade:
+chat-header cost & budget badges, message/usage cost, diagnostics-check OK, assistant/pin role labels,
+onboarding test-result + success icons, and ~25 more.
+
+Surgical fix: replaced the **34 foreground `color:` declarations** that carried a bare status hex with the
+matching theme token (`#4ade80`/`#22c55e` → `var(--success)`, `#fbbf24` → `var(--warning)`,
+`#f87171`/`#ef4444` → `var(--error)`). The `perl` substitution was anchored to `^\s*color:\s*#hex;` so it
+touched ONLY foreground declarations — background/border `rgba(...)` tints and the
+`color: var(--error, #f87171)` fallback forms (token already wins) were left untouched. Spot-checked 10
+selector contexts: all sit on theme-flipping content surfaces (no fixed always-dark region where the
+lighter dark-token would *reduce* contrast), so the swap is strictly an improvement in light theme and a
+no-op in dark.
+
+HONEST scope: this is the legibility-critical subset. The ~74 low-alpha background `rgba()` status tints
+were deliberately left as-is — they blend acceptably in both themes, and sweeping all of them is a larger,
+harder-to-verify change with diminishing value. CSS-only iteration → no JSX, so the JSX-hook audit is N/A.
+Verified: `tsc` + `vite build` clean (2116 modules), 0 bare-hex status foregrounds remain.
+
 ## What's Done (iter 1244+ — UX/UI pass #3: keyboard-operable collapsible tool/plan/memory cards)
 
 Next UX-backlog item — the strongest remaining FUNCTIONAL accessibility gap. The expand/collapse headers on
