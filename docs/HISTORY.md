@@ -25,6 +25,31 @@ First minor release since v1.0.0 (97 commits). Headlines:
 
 ---
 
+## What's Done (iter 1248+ — Redesign pass #3: right Git/Goal/Progress panel → raised rounded cards)
+
+Plan iter 3. The right ContextPanel already rendered Git tools → Goal → Progress in the exact mockup order
+(diff stats, Complete badge, struck-through completed steps), but as flat sections divided by hairline
+border-bottoms. Restyled them into the mockup's stacked raised cards:
+
+- ContextPanel.tsx: wrapped the three `<section className="context-section">` blocks in a new
+  `<div className="context-body">` (pure presentational wrapper — no hooks/handlers; the collapsed-rail
+  early-return path is untouched). The sticky `.context-head` stays a DIRECT panel child above the body, so
+  the panel keeps a single scrollbar (the plan's double-scrollbar risk avoided by construction).
+- App.css: `.context-body` = padded flex column (`padding:10px; gap:10px`). `.context-section` became a card
+  (`background:var(--bg-panel)`, `border:1px solid var(--border)`, `border-radius:10px`, `padding:11px 12px`,
+  dropped the `border-bottom` hairline). Panel + sticky head + collapsed-dot ring re-pointed to
+  `var(--bg-deep)` so the darker tray sits behind the lighter `--bg-panel` cards (Δlum 19→22, card reads
+  raised; the 1px border does the rest). Softened `.context-section-head` from 10.5px uppercase+letterspaced
+  muted to a 12px `--text-secondary` title so heads read as "Git tools" / "Goal" / "Progress". Right-aligned
+  the git change cluster (`+N -N`) via `margin-left:auto` on `.cg-add` to match the mockup's
+  "Changes ........ +734 -7" layout.
+
+HONEST value: real visual step toward the mockup's card-stack right panel; low-risk (CSS + one wrapper div),
+content/logic untouched. The recessed commit textarea (`--bg-deepest`) and inputs still read correctly inside
+the lighter cards. KNOWN remaining divergence from the mockup: the panel still keeps a small "Context" header
+bar (refresh + hide-panel buttons) which the mockup omits — kept deliberately for the refresh/collapse
+affordances; can be de-emphasized in a later pass. Verified: `tsc` + `vite build` clean.
+
 ## What's Done (iter 1247+ — Redesign pass #2: neutralize the dark bg ramp toward near-black [palette foundation complete])
 
 Plan iter 2 (completes the palette foundation begun in iter 1246). Retuned the dark-theme background

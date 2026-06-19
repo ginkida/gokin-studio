@@ -8435,11 +8435,20 @@
   width: 304px;
   flex-shrink: 0;
   border-left: 1px solid var(--border);
-  background: var(--bg-panel);
+  background: var(--bg-deep);
   display: flex;
   flex-direction: column;
   overflow-y: auto;
   overflow-x: hidden;
+}
+
+/* Padded tray that holds the stacked cards; the sticky .context-head stays a
+   direct panel child (above this), so the panel keeps a single scrollbar. */
+.context-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px;
 }
 
 .context-panel.is-collapsed {
@@ -8467,7 +8476,7 @@
   height: 7px;
   border-radius: 50%;
   background: var(--accent);
-  box-shadow: 0 0 0 2px var(--bg-panel);
+  box-shadow: 0 0 0 2px var(--bg-deep);
 }
 
 .context-head {
@@ -8478,7 +8487,7 @@
   border-bottom: 1px solid var(--border-subtle);
   position: sticky;
   top: 0;
-  background: var(--bg-panel);
+  background: var(--bg-deep);
   z-index: 1;
 }
 .context-head-title {
@@ -8501,16 +8510,19 @@
 .context-head-actions button:hover:not(:disabled) { color: var(--accent); background: var(--accent-subtle); }
 .context-head-actions button:disabled { opacity: 0.5; cursor: default; }
 
-.context-section { padding: 12px 14px; border-bottom: 1px solid var(--border-subtle); }
+.context-section {
+  padding: 11px 12px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
 .context-section-head {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 10.5px;
+  font-size: 12px;
   font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   margin-bottom: 9px;
 }
 .context-section-head svg { opacity: 0.8; }
@@ -8546,7 +8558,7 @@
   font-family: var(--font-mono, monospace);
 }
 .cg-changes { color: var(--text-muted); }
-.cg-add { color: var(--success); font-weight: 600; }
+.cg-add { color: var(--success); font-weight: 600; margin-left: auto; }
 .cg-del { color: var(--error); font-weight: 600; }
 .context-git-clean {
   display: flex;

@@ -179,6 +179,7 @@ export function ContextPanel({ projectId }: { projectId: string }) {
         </div>
       </div>
 
+      <div className="context-body">
       {/* Git tools */}
       <section className="context-section">
         <div className="context-section-head"><GitBranch size={13} /><span>Git tools</span></div>
@@ -283,6 +284,7 @@ export function ContextPanel({ projectId }: { projectId: string }) {
           </ul>
         </section>
       )}
+      </div>
     </div>
   )
 }
