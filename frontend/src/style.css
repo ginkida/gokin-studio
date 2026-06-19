@@ -10,6 +10,11 @@
   --bg-surface: #23232c;
   --bg-hover: #2a2a34;
   --bg-active: #34343f;
+  /* Aliases referenced ~20× across App.css (e.g. .sidebar-search) that were
+     never defined, so those surfaces silently rendered transparent. Anchor
+     them to the ramp: --bg-deeper = app floor, --bg-input = field surface. */
+  --bg-deeper: var(--bg-deepest);
+  --bg-input: var(--bg-surface);
 
   /* Borders */
   --border: #2d2d38;
@@ -20,11 +25,11 @@
   --text-secondary: #a8abb5;
   --text-muted: #6c6e7a;
 
-  /* Accent (violet) */
-  --accent: #8b7bfa;
-  --accent-hover: #7a68f0;
-  --accent-subtle: rgba(139, 123, 250, 0.12);
-  --accent-muted: rgba(139, 123, 250, 0.2);
+  /* Accent (blue) — matches the target mockup's send/active hue */
+  --accent: #3b82f6;
+  --accent-hover: #2f6fe0;
+  --accent-subtle: rgba(59, 130, 246, 0.12);
+  --accent-muted: rgba(59, 130, 246, 0.2);
 
   /* Semantic colors */
   --success: #4ade80;
@@ -81,6 +86,8 @@
   --bg-surface: #f0f0f4;
   --bg-hover: #e7e7ec;
   --bg-active: #dadae2;
+  --bg-deeper: var(--bg-deepest);
+  --bg-input: var(--bg-surface);
 
   --border: #d5d5dd;
   --border-subtle: #ebebef;
@@ -89,10 +96,10 @@
   --text-secondary: #4d4d63;
   --text-muted: #8b8b97;
 
-  --accent: #6d4ce0;
-  --accent-hover: #5b3cc8;
-  --accent-subtle: rgba(109, 76, 224, 0.08);
-  --accent-muted: rgba(109, 76, 224, 0.15);
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --accent-subtle: rgba(37, 99, 235, 0.08);
+  --accent-muted: rgba(37, 99, 235, 0.15);
 
   --success: #059669;
   --success-subtle: rgba(5, 150, 105, 0.1);

@@ -25,6 +25,33 @@ First minor release since v1.0.0 (97 commits). Headlines:
 
 ---
 
+## What's Done (iter 1246+ — Redesign pass #1: blue accent + repair two undefined bg tokens [palette foundation])
+
+New design direction: the user supplied a target mockup (task-centric sidebar + right Git/Goal/Progress
+panel + blue accent, near-black neutral palette) and asked to evolve the app toward it ("сделай дизайн как
+тут" + "продумай хорошо"). A 6-agent gap-analysis Workflow (run wf_c6f59a83-90a) mapped current-vs-mockup
+region by region and produced an ordered 9-iteration plan. Honest finding: **~60% of the mockup is already
+in the bones** — the right ContextPanel already renders Git tools → Goal → Progress in the exact mockup
+order (with green/red diff stats, a Complete badge, struck-through completed steps); the composer is
+already a rounded card with model + thinking ("Max") + permission chips and a circular accent send button;
+the sidebar already has folder icons, an active-row treatment, and a status dot. So this is a re-palette +
+re-skin, NOT a rewrite.
+
+Iter 1 of the plan (foundational, highest value-per-effort, low-risk): re-point the accent family from
+violet to the mockup's blue in BOTH theme blocks (`--accent` `#8b7bfa`→`#3b82f6` dark / `#6d4ce0`→`#2563eb`
+light, plus `-hover`/`-subtle`/`-muted`). Because every active-row / focus-ring / send-button / in-progress
+icon already consumes `var(--accent)`, this single token block re-skins the whole app to blue at once. Also
+**repaired two silently-broken tokens**: `--bg-deeper` (referenced 14×, e.g. `.sidebar-search`) and
+`--bg-input` (referenced 6×) were never defined → those surfaces rendered transparent; anchored them to the
+ramp (`var(--bg-deepest)` / `var(--bg-surface)`) in both themes. Fixed the one stray hardcoded violet that
+bypassed the token (`.git-diff-hunk` `rgba(139,123,250,0.10)` → `var(--accent-subtle)`).
+
+HONEST value: the accent swap is the single most recognizable visual move in the mockup (violet→blue) and
+is trivially reversible; the undefined-token fix is a real latent bug, not cosmetic. Deliberately did NOT
+neutralize the bg ramp here (that's plan iter 2 — separate risk of flattening adjacent layers, needs its
+own verification). CSS-only → no JSX, JSX-hook audit N/A. Verified: 0 violet literals remain app-wide, both
+tokens defined in both themes, `tsc` + `vite build` clean.
+
 ## What's Done (iter 1245+ — UX/UI pass #4: status text colors → theme-adaptive tokens, light-theme contrast)
 
 Audit item A. The status (green/amber/red) *foreground text* colors in `App.css` were hardcoded to the
