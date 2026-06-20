@@ -25,6 +25,32 @@ First minor release since v1.0.0 (97 commits). Headlines:
 
 ---
 
+## What's Done (iter 1252+ — Redesign pass #7: active status dot green→blue [color semantics complete])
+
+Plan iter 7, scoped HONESTLY. The mockup's sidebar is task-centric (project groups → tasks with relative
+times, "New Task"/"Open Workspace"/"Skills" nav rows, a "Ryan Bot" identity footer). Studio's sidebar is
+project-centric, and the plan's own risk section flagged that "New Task" (session creation lives in the tab
+bar, not the sidebar), "Skills" (no backend), the archive icon, and the avatar/identity are DEAD or
+REDUNDANT controls here. So rather than churn fake/dead chrome to chase the mockup pixel-for-pixel, I shipped
+the one genuinely-valuable, real sidebar change:
+
+- App.css `.project-status-dot.active`: `var(--success)` (green) + green glow → `var(--accent)` (blue) +
+  `var(--accent-muted)` glow. The running/active project dot is now blue, matching the mockup, and — verified
+  by an app-wide grep — this was the ONLY "active/running" indicator still using green (the context-panel
+  in-progress step icon and the tool spinner already moved to `var(--accent)` in the iter-1246 token swap).
+  So green is now exclusively success/additions and blue exclusively active/in-progress across the whole app.
+
+HONEST value: small but real and semantically complete — it finishes the active=blue / success=green color
+system from iter 1246. DELIBERATELY SKIPPED (would be dead/redundant/fake, not an oversight): the mockup's
+"New Task"/"Skills" nav rows, the archive icon, and the "Ryan Bot" avatar/identity footer. The sidebar
+already had the mockup's real structural features (folder icons, active-row highlight + left accent,
+ellipsis-truncated names, the status dot). Verified: `tsc` + `vite build` clean.
+
+The visual re-skin is now substantially complete (palette → right-panel cards → flat tool lines → file
+chips/diff counts → composer → color semantics). The remaining plan items (iter 8 full-width top-bar shell;
+iter 9 inset/frameless window chrome) are the STRUCTURAL ones — checkpoint with the user before the
+window-frame change (platform risk: a wrong `--wails-draggable` makes the window unmovable).
+
 ## What's Done (iter 1251+ — Redesign pass #6: composer toolbar polish + adversarial verification)
 
 Plan iter 6 (ultracode). The composer was already ~90% the mockup (rounded card, model + thinking("Max") +
