@@ -48,6 +48,35 @@ First minor release since v1.0.0 (97 commits). Headlines:
 
 ---
 
+## What's Done (iter 1255+ — Fix flaky CI: StudioMessenger lost-response race)
+
+CI (ci.yml) went red on the v1.2.0 push with `TestStudioMessenger_SendMessage_Success` →
+`messenger_test.go: ReceiveResponse: no pending message with ID …`. The v1.2.0 diff is frontend-only and
+never touches messenger.go, so this was a PRE-EXISTING flaky test surfaced by CI's loaded parallel scheduling
+— but the root cause is a real concurrency bug, fixed here:
+
+- **Bug**: `StudioMessenger.SendMessage` registered `pending[msgID]=ch` (buffered 1), then the dispatch
+  goroutine DELETED that entry in its completion defer. With a fast client the goroutine wrote the response
+  to the buffered channel and removed the correlation entry BEFORE the caller reached `ReceiveResponse`,
+  which then looked up a now-missing ID and returned "no pending message with ID" — the response was lost.
+  (Several tests do `s.wg.Wait()` then `ReceiveResponse`; `wg.Done()` runs just before the `delete()` in the
+  same defer, so even those raced the window.) In production the race is benign — real LLM latency means
+  `ReceiveResponse` virtually always blocks on the channel first — which is why the shipped v1.2.0 binary is
+  unaffected and needs no re-release.
+- **Fix** (messenger.go): the dispatch goroutine no longer deletes the entry (its defer keeps only
+  `wg.Done()`); the correlation entry is now reaped by the CONSUMER — a `defer delete(...)` in
+  `ReceiveResponse` covering both the result and ctx-cancel branches. The buffered(1) channel preserves the
+  result even if the goroutine finished first, so retrieval can never miss a valid in-flight ID. Studio
+  always pairs SendMessage with ReceiveResponse, so this cannot leak in practice.
+- **Regression guard** (messenger_test.go): new `TestStudioMessenger_ReceiveAfterDispatchFinished` forces the
+  exact CI ordering (`s.wg.Wait()` so the goroutine fully completes, THEN `ReceiveResponse`) and asserts the
+  result still returns. PROVEN to catch the bug: reverting only the messenger.go fix makes it fail
+  deterministically with the same "no pending message with ID" error; with the fix it passes 1000× under
+  `-race`.
+
+Verified: build/vet clean; messenger tests ×2000 `-race` green; whole studio package ×3 `-race` green; full
+`-race` suite (studio+client+tools) green. This is a CI/reliability fix on the branch; no new release tag.
+
 ## What's Done (iter 1254+ — Redesign re-verification + cleanup sweep)
 
 User asked to re-check everything ("перепроверь все хорошо", ultracode). Ran ground-truth verification +

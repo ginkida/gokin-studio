@@ -115,9 +115,12 @@ func (m *StudioMessenger) SendMessage(msgType string, toRole string, content str
 			if m.studio != nil {
 				m.studio.wg.Done()
 			}
-			m.mu.Lock()
-			delete(m.pending, msgID)
-			m.mu.Unlock()
+			// NOTE: the pending entry is reaped by ReceiveResponse (the
+			// consumer), NOT here. Deleting on dispatch-completion raced the
+			// window between SendMessage returning and ReceiveResponse looking
+			// up the ID: with a fast client the goroutine wrote the (buffered)
+			// response and removed the entry before the caller could find it,
+			// surfacing as "no pending message with ID" and losing the result.
 		}()
 
 		if err := target.initClient(settings); err != nil {
@@ -171,6 +174,18 @@ func (m *StudioMessenger) ReceiveResponse(ctx context.Context, messageID string)
 	if !ok {
 		return "", fmt.Errorf("no pending message with ID %s", messageID)
 	}
+
+	// Reap the correlation entry on retrieval (in the consumer). The response
+	// channel is buffered(1), so the dispatch goroutine may have already
+	// written the result and exited; keeping the entry until ReceiveResponse
+	// collects it (or its ctx cancels) closes the race that previously lost
+	// the response. Studio always pairs SendMessage with a ReceiveResponse, so
+	// this cannot leak in practice.
+	defer func() {
+		m.mu.Lock()
+		delete(m.pending, messageID)
+		m.mu.Unlock()
+	}()
 
 	select {
 	case <-ctx.Done():

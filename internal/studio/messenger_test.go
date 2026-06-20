@@ -210,6 +210,45 @@ func TestStudioMessenger_SendMessage_Success(t *testing.T) {
 	}
 }
 
+// TestStudioMessenger_ReceiveAfterDispatchFinished is a deterministic regression
+// guard for the race that made TestStudioMessenger_SendMessage_Success flaky in
+// CI. The dispatch goroutine used to delete the pending correlation entry on
+// completion, so when it finished BEFORE the caller reached ReceiveResponse, the
+// buffered response was orphaned and ReceiveResponse failed with "no pending
+// message with ID …". Here we force exactly that ordering — wait for the
+// goroutine to fully finish (s.wg.Wait) and only THEN retrieve — which must
+// still return the result now that the entry is reaped by the consumer.
+func TestStudioMessenger_ReceiveAfterDispatchFinished(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	s := newStudioForTest(t)
+
+	mc := &mockClient{sendMessageOverride: &mockResp{text: "42"}}
+	target := NewProject(ProjectConfig{
+		ID: "proj-late", Name: "Late", Directory: t.TempDir(),
+	})
+	target.client = mc
+	target.studio = s
+	s.projects[target.ID] = target
+
+	m := NewStudioMessenger(s, "proj-source-late")
+
+	msgID, err := m.SendMessage("query", "Late", "what is 6*7?", nil)
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	// Force the dispatch goroutine to fully complete (including its cleanup
+	// defer) BEFORE retrieving — the exact ordering that used to lose the
+	// response under the old delete-on-completion design.
+	s.wg.Wait()
+	result, err := m.ReceiveResponse(context.Background(), msgID)
+	if err != nil {
+		t.Fatalf("ReceiveResponse after dispatch finished: %v", err)
+	}
+	if result != "42" {
+		t.Errorf("got %q, want '42'", result)
+	}
+}
+
 // TestStudioMessenger_SendMessage_CollectError verifies that when the response
 // stream emits an error chunk, resp.Collect() returns an error, which is
 // delivered to the caller as "error: ..." string (lines 119-121).
