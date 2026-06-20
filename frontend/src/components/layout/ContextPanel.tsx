@@ -142,6 +142,14 @@ export function ContextPanel({ projectId }: { projectId: string }) {
     return () => window.removeEventListener('keydown', onKey)
   }, [toggle])
 
+  // The top-bar right panel-toggle button drives the same collapse via a
+  // decoupled custom event (the bar doesn't own this panel's state).
+  useEffect(() => {
+    const onToggle = () => toggle()
+    window.addEventListener('gokin:toggle-context', onToggle)
+    return () => window.removeEventListener('gokin:toggle-context', onToggle)
+  }, [toggle])
+
   // Something worth surfacing even when the panel is collapsed.
   const collapsedHasState = !!(
     git?.changedFiles?.length ||

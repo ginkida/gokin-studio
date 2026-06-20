@@ -25,6 +25,44 @@ First minor release since v1.0.0 (97 commits). Headlines:
 
 ---
 
+## What's Done (iter 1253+ — Redesign pass #8: full-width top-bar shell [redesign complete])
+
+Plan iter 8 — the single largest missing mockup region. The user chose "top bar + native window" (declined
+iter 9's frameless/inset chrome), so this is a purely ADDITIVE shell element under the native OS titlebar,
+no window-frame change, zero platform risk.
+
+- New `components/layout/TopBar.tsx`: a full-width bar with left (sidebar-collapse button → real
+  `setSidebarCollapsed`), center (view/session title + active-project chip + read-only current git branch),
+  right (context-panel toggle, gated to chat view so it's never a no-op). Branch is fetched via
+  `GetProjectGitContext` keyed on `[projectId]` with a `cancelled` stale-guard, and refreshes on
+  `chat:complete`/`project:status` so a mid-session `git checkout` updates the label (mirrors ContextPanel).
+  Back/forward navigation and an account avatar are DELIBERATELY omitted — studio has no view-history stack
+  and no user identity, so they'd be dead/fake chrome.
+- App.tsx: added a `projects` selector, derived `activeProject` + `topBarTitle` (Files/Settings/session
+  name), rendered `<TopBar>` as the first `.app` child.
+- App.css: `.app` grid-template-rows `1fr 28px` → `40px 1fr 28px`; new `.top-bar` (+ left/center/right/title/
+  chip/branch/btn rules). Pinned all four shell children to EXPLICIT grid cells (`.top-bar` r1 1/-1,
+  `.sidebar` r2c1, `.main-content` r2c2, `.status-bar` r3 1/-1) so placement is order-independent (hardening
+  against a future child insert) rather than relying on source order.
+- ContextPanel.tsx: a `gokin:toggle-context` window-event listener (before the `if (collapsed)` early return)
+  so the top-bar right button drives the panel via a decoupled event.
+
+VERIFIED via a 3-agent adversarial Workflow (run wdt5bxl9s): grid-layout, topbar-component, shell-regression
+— all **pass**, verdict **ship**, 0 must-fix, tsc clean. The two nice-to-haves it surfaced were BOTH applied
+here (live branch refresh; explicit grid placement). Independently confirmed: 3-row grid auto-places with no
+phantom rows/overlap, overlays are `position:fixed` (consume no cells), `sidebar-collapsed`/`@media`
+column-overrides still apply, 100vh math sums exactly (content row shrinks 68px), branch effect has a proper
+stale guard + null handling, the context-toggle reaches ContextPanel, and Rules of Hooks hold.
+
+This COMPLETES the mockup redesign. HONEST final state vs. the mockup — matches: blue accent + neutral
+near-black palette, right Git/Goal/Progress cards, flat inline tool lines, filetype chips + green/red diff
+counts, polished composer (+/spinner/ArrowUp/Hand/contextual placeholder), blue active dot, and now the
+full-width top bar (title + project chip + branch + panel toggles). Intentionally DIVERGENT (with reasons):
+native window titlebar instead of frameless/traffic-light-integrated chrome (user's choice — iter 9 declined,
+avoids platform risk); the sidebar stays project-centric rather than the mockup's task-nesting + "New
+Task"/"Skills"/avatar nav, which would be dead/fake controls in studio's model. Verified: `tsc` + `vite
+build` clean; adversarial verification clean.
+
 ## What's Done (iter 1252+ — Redesign pass #7: active status dot green→blue [color semantics complete])
 
 Plan iter 7, scoped HONESTLY. The mockup's sidebar is task-centric (project groups → tasks with relative

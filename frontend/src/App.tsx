@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Sidebar } from './components/layout/Sidebar'
 import { ChatPanel } from './components/chat/ChatPanel'
 import { StatusBar } from './components/layout/StatusBar'
+import { TopBar } from './components/layout/TopBar'
 import { ToastStack } from './components/layout/ToastStack'
 import { ContextPanel } from './components/layout/ContextPanel'
 import { ErrorBoundary, installGlobalErrorHandlers } from './components/layout/ErrorBoundary'
@@ -282,6 +283,7 @@ function AppContent() {
 
   // Hooks before early return
   const activeProjectId = useProjectStore((s) => s.activeProjectId)
+  const projects = useProjectStore((s) => s.projects)
   const sessionActive = useChatStore((s) => s.sessionActive)
   const unread = useChatStore((s) => s.unread)
   const clearUnread = useChatStore((s) => s.clearUnread)
@@ -422,9 +424,22 @@ function AppContent() {
   }
 
   const isChat = view !== 'files' && view !== 'settings'
+  const activeProject = projects.find((p) => p.id === activeProjectId)
+  const topBarTitle = view === 'files'
+    ? 'Files'
+    : view === 'settings'
+    ? 'Settings'
+    : (sessions.find((s) => s.id === view)?.name || 'Chat')
 
   return (
     <div className={`app ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
+      <TopBar
+        title={topBarTitle}
+        projectName={activeProject?.name}
+        projectId={activeProjectId}
+        isChat={isChat}
+        onToggleSidebar={() => setSidebarCollapsed(!sidebarCollapsed)}
+      />
       <Sidebar
         onOpenSettings={() => setView('settings')}
         onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
