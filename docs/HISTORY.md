@@ -25,6 +25,43 @@ First minor release since v1.0.0 (97 commits). Headlines:
 
 ---
 
+## What's Done (iter 1254+ — Redesign re-verification + cleanup sweep)
+
+User asked to re-check everything ("перепроверь все хорошо", ultracode). Ran ground-truth verification +
+a 4-dimension adversarial Workflow (run wsyv00tvg: css-theme-correctness, tool-rendering-states,
+cross-iteration-coherence, deadcode → adversarial-verify medium+ findings → synthesize). VERDICT:
+**minor-cleanups / ship** — the redesign (1246-1253) is sound: frontend `tsc`+`vite` clean, Go
+build/vet/`-race` (studio+client+tools) all PASS, ZERO blocker/high, ZERO must-fix; both medium findings
+downgraded to low on verification. This iteration sweeps the confirmed low/cosmetic findings (several were
+real bugs in my own redesign code):
+
+- **Undefined-token bug** (same class the redesign claimed to close): `--bg-elevated` (`.tool-elapsed-chip`
+  bg) and `--bg-tertiary` (`.chat-header-pin-clear:hover`) were referenced but never defined → transparent.
+  Defined both in dark+light blocks (`var(--bg-surface)`/`var(--bg-hover)`). An EXHAUSTIVE token audit now
+  confirms every `var(--X)` in the tree resolves to a definition (0 undefined, 0 fallback-only).
+- **Phantom `-1` diff count** (bug from iter 1250): a pure-addition edit (`insert_after_line` / line-range,
+  where `editArgsToDiff` yields `oldText:''`) showed `+3 -1` because diffing against `''` counts a phantom
+  empty line as a removal. Fixed: empty `oldText` is now counted as a pure addition (line count, `dels:0`),
+  mirroring the write path.
+- **Identity-chrome redundancy** (created by the iter-1253 TopBar): project name + branch were shown in 3 /
+  2 surfaces. Dropped `chat-header-name` + `chat-header-branch` from the chat header (TopBar is now the
+  single source of truth for project identity); trimmed the breadcrumb separator CSS so it reads "path ›
+  model". Header now: path › model + thinking/pin chips; StatusBar keeps provider/model.
+- **TopBar empty-state title**: when there's no active project, the title was a misleading "Chat"; now ''
+  (no implied active chat on the welcome screen).
+- **Dead code**: removed the orphaned `.tool-name` CSS rule (renamed to `.tool-verb` in 1249;
+  `.activity-tool-name` is separate, kept), the dead `--assistant-bubble` token (zero `var()` consumers;
+  assistant content renders transparent) from both themes, and a stale `.tool-card` comment describing the
+  removed collapsed left-rail.
+- **Light-theme polish**: `.changed-file-btn:hover` had a no-op identical background → dropped (border-color
+  hover remains). Added a `[data-theme="light"]` override darkening the bright `.ft-*` filetype glyph colors
+  so they keep contrast on the pale light-theme chip (they popped on near-black but washed out on light).
+
+JSX-hook audit: clean — only derived-const changes + two span removals; no hooks added/moved/conditionalized.
+Verified: exhaustive token audit passes, `tsc` + `vite build` clean (Go untouched, suite already green).
+DELIBERATELY left (honest): nothing outstanding — the only item the review called truly optional (ft glyph
+contrast) was also addressed. The mockup redesign + its verification are complete.
+
 ## What's Done (iter 1253+ — Redesign pass #8: full-width top-bar shell [redesign complete])
 
 Plan iter 8 — the single largest missing mockup region. The user chose "top bar + native window" (declined

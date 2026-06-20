@@ -425,7 +425,9 @@ function AppContent() {
 
   const isChat = view !== 'files' && view !== 'settings'
   const activeProject = projects.find((p) => p.id === activeProjectId)
-  const topBarTitle = view === 'files'
+  const topBarTitle = !activeProjectId
+    ? '' // welcome/empty state — don't imply an active chat
+    : view === 'files'
     ? 'Files'
     : view === 'settings'
     ? 'Settings'

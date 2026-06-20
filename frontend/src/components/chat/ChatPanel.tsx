@@ -1708,17 +1708,11 @@ function ChatPanelBody({
     <div className="chat-panel">
       <div className="chat-header">
         <div className="chat-header-info">
-          {/* iter 740+: context strip = breadcrumb (project › branch › model) +
-              status chips. Separators rendered via CSS ::before so they only
-              appear when the next chunk is present. wireframes.html direction 01:
-              "context strip is a single truth: project › branch › model › $" */}
-          <span className="chat-header-name">{activeProject.name}</span>
+          {/* Context strip = breadcrumb (path › model) + status chips. The
+              project name + git branch now live in the window TopBar (single
+              source of truth), so they're not duplicated here. Separators are
+              CSS ::before so they only appear when the next chunk is present. */}
           <span className="chat-header-path" title={activeProject.directory}>{shortPath}</span>
-          {activeProject.gitBranch && (
-            <span className="chat-header-branch">
-              <GitBranch size={10} /> {activeProject.gitBranch}
-            </span>
-          )}
           {activeProject.model && (
             <span className="chat-header-model" title={`Provider: ${activeProject.provider}\nModel: ${activeProject.model}\nCtrl+M to switch`}>
               {activeProject.model}
@@ -5205,10 +5199,18 @@ function MessageBubbleInner({ message, onRerun, canEdit, onEditSubmit, changedFi
     const editDiff = isEdit ? editArgsToDiff(message.toolArgs as any) : null
     const writeContent = isWrite ? String((message.toolArgs as any)?.content ?? '') : ''
     // Compact +adds/-dels for the collapsed write/edit row (mockup "Wrote … +733").
-    // A write adds all its lines (cheap line count); an edit diffs old→new.
+    // A write — and an edit with no old text (insert_after_line / line-range
+    // replace, where editArgsToDiff yields oldText:'') — is a pure addition, so
+    // count its lines directly; otherwise diff old→new. Counting lines for the
+    // pure-add case avoids a phantom "-1" from diffing against an empty string.
+    const lineCount = (s: string) => (s ? s.replace(/\n$/, '').split('\n').length : 0)
     const toolDiffCounts = isWrite
-      ? { adds: writeContent ? writeContent.replace(/\n$/, '').split('\n').length : 0, dels: 0 }
-      : (isEdit && editDiff ? diffCounts(editDiff.oldText, editDiff.newText) : null)
+      ? { adds: lineCount(writeContent), dels: 0 }
+      : (isEdit && editDiff
+          ? (editDiff.oldText === ''
+              ? { adds: lineCount(editDiff.newText), dels: 0 }
+              : diffCounts(editDiff.oldText, editDiff.newText))
+          : null)
 
     // iter 740+: left accent rail state — pending/success/failure drives a
     // colored left border on .tool-card so status is visible at a glance

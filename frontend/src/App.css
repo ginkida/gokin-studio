@@ -956,11 +956,8 @@
   align-items: center;
 }
 
-/* iter 740+ context-strip breadcrumb: a chevron separator before chunks
-   that follow the project name. Skipped for the first chunk
-   (chat-header-name) so it doesn't render at the start. */
-.chat-header-path::before,
-.chat-header-info > .chat-header-branch::before,
+/* Context-strip breadcrumb: a chevron separator before the model chunk so it
+   reads "path › model". Path is the first chunk and gets no leading separator. */
 .chat-header-info > .chat-header-model::before {
   content: '›';
   margin-right: 8px;
@@ -2468,10 +2465,8 @@
   border: none;
   border-radius: 8px;
   overflow: hidden;
-  /* iter 740+: left accent rail — wireframes.html direction 01 calls out
-     "tool cards get a left rail for at-a-glance status" instead of badge soup.
-     Border-left is on .tool-header (inline) for the collapsed state and on
-     the whole card for expanded. The color reflects pending/success/failure. */
+  /* Collapsed row is flat text (see .tool-header below); the colored status
+     rail now lives only on the EXPANDED .tool-detail. */
 }
 
 /* iter 1249+: collapsed tool rows read as flat inline text in the message flow
@@ -2520,14 +2515,6 @@
   animation: spin 1s linear infinite;
 }
 
-.tool-name {
-  font-family: 'Geist Mono', 'SF Mono', 'JetBrains Mono', 'Cascadia Code', monospace;
-  font-size: 11px;
-  color: var(--text-primary);
-  font-weight: 500;
-  letter-spacing: -0.01em;
-}
-
 /* The friendly verb / humanized tool name leading the flattened collapsed row
    ("Ran" · "Wrote" · "git status"). Muted so the inline-code primary stands out. */
 .tool-verb {
@@ -2570,6 +2557,19 @@
 .ft-sh { color: #6cc04a; }
 .ft-yaml { color: #c04ac0; }
 .ft-default { color: var(--text-muted); }
+/* Light theme: darken the bright glyph colors so they keep contrast against the
+   pale chip background (the bright variants pop on near-black but wash out on light). */
+[data-theme="light"] .ft-html { color: #c2410c; }
+[data-theme="light"] .ft-css { color: #2563eb; }
+[data-theme="light"] .ft-js { color: #a16207; }
+[data-theme="light"] .ft-ts { color: #1d4ed8; }
+[data-theme="light"] .ft-json { color: #b45309; }
+[data-theme="light"] .ft-md { color: #57606a; }
+[data-theme="light"] .ft-go { color: #0e7490; }
+[data-theme="light"] .ft-py { color: #1d4ed8; }
+[data-theme="light"] .ft-rs { color: #c2410c; }
+[data-theme="light"] .ft-sh { color: #4d7c0f; }
+[data-theme="light"] .ft-yaml { color: #a21caf; }
 
 /* iter 1030+: live streaming output preview on pending tool cards. Sits
    between the tool header and the expanded detail. Auto-cleared when the
@@ -3116,7 +3116,6 @@
 .changed-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
 
 .changed-file-btn:hover {
-  background: var(--success-subtle);
   border-color: var(--success);
 }
 
