@@ -25,6 +25,35 @@ First minor release since v1.0.0 (97 commits). Headlines:
 
 ---
 
+## What's Done (iter 1251+ — Redesign pass #6: composer toolbar polish + adversarial verification)
+
+Plan iter 6 (ultracode). The composer was already ~90% the mockup (rounded card, model + thinking("Max") +
+permission chips, circular accent send). Additive polish, send kept INSIDE the textarea wrapper (no
+handleSend/handleStop rewiring):
+
+- ChatPanel.tsx: added a round `.composer-add-btn` (+) as the first `.input-bar-controls` child, wired to the
+  EXISTING `setShowFilePicker(true)` flow (same FilePicker / @-mention-at-cursor path as Ctrl+P and the
+  FolderTree button — not a no-op). Added a `Loader2` spinner (`thisSessionActive && …`) next to the model
+  chip as a live working indicator. Swapped the send glyph `Send`→`ArrowUp` (the button is already a blue
+  accent rounded square). Swapped the permission toggle icon `ShieldCheck/ShieldOff`→`Hand` ("Ask before
+  changes" reading; the "Ask first"/"Auto" label + `.perm-ask` highlight still differentiate state). Made the
+  placeholder contextual: "Ask for follow-up changes…" once `messages.length > 0`, else "Ask anything…".
+- App.css: added `.composer-add-btn` (+ `:hover` accent) and `.composer-spinner`.
+
+VERIFIED via a 3-agent adversarial Workflow (run w3iokyr3l): filepicker-attach-flow, regression-hunt,
+a11y/visual — all **pass**, 0 blocker/high/medium, 7 low cosmetic notes. Acted on the worthwhile ones:
+removed the now-dead `Send`/`ShieldCheck`/`ShieldOff` imports (confirmed zero icon usages — the only `Send`
+hits are in tooltip strings), and matched the `+` button to chip height (26→24px). Left the spinner's tiny
+active↔idle layout shift as-is (verifier confirmed reserving permanent space is worse). JSX-hook audit
+(also independently confirmed): the spinner is a pure conditional RENDER, no conditional hook; `messages`/
+`thisSessionActive` are existing top-level selectors; all handlers are plain props.
+
+HONEST value: medium — the composer was already close, so this is the smallest-delta iteration; the genuine
+adds are the wired `+` attach button, the working-state spinner, and the contextual placeholder. The Hand
+icon trades a per-state icon for a single feature glyph (label/highlight carry the state) — a deliberate
+mockup-match. Send stays a rounded square (10px radius), not a literal circle. Verified: `tsc` + `vite
+build` clean; adversarial verification clean.
+
 ## What's Done (iter 1250+ — Redesign pass #5: filetype file chips + green/red diff counts on write/edit lines)
 
 Plan iter 5 — completes the mockup's "Wrote index.html, app.js +733" vocabulary on top of the flattened

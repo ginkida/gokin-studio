@@ -8,7 +8,7 @@ import { useProjectStore, type ProjectInfo } from '../../stores/projectStore'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { DispatchModal } from '../dispatch/DispatchModal'
 import { FilePicker } from '../files/FilePicker'
-import { Send, Square, ChevronRight, ChevronDown, CheckCircle, XCircle, Trash2, ArrowRightLeft, AlertTriangle, Brain, ExternalLink, ListChecks, Circle, Database, FileText, Download, Search, X, MessageSquare, Zap, Bot, User, Terminal, TerminalSquare, Pencil, Eye, EyeOff, GitBranch, FolderSearch, Loader2, Copy, Check, MoreHorizontal, RotateCcw, FolderTree, Pin, GitFork, Bookmark, BookmarkPlus, BookmarkMinus, Activity, DollarSign, ShieldCheck, ShieldOff } from 'lucide-react'
+import { Square, ChevronRight, ChevronDown, CheckCircle, XCircle, Trash2, ArrowRightLeft, AlertTriangle, Brain, ExternalLink, ListChecks, Circle, Database, FileText, Download, Search, X, MessageSquare, Zap, Bot, User, Terminal, TerminalSquare, Pencil, Eye, EyeOff, GitBranch, FolderSearch, Loader2, Copy, Check, MoreHorizontal, RotateCcw, FolderTree, Pin, GitFork, Bookmark, BookmarkPlus, BookmarkMinus, Activity, DollarSign, Plus, ArrowUp, Hand } from 'lucide-react'
 import { SendMessage, StopGeneration, ClearHistory, GetHistory, SetProjectSystemPrompt, ExportChat, ListDirectory, EditUserMessage, ReadFileContent, GetRecoveryEvents, DiscardRecoveryEvents, AnswerQuestion, CancelQuestion, ListProjectMemory, DeleteMemoryEntry, ClearPinnedContext, SearchProjectHistory, SaveDraft, GetDraft, ForkChatSession, PinMessage, UnpinMessage, ListPinnedMessages, ListPromptTemplates, SaveUserPromptTemplate, DeleteUserPromptTemplate, ListUserPromptTemplates, GetProjectGitContext, ProjectUsageStats, ExportProjectAllSessions, SummarizeSession, SetProjectBudget, SetProjectEnforceBudget, SetProjectProvider, GetProject, ListUserSnippets, ListChatSessions, DeleteChatSession, ListProjectFiles, ExportSessionJSON, ImportSessionJSON, ExportProjectUsageCSV, GetModelPricing, SetProjectThinking, SetProjectPermissionMode } from '../../../wailsjs/go/studio/Studio'
 import { ClipboardSetText, EventsOn } from '../../../wailsjs/runtime/runtime'
 import { isProjectMuted } from '../../lib/mutedProjects'
@@ -3830,6 +3830,8 @@ function ChatPanelBody({
                 ? 'Project directory is missing — fix or re-add the project before sending'
                 : !canSend
                 ? `Configure ${missingKey} API key in Settings first`
+                : messages.length > 0
+                ? 'Ask for follow-up changes…'
                 : 'Ask anything about your project...'
             }
             rows={1}
@@ -3850,12 +3852,26 @@ function ChatPanelBody({
               disabled={!input.trim() || !canSend || sending}
               title={!canSend ? 'API key required' : 'Send (Enter)'}
             >
-              <Send size={14} />
+              <ArrowUp size={16} />
             </button>
           )}
         </div>
         <div className="chat-input-footer">
           <div className="input-bar-controls">
+            {/* Attach a project file — opens the same FilePicker as Ctrl+P; it
+                inserts an @-mention at the cursor (no new wiring, real flow). */}
+            <button
+              className="composer-add-btn"
+              onClick={() => setShowFilePicker(true)}
+              title="Attach a project file (@-mention)"
+              aria-label="Attach a project file"
+            >
+              <Plus size={15} />
+            </button>
+
+            {/* Live spinner while the agent is working this session. */}
+            {thisSessionActive && <Loader2 size={13} className="spin composer-spinner" aria-label="Working" />}
+
             {/* Model chip — opens the Ctrl+M quick-switcher. */}
             <button
               className="input-bar-chip"
@@ -3933,7 +3949,7 @@ function ChatPanelBody({
                     ? 'Ask before changes: the agent confirms via ask_user before file/git/destructive changes. Click to allow automatically.'
                     : 'Auto: the agent proceeds without asking. Click to require confirmation before changes.'}
                 >
-                  {ask ? <ShieldCheck size={12} /> : <ShieldOff size={12} />}
+                  <Hand size={12} />
                   <span className="ibc-label">{ask ? 'Ask first' : 'Auto'}</span>
                 </button>
               )
