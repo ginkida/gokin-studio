@@ -7,6 +7,29 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## Release v1.2.0 (2026-06-20)
+
+UI redesign toward the user's target mockup — a front-end-only refresh on top of v1.1.0 (no backend /
+provider / agent-loop behavior change). Shipped as 10 verified iterations (1245-1254), each built clean;
+the two highest-risk (composer, top bar) and the cumulative result were adversarially verified via
+multi-agent workflows (verdict ship, 0 must-fix). Headlines:
+- **Blue accent + neutral near-black palette** (violet→blue app-wide; retuned bg ramp) + repair of latent
+  undefined-token bugs (`--bg-deeper`/`--bg-input`/`--bg-elevated`/`--bg-tertiary` were rendering transparent).
+- **Right context panel** Git/Goal/Progress restyled into raised rounded cards.
+- **Flat inline tool lines** ("Ran `git status`" / "Wrote `index.html`") replacing bordered pill cards, with
+  **filetype chips + green/red `+N`/`-N` diff counts** on write/edit rows.
+- **Polished composer** (+ attach button, working spinner, up-arrow send, clearer permission icon, contextual
+  placeholder) and a **blue active-project dot** completing the active=blue / success=green color system.
+- **Full-width top bar** under the native window: title + project chip + live git branch + sidebar/context
+  panel toggles. Intentionally NOT frameless (cross-platform window-chrome risk); sidebar stays
+  project-centric (the mockup's task-nav/avatar would be dead controls here).
+
+`Version` const → 1.2.0; `wails.json` productVersion → 1.2.0. Verified for release: Go build/vet/`-race`
+(studio+client+tools) all pass, `tsc` + `vite build` clean, `wails build` (darwin/universal) at 1.2.0,
+exhaustive CSS token audit (0 undefined), release-diff safety scan (no leaked secrets / debug / stray files).
+
+---
+
 ## Release v1.1.0 (2026-06-19)
 
 First minor release since v1.0.0 (97 commits). Headlines:

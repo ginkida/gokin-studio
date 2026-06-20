@@ -4,7 +4,7 @@ Desktop IDE for running LLM coding agents against multiple project directories a
 
 Built with [Wails v2](https://wails.io) — Go backend + React/TypeScript frontend.
 
-**Status:** v1.0.0 · 910 tests (677 studio + 233 tools) · 90.5% studio coverage.
+**Status:** v1.2.0 · 1636 tests (801 studio + 835 tools) · ~90% studio coverage.
 
 ## Features
 

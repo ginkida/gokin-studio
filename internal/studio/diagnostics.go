@@ -12,7 +12,7 @@ import (
 
 // Version is the current release version of Gokin Studio.
 // Bumped on each release. Surfaced in About panel and diagnostics exports.
-const Version = "1.1.0"
+const Version = "1.2.0"
 
 // BuildInfo describes the running binary: version + runtime environment.
 // Used by the About panel and "Copy diagnostics" reports so support requests

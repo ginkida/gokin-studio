@@ -1201,7 +1201,7 @@ export function SettingsPage() {
               <span className="about-stat-label">Providers</span>
             </div>
             <div className="about-stat">
-              <span className="about-stat-value">v{buildInfo?.version || '1.0.0'}</span>
+              <span className="about-stat-value">v{buildInfo?.version || '1.2.0'}</span>
               <span className="about-stat-label">Version</span>
             </div>
           </div>
