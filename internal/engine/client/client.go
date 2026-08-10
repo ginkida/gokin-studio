@@ -7,6 +7,27 @@ import (
 	"google.golang.org/genai"
 )
 
+const turnContextEnvelopePrefix = "<turn-context>\nEphemeral task-state snapshot (auto-generated, not part of the user's message):\n\n"
+
+// appendTurnContextToContents returns a copy-on-write view of contents with an
+// ephemeral context part on the final user message. It never mutates caller
+// history, so retries and persisted conversations remain context-free.
+func appendTurnContextToContents(contents []*genai.Content, turnContext string) []*genai.Content {
+	if turnContext == "" || len(contents) == 0 {
+		return contents
+	}
+	last := contents[len(contents)-1]
+	if last == nil || last.Role != genai.RoleUser {
+		return contents
+	}
+	out := append([]*genai.Content(nil), contents...)
+	lastCopy := *last
+	lastCopy.Parts = append([]*genai.Part(nil), last.Parts...)
+	lastCopy.Parts = append(lastCopy.Parts, genai.NewPartFromText(turnContextEnvelopePrefix+turnContext+"\n</turn-context>"))
+	out[len(out)-1] = &lastCopy
+	return out
+}
+
 // Default base URLs for API providers.
 const (
 	DefaultAnthropicBaseURL = "https://api.anthropic.com"
@@ -64,14 +85,14 @@ var AvailableModels = []ModelInfo{
 	{
 		ID:          "glm-5.2",
 		Name:        "GLM-5.2",
-		Description: "Most capable GLM model — 1M context, Max tier (Coding Plan)",
+		Description: "Latest flagship for long-horizon agent tasks — 1M context",
 		Provider:    "glm",
 		BaseURL:     DefaultGLMBaseURL,
 	},
 	{
 		ID:          "glm-5.1",
 		Name:        "GLM-5.1",
-		Description: "Previous flagship GLM — 200K context (Coding Plan)",
+		Description: "Flagship agentic coding model — 200K context (Coding Plan)",
 		Provider:    "glm",
 		BaseURL:     DefaultGLMBaseURL,
 	},
@@ -151,11 +172,32 @@ var AvailableModels = []ModelInfo{
 		Provider:    "minimax",
 		BaseURL:     DefaultMiniMaxBaseURL,
 	},
-	// Kimi models (via api.kimi.com/coding — Anthropic-compatible endpoint for sk-kimi-* keys)
+	// Kimi Code models (Anthropic-compatible endpoint for Kimi membership keys).
+	{
+		ID:          "k3",
+		Name:        "Kimi K3",
+		Description: "Most capable Kimi coding model — up to 1M context",
+		Provider:    "kimi",
+		BaseURL:     DefaultKimiBaseURL,
+	},
+	{
+		ID:          "k3-256k",
+		Name:        "Kimi K3 256K",
+		Description: "Flagship K3 coding model — quota-efficient 256K context",
+		Provider:    "kimi",
+		BaseURL:     DefaultKimiBaseURL,
+	},
 	{
 		ID:          "kimi-for-coding",
-		Name:        "Kimi for Coding",
-		Description: "Kimi K2.5 coding-tuned, 262K context (Bearer auth)",
+		Name:        "Kimi K2.7 Code",
+		Description: "Stable coding model — 256K context",
+		Provider:    "kimi",
+		BaseURL:     DefaultKimiBaseURL,
+	},
+	{
+		ID:          "kimi-for-coding-highspeed",
+		Name:        "Kimi K2.7 Code HighSpeed",
+		Description: "Same coding quality, 5–6× faster output — 256K context",
 		Provider:    "kimi",
 		BaseURL:     DefaultKimiBaseURL,
 	},
@@ -324,6 +366,13 @@ type Client interface {
 
 	// Close closes the client connection.
 	Close() error
+}
+
+// FunctionResponsePartsClient is implemented by providers that can preserve
+// non-text parts (for example screenshots) alongside tool results. It remains
+// optional so text-only and legacy clients keep the smaller Client contract.
+type FunctionResponsePartsClient interface {
+	SendFunctionResponseParts(ctx context.Context, history []*genai.Content, parts []*genai.Part) (*StreamingResponse, error)
 }
 
 // RateLimiter interface for rate limiting API calls (optional).

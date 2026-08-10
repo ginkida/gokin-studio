@@ -7,8 +7,15 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/ginkida/gokin-studio/internal/engine/security"
 	"google.golang.org/genai"
 )
+
+// managedEnvironmentPlaceholder stands in for the value of a variable the user
+// configured under Settings -> Local environment. Those live in the macOS
+// Keychain / Windows DPAPI and never cross the UI bridge, so the agent must not
+// be able to read them back out through this tool either.
+const managedEnvironmentPlaceholder = "(set in Studio local environment; value hidden)"
 
 // EnvTool provides access to environment variables.
 type EnvTool struct{}
@@ -59,12 +66,20 @@ func (t *EnvTool) Execute(ctx context.Context, args map[string]any) (ToolResult,
 	prefix := GetStringDefault(args, "prefix", "")
 	maskSecrets := GetBoolDefault(args, "mask_secrets", true)
 
+	// Variables the user stored under Settings -> Local environment live in the
+	// OS keychain and are deliberately write-only: the UI itself only ever gets
+	// their names back. Their values must not reach the model either, so this
+	// tool reports the name as configured and never the plaintext.
+	managed := security.WorkspaceEnvironmentSnapshot()
+
 	// Get specific variable
 	if name != "" {
-		value := os.Getenv(name)
+		if _, isManaged := managed[name]; isManaged {
+			return NewSuccessResult(fmt.Sprintf("%s=%s", name, managedEnvironmentPlaceholder)), nil
+		}
+		value, exists := os.LookupEnv(name)
 		if value == "" {
 			// Check if it exists but is empty vs doesn't exist
-			_, exists := os.LookupEnv(name)
 			if !exists {
 				return NewErrorResult(fmt.Sprintf("environment variable not found: %s", name)), nil
 			}
@@ -78,8 +93,12 @@ func (t *EnvTool) Execute(ctx context.Context, args map[string]any) (ToolResult,
 		return NewSuccessResult(fmt.Sprintf("%s=%s", name, value)), nil
 	}
 
-	// List all variables
-	envVars := os.Environ()
+	// List all variables. The host environment is listed as-is; managed names
+	// are appended with their value withheld rather than merged in plaintext.
+	envVars := append([]string(nil), os.Environ()...)
+	for managedName := range managed {
+		envVars = append(envVars, managedName+"="+managedEnvironmentPlaceholder)
+	}
 	sort.Strings(envVars)
 
 	var builder strings.Builder

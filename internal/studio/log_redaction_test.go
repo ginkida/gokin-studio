@@ -15,7 +15,7 @@ func TestSanitizeLogMessage_NoSecrets(t *testing.T) {
 	cases := []string{
 		"failed to save config: disk full",
 		"ski rental near Bearer Lake (not a token)", // tricky: "Bearer Lake" should NOT match (word "Lake" has no token chars after Bearer)
-		"client error 401 invalid token", // generic
+		"client error 401 invalid token",            // generic
 		"call to /v1/chat/completions returned 200",
 	}
 	for _, in := range cases {

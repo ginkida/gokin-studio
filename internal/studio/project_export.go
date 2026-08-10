@@ -16,13 +16,12 @@ import (
 // metadata + every session; import creates a fresh project (the user
 // must pick a directory for it).
 
-const projectExportVersion = 1
+const projectExportVersion = 2
 
 // ImportPayloadMaxBytes caps both ExportSessionJSON and ExportProjectJSON
 // payloads on the import path so a malformed/giant blob can't OOM the
-// process. 5 MB is generous — a project with 100 active sessions
-// totalling many thousands of turns fits comfortably below this.
-const ImportPayloadMaxBytes = 5 * 1024 * 1024
+// process. The larger v2 budget accommodates portable base64 image data.
+const ImportPayloadMaxBytes = 96 * 1024 * 1024
 
 // ProjectExportEnvelope is the canonical JSON shape for a full project
 // export. The project Directory is intentionally NOT included — paths
@@ -40,9 +39,9 @@ type ProjectExportEnvelope struct {
 	Sessions     []SessionExportEnvelope `json:"sessions"`
 }
 
-// ExportProjectJSON snapshots the project + every session into one JSON
-// envelope. Each session is rendered via the same logic as the per-
-// session export (text-only entries, thinking parts stripped).
+// ExportProjectJSON snapshots the project + every session into one portable
+// JSON envelope. Text and image attachments round-trip; thinking/tool parts
+// are stripped.
 func (s *Studio) ExportProjectJSON(projectID string) (string, error) {
 	if projectID == "" {
 		return "", fmt.Errorf("projectID cannot be empty")
@@ -84,21 +83,9 @@ func (s *Studio) ExportProjectJSON(projectID string) (string, error) {
 		copy(histSnap, sess.history)
 		sess.mu.RUnlock()
 
-		entries := make([]HistoryEntry, 0, len(histSnap))
-		for _, c := range histSnap {
-			text := ""
-			for _, part := range c.Parts {
-				if part.Thought {
-					continue
-				}
-				if part.Text != "" {
-					text += part.Text
-				}
-			}
-			if text == "" {
-				continue
-			}
-			entries = append(entries, HistoryEntry{Role: c.Role, Text: text})
+		entries, err := historyEntriesForExport(histSnap)
+		if err != nil {
+			return "", fmt.Errorf("export session %q: %w", sName, err)
 		}
 		sessions = append(sessions, SessionExportEnvelope{
 			Version:    sessionExportVersion,
@@ -125,6 +112,9 @@ func (s *Studio) ExportProjectJSON(projectID string) (string, error) {
 	out, err := json.MarshalIndent(env, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("marshal project export: %w", err)
+	}
+	if len(out) > ImportPayloadMaxBytes {
+		return "", fmt.Errorf("project export exceeds the %d MiB portable-export limit", ImportPayloadMaxBytes>>20)
 	}
 	return string(out), nil
 }
@@ -191,8 +181,16 @@ func (s *Studio) ImportProjectJSON(jsonBlob, directory string) (*ProjectInfo, er
 	if env.SystemPrompt != "" {
 		_ = s.SetProjectSystemPrompt(info.ID, env.SystemPrompt)
 	}
-	if env.Provider != "" && env.Model != "" {
-		_ = s.SetProjectProvider(info.ID, env.Provider, env.Model)
+	if env.Provider != "" || env.Model != "" {
+		// Portable exports can outlive a provider model or come from an older
+		// build that exposed providers outside Studio's current product boundary.
+		// Preserve GLM/Kimi identity when possible and migrate the model within
+		// that provider. Unsupported providers move to the safe Studio default.
+		// Do this explicitly rather than relying on AddProject's current default:
+		// otherwise importing an old GLM export while Kimi is the user's default
+		// would silently turn the imported project into Kimi.
+		provider, model := normalizeStudioProviderModel(env.Provider, env.Model)
+		_ = s.SetProjectProvider(info.ID, provider, model)
 	}
 	if env.Temperature != 0 || env.MaxTokens != 0 {
 		_ = s.SetProjectModelParams(info.ID, env.Temperature, env.MaxTokens)

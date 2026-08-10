@@ -379,8 +379,7 @@ func (t *FindReferencesTool) referencesViaGopls(ctx context.Context, file, symbo
 // filesystem walk so it works outside a git checkout.
 func (t *FindReferencesTool) referencesViaGrep(ctx context.Context, symbol string) (ToolResult, error) {
 	// -F: literal match; -w: whole-word.
-	cmd := exec.CommandContext(ctx, "git", "grep", "-n", "-F", "-w", "--", symbol, "--", "*.go")
-	cmd.Dir = t.workDir
+	cmd := newGitCommand(ctx, t.workDir, "grep", "-n", "-F", "-w", "--", symbol, "--", "*.go")
 	output, err := cmd.Output()
 	if err != nil {
 		// exit 1 with empty stderr inside a valid repo = no matches.

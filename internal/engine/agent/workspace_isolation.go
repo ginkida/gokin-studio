@@ -125,7 +125,13 @@ func prepareGitWorktree(baseWorkDir string, applyBackOnSuccess bool) (*isolatedW
 	}
 
 	worktreeDir := filepath.Join(parent, "workspace")
-	cmd := exec.Command("git", "-C", baseWorkDir, "worktree", "add", "--detach", worktreeDir, "HEAD")
+	cmd := exec.Command(
+		"git",
+		"-c", "core.hooksPath=/dev/null",
+		"-c", "core.fsmonitor=false",
+		"-C", baseWorkDir,
+		"worktree", "add", "--detach", worktreeDir, "HEAD",
+	)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		_ = os.RemoveAll(parent)
@@ -138,7 +144,13 @@ func prepareGitWorktree(baseWorkDir string, applyBackOnSuccess bool) (*isolatedW
 		Strategy:           "git_worktree",
 		ApplyBackOnSuccess: applyBackOnSuccess,
 		cleanup: func() error {
-			cmd := exec.Command("git", "-C", baseWorkDir, "worktree", "remove", "--force", worktreeDir)
+			cmd := exec.Command(
+				"git",
+				"-c", "core.hooksPath=/dev/null",
+				"-c", "core.fsmonitor=false",
+				"-C", baseWorkDir,
+				"worktree", "remove", "--force", worktreeDir,
+			)
 			output, err := cmd.CombinedOutput()
 			removeErr := os.RemoveAll(parent)
 			if err != nil {
@@ -291,7 +303,12 @@ func runGitCommand(workDir string, args ...string) ([]byte, error) {
 }
 
 func runGitCommandWithInput(workDir string, input []byte, args ...string) ([]byte, error) {
-	cmdArgs := append([]string{"-C", workDir}, args...)
+	cmdArgs := []string{
+		"-c", "core.hooksPath=/dev/null",
+		"-c", "core.fsmonitor=false",
+		"-C", workDir,
+	}
+	cmdArgs = append(cmdArgs, args...)
 	cmd := exec.Command("git", cmdArgs...)
 	if len(input) > 0 {
 		cmd.Stdin = bytes.NewReader(input)

@@ -27,17 +27,17 @@ func TestLookupPricing_UnknownIsZero(t *testing.T) {
 
 func TestLookupPricing_ExactMatch(t *testing.T) {
 	p := LookupPricing("glm", "glm-5.1")
-	if p.InputPerMTok != 0.55 || p.OutputPerMTok != 2.19 {
+	if p.InputPerMTok != 1.40 || p.OutputPerMTok != 4.40 {
 		t.Errorf("glm-5.1 pricing wrong: %+v", p)
 	}
 }
 
 func TestLookupPricing_LongestPrefixWins(t *testing.T) {
-	// "glm-4.6" should resolve to glm-4.6 tier even though "glm-4" and "glm"
-	// are both registered prefixes — the longest match must win.
-	p := LookupPricing("glm", "glm-4.6")
-	if p.InputPerMTok != 0.55 {
-		t.Errorf("glm-4.6 should match glm-4.6 tier (input 0.55), got %+v", p)
+	// "glm-5-turbo-preview" must resolve to the longer turbo tier rather than
+	// the flagship "glm-5" prefix.
+	p := LookupPricing("glm", "glm-5-turbo-preview")
+	if p.InputPerMTok != 1.20 {
+		t.Errorf("glm-5-turbo-preview should match turbo tier (input 1.20), got %+v", p)
 	}
 	// "glm-5.1-experimental" → glm-5.1 (longest matching prefix), not glm-5.
 	p2 := LookupPricing("glm", "glm-5.1-experimental")
@@ -75,19 +75,18 @@ func TestEstimateCost_Ollama(t *testing.T) {
 }
 
 func TestEstimateCost_GLM5_1(t *testing.T) {
-	// 1M input + 1M output at GLM-5.1 rates: 0.55 + 2.19 = 2.74.
+	// 1M input + 1M output at GLM-5.1 rates.
 	got := EstimateCost("glm", "glm-5.1", 1_000_000, 1_000_000, 0, 0)
-	want := 0.55 + 2.19
+	want := 1.40 + 4.40
 	if !approxEqual(got, want) {
 		t.Errorf("glm-5.1 cost = %f, want %f", got, want)
 	}
 }
 
 func TestEstimateCost_WithCache(t *testing.T) {
-	// 100K input + 50K output + 1M cache read at GLM-5.1 rates:
-	// 100k * 0.55/M + 50k * 2.19/M + 1M * 0.11/M = 0.055 + 0.1095 + 0.11 = 0.2745
+	// 100K input + 50K output + 1M cache read at GLM-5.1 rates.
 	got := EstimateCost("glm", "glm-5.1", 100_000, 50_000, 1_000_000, 0)
-	want := 100_000*0.55/1e6 + 50_000*2.19/1e6 + 1_000_000*0.11/1e6
+	want := 100_000*1.40/1e6 + 50_000*4.40/1e6 + 1_000_000*0.26/1e6
 	if !approxEqual(got, want) {
 		t.Errorf("cache-read cost = %f, want %f", got, want)
 	}
@@ -95,21 +94,9 @@ func TestEstimateCost_WithCache(t *testing.T) {
 
 func TestEstimateCost_CacheWrite(t *testing.T) {
 	got := EstimateCost("glm", "glm-5.1", 0, 0, 0, 1_000_000)
-	want := 0.69 // 1M * 0.69/M
+	want := 1.40
 	if !approxEqual(got, want) {
 		t.Errorf("cache-write cost = %f, want %f", got, want)
-	}
-}
-
-func TestEstimateCost_CacheZeroForModelsWithoutCache(t *testing.T) {
-	// MiniMax abab models don't have cache pricing — the cache-token amounts
-	// should contribute nothing rather than pricing them at $0/M_in
-	// (which would be wrong for true cache reads, although here it's the
-	// same since their cache prices are unset → 0).
-	got := EstimateCost("minimax", "abab7-chat-pro", 1_000_000, 0, 1_000_000, 1_000_000)
-	want := 1.0 // Only the 1M input tokens at $1/M; cache fields don't apply.
-	if !approxEqual(got, want) {
-		t.Errorf("minimax cost = %f, want %f (cache-* should be ignored)", got, want)
 	}
 }
 
@@ -150,41 +137,27 @@ func TestStudioEstimateCost_WailsBindingPassthrough(t *testing.T) {
 	}
 }
 
-// TestEstimateCost_GLM4_5Air verifies the cheaper GLM tier resolves
-// correctly — important so users on the cost-optimized tier see lower
-// numbers, not the flagship price.
-func TestEstimateCost_GLM4_5Air(t *testing.T) {
-	got := EstimateCost("glm", "glm-4.5-air", 1_000_000, 1_000_000, 0, 0)
-	want := 0.20 + 1.10
-	if !approxEqual(got, want) {
-		t.Errorf("glm-4.5-air cost = %f, want %f", got, want)
-	}
-}
-
 // TestEstimateCost_GLM5_2 verifies the new flagship default resolves to the
-// Max-tier rate (same as glm-5.1) rather than falling through to $0.
+// current official tier rather than falling through to $0.
 func TestEstimateCost_GLM5_2(t *testing.T) {
 	got := EstimateCost("glm", "glm-5.2", 1_000_000, 1_000_000, 0, 0)
-	want := 0.55 + 2.19
+	want := 1.40 + 4.40
 	if !approxEqual(got, want) {
 		t.Errorf("glm-5.2 cost = %f, want %f", got, want)
 	}
-	// Prefix match: a future glm-5.2-* variant still resolves to the 5.2 tier.
-	if EstimateCost("glm", "glm-5.2-preview", 1_000_000, 0, 0, 0) != 0.55 {
-		t.Errorf("glm-5.2-preview should resolve to the glm-5.2 tier (0.55 input)")
+	// Prefix match: a future glm-5.1-* variant still resolves to the same tier.
+	if EstimateCost("glm", "glm-5.1-preview", 1_000_000, 0, 0, 0) != 1.40 {
+		t.Errorf("glm-5.1-preview should resolve to the glm-5.1 tier (1.40 input)")
 	}
 }
 
-// TestEstimateCost_MiniMaxM2_7 verifies the current MiniMax lineup is priced
-// (the old table only had abab/minimax-m1, so M2.7 used to fall through to $0).
-func TestEstimateCost_MiniMaxM2_7(t *testing.T) {
-	got := EstimateCost("minimax", "MiniMax-M2.7", 1_000_000, 1_000_000, 0, 0)
-	want := 0.30 + 1.20
+func TestEstimateCost_KimiK3CurrentRates(t *testing.T) {
+	got := EstimateCost("kimi", "k3", 1_000_000, 1_000_000, 1_000_000, 0)
+	want := 3.00 + 15.00 + 0.30
 	if !approxEqual(got, want) {
-		t.Errorf("MiniMax-M2.7 cost = %f, want %f", got, want)
+		t.Errorf("Kimi K3 cost = %f, want %f", got, want)
 	}
-	// The "minimax" catch-all keeps an unknown future model from costing $0.
-	if EstimateCost("minimax", "MiniMax-M9-unknown", 1_000_000, 0, 0, 0) != 0.30 {
-		t.Errorf("unknown MiniMax model should fall back to the minimax catch-all (0.30 input)")
+	if got256 := LookupPricing("kimi", "k3-256k"); got256 != modelPricing["k3"] {
+		t.Errorf("k3-256k pricing = %+v, want K3 tier %+v", got256, modelPricing["k3"])
 	}
 }

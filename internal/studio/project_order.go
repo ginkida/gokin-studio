@@ -33,7 +33,7 @@ func projectOrderPath() string {
 // the user into the lastUsedAt-default order is preferable to refusing to
 // list projects at all.
 func loadProjectOrder() ([]string, error) {
-	data, err := os.ReadFile(projectOrderPath())
+	data, err := readRegularFileLimited(projectOrderPath(), 256<<10)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return []string{}, nil

@@ -3,8 +3,10 @@ package studio
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/ginkida/gokin-studio/internal/engine/tools"
 	"google.golang.org/genai"
 )
 
@@ -441,4 +443,44 @@ func TestNewProject_PreLoadsPinnedContext(t *testing.T) {
 	if info.PinnedContext != "startup pin content" {
 		t.Errorf("Info().PinnedContext = %q, want %q", info.PinnedContext, "startup pin content")
 	}
+}
+
+func TestNewProject_DoesNotPreloadUntrustedPinnedContext(t *testing.T) {
+	t.Run("oversized", func(t *testing.T) {
+		_ = withTempHistoryDir(t)
+		dir := t.TempDir()
+		pinPath := filepath.Join(dir, ".gokin", "pinned_context.md")
+		if err := os.MkdirAll(filepath.Dir(pinPath), 0750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(pinPath, []byte(strings.Repeat("x", tools.MaxPinnedContextBytes+1)), 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		p := NewProject(ProjectConfig{ID: "pin-too-large", Name: "P", Directory: dir})
+		if got := p.Info().PinnedContext; got != "" {
+			t.Fatalf("oversized pin was preloaded: %d bytes", len(got))
+		}
+	})
+
+	t.Run("symlink", func(t *testing.T) {
+		_ = withTempHistoryDir(t)
+		dir := t.TempDir()
+		outside := filepath.Join(t.TempDir(), "secret")
+		if err := os.WriteFile(outside, []byte("do not inject"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		pinPath := filepath.Join(dir, ".gokin", "pinned_context.md")
+		if err := os.MkdirAll(filepath.Dir(pinPath), 0750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, pinPath); err != nil {
+			t.Fatal(err)
+		}
+
+		p := NewProject(ProjectConfig{ID: "pin-symlink", Name: "P", Directory: dir})
+		if got := p.Info().PinnedContext; got != "" {
+			t.Fatalf("symlinked pin was preloaded: %q", got)
+		}
+	})
 }

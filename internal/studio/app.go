@@ -2,14 +2,26 @@ package studio
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
+	"io"
+	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf16"
+	"unicode/utf8"
 
+	"github.com/ginkida/gokin-studio/internal/engine/memory"
+	"github.com/ginkida/gokin-studio/internal/engine/security"
+	"github.com/ginkida/gokin-studio/internal/engine/tools"
 	"github.com/google/uuid"
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 	"google.golang.org/genai"
@@ -21,41 +33,181 @@ import (
 // Studio is the main Wails-bound struct.
 // All public methods are exposed as bindings to the React frontend.
 type Studio struct {
-	ctx          context.Context
-	config       *StudioConfig
-	projects     map[string]*Project
-	terminals    map[string]*Terminal
-	sharedMemory *SharedMemory    // process-wide cross-project scratchpad for agents
-	askUsers     *askUserRegistry // pending ask_user questions awaiting frontend answers
-	eventLog     *EventLog        // ring buffer of recent backend events (errors, warnings) — exposed via Diagnostics UI
-	eventLogOnce sync.Once        // guards lazy-init of eventLog for tests using bare &Studio{}
-	mu           sync.RWMutex
-	wg           sync.WaitGroup // tracks background goroutines (SendMessage, Dispatch)
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	config                 *StudioConfig
+	projects               map[string]*Project
+	archived               map[string]ArchivedProjectRecord
+	terminals              map[string]*Terminal
+	previewMu              sync.Mutex
+	previewServers         map[string]*previewServerRun
+	previewStaticEpoch     map[string]uint64
+	externalBrowserMu      sync.Mutex
+	externalBrowserTabs    map[string]*externalBrowserRun
+	externalBrowserActive  map[string]string
+	externalBrowserAgent   *externalBrowserAgentRegistry
+	browserPermissionMu    sync.Mutex
+	browserPermissions     map[string]bool
+	browserPermissionsRead bool
+	sharedMemory           *SharedMemory    // process-wide cross-project scratchpad for agents
+	askUsers               *askUserRegistry // pending ask_user questions awaiting frontend answers
+	previewBrowser         *previewBrowserRegistry
+	mcpApps                *mcpAppRegistry // ephemeral same-server sessions for sandboxed MCP Apps
+	mcpAppsOnce            sync.Once
+	eventLog               *EventLog // ring buffer of recent backend events (errors, warnings) — exposed via Diagnostics UI
+	eventLogOnce           sync.Once // guards lazy-init of eventLog for tests using bare &Studio{}
+	mu                     sync.RWMutex
+	configSaveMu           sync.Mutex // serializes config snapshots through durable commit
+	sessionFileSaveMu      sync.Mutex // makes each optimistic editor compare-and-replace indivisible from another editor save
+	lifecycleMu            sync.Mutex // makes background registration atomic with shutdown
+	shuttingDown           bool
+	shutdownOnce           sync.Once
+	quitPromptMu           sync.Mutex // prevents duplicate native dialogs from repeated Quit commands
+	quitPromptOpen         bool
+	wg                     sync.WaitGroup // tracks every Studio-owned background goroutine
+	scheduleWake           chan struct{}  // wakes the persistent scheduled-task loop after config changes
+	quickEntryMu           sync.Mutex
+	quickEntry             quickEntryController
+	quickEntryWindowMu     sync.Mutex
+	quickEntryWindow       bool
+	deepLinkMu             sync.Mutex
+	deepLinkPending        []DeepLinkEvent
+	deepLinkReady          bool
+	deepLinkSequence       uint64
+	deepLinkRecent         map[[32]byte]time.Time
+	nativeCommandMu        sync.Mutex
+	nativeCommandPending   []string
+	nativeCommandReady     bool
+	sideChatMu             sync.Mutex
+	sideChatRuns           map[string]sideChatRun
+	updateMu               sync.Mutex
+	pullRequestMu          sync.Mutex
+	pullRequestArchiveOnce sync.Once
+	pullRequestArchiveNext atomic.Uint64
+	voiceShortcutMu        sync.Mutex
+	voiceShortcut          quickEntryController
+	speechMu               sync.Mutex
+	speechSession          *studioSpeechSession
+	mcpOAuthMu             sync.Mutex
+	mcpOAuthRuns           map[string]bool
+	localEnvironmentMu     sync.Mutex
+	localEnvironmentError  string
+	codeReviewMu           sync.Mutex
+	codeReviewFindings     map[string]storedCodeReview
+	wakeEnabled            atomic.Bool
+	wakeScheduled          atomic.Bool
+	archivedIDs            atomic.Value // map[string]bool; lock-free scheduler/wake snapshot
+	wakeMu                 sync.Mutex
+	wakeRuns               int
+	wakeLease              wakeLease
+	wakeError              string
+	discoveredModels       map[string]map[string]bool // provider model IDs confirmed by this process's authenticated /models probe
+	discoveredModelsAt     map[string]time.Time       // freshness boundary mirrors the frontend capability snapshot TTL
+	// Test seams keep OS shortcut registration/window activation out of unit
+	// tests while exercising the full settings lifecycle.
+	testQuickEntryStarter      func(string, func()) (quickEntryController, error)
+	testVoiceShortcutStarter   func(string, func()) (quickEntryController, error)
+	testQuickEntryActivation   func(string)
+	testQuickEntryWindowShow   func() error
+	testQuickEntryWindowHide   func(bool) error
+	testDeepLinkEmitter        func(DeepLinkEvent)
+	testNativeCommandEmitter   func(string)
+	testSideChatEmitter        func(string, SideChatEvent)
+	testWindowActivator        func()
+	testUpdateHTTPClient       *http.Client
+	testUpdateEndpoint         string
+	testUpdateEmitter          func(UpdateStatus)
+	testUpdateNow              func() time.Time
+	testGHCommand              func(context.Context, string, ...string) ([]byte, error)
+	testSpeechStarter          func(string, string, func(nativeSpeechEvent)) (nativeSpeechController, error)
+	testSpeechStatus           func(string) nativeSpeechStatus
+	testSpeechPermissions      func(context.Context) (nativeSpeechStatus, error)
+	testSpeechEmitter          func(SpeechDictationEvent)
+	testDesktopCapture         func(context.Context) ([]byte, error)
+	testInteractiveCapture     func(context.Context) ([]byte, error)
+	testMCPOAuthHTTPClient     *http.Client
+	testMCPOAuthOpenBrowser    func(string) error
+	testMCPOAuthSave           func(string, []byte) error
+	testLocalEnvironmentLoad   func() ([]byte, error)
+	testLocalEnvironmentSave   func([]byte) error
+	testLocalEnvironmentDelete func() error
+	testKnowledgeURLFetcher    func(context.Context, string) (string, error)
+	testKnowledgeURLValidate   func(string) error
+	testWakeAcquire            func(string) (wakeLease, error)
 	// testDispatchFn, if non-nil, is called instead of dispatchInternal in tests.
 	testDispatchFn func(from, to *Project, fromSid, task string, settings Settings)
+	// testMCPAppApproval bypasses the Wails approval card in MCP App tests.
+	testMCPAppApproval              func(context.Context, string, string, string, string, map[string]any) (bool, error)
+	testPreviewBrowserEmitter       func(map[string]any)
+	testCodeReviewEmitter           func(map[string]any)
+	testExternalBrowserClient       *http.Client
+	testExternalBrowserValidate     func(string) error
+	testExternalBrowserAgentEmitter func(map[string]any)
+	testQuitConfirmation            func(QuitWorkSummary) (bool, error)
 }
 
 // NewStudio creates a new Studio instance.
 func NewStudio() *Studio {
-	return &Studio{
-		projects:     make(map[string]*Project),
-		terminals:    make(map[string]*Terminal),
-		sharedMemory: NewSharedMemory(),
-		askUsers:     newAskUserRegistry(),
-		eventLog:     NewEventLog(),
+	s := &Studio{
+		projects:              make(map[string]*Project),
+		archived:              make(map[string]ArchivedProjectRecord),
+		terminals:             make(map[string]*Terminal),
+		previewServers:        make(map[string]*previewServerRun),
+		previewStaticEpoch:    make(map[string]uint64),
+		externalBrowserTabs:   make(map[string]*externalBrowserRun),
+		externalBrowserActive: make(map[string]string),
+		externalBrowserAgent:  newExternalBrowserAgentRegistry(),
+		browserPermissions:    make(map[string]bool),
+		sharedMemory:          NewSharedMemory(),
+		askUsers:              newAskUserRegistry(),
+		previewBrowser:        newPreviewBrowserRegistry(),
+		mcpApps:               newMCPAppRegistry(),
+		eventLog:              NewEventLog(),
+		scheduleWake:          make(chan struct{}, 1),
+		discoveredModels:      make(map[string]map[string]bool),
+		discoveredModelsAt:    make(map[string]time.Time),
+		sideChatRuns:          make(map[string]sideChatRun),
+		codeReviewFindings:    make(map[string]storedCodeReview),
 	}
+	s.archivedIDs.Store(map[string]bool{})
+	return s
+}
+
+// GetWorkspaceIsolationStatus reports the real code-execution boundary used
+// by bash, background shell tasks, and run_tests. Unsupported platforms do not
+// pretend that process groups are a filesystem sandbox.
+func (s *Studio) GetWorkspaceIsolationStatus() security.WorkspaceIsolationStatus {
+	return security.DetectWorkspaceIsolation()
 }
 
 // --- Wails lifecycle ---
 
 // Startup is called by Wails when the app starts.
 func (s *Studio) Startup(ctx context.Context) {
-	s.ctx = ctx
+	// Install the macOS WKNavigationDelegate guard before React can create any
+	// preview/browser iframe. Unsupported hosts keep the script-disabled proxy.
+	_ = externalBrowserActiveScriptsSupported()
+	s.ctx, s.cancel = context.WithCancel(ctx)
 	s.config = LoadConfig()
+	s.wakeEnabled.Store(s.config.Settings.KeepAwakeEnabled)
+	archived, err := loadArchivedProjectsRaw()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gokin-studio: archived projects unavailable: %v\n", err)
+		archived = make(map[string]ArchivedProjectRecord)
+	}
+	s.archived = archived
 	for _, pc := range s.config.Projects {
+		// Active config wins after a crash between the two durable commits of
+		// archive/restore. This is the only reconciliation rule that cannot
+		// hide an otherwise usable project.
+		delete(s.archived, pc.ID)
 		p := NewProject(pc)
 		p.studio = s
 		s.projects[pc.ID] = p
+	}
+	s.syncArchivedIDsLocked()
+	if err := saveArchivedProjectsRaw(s.archived); err != nil {
+		fmt.Fprintf(os.Stderr, "gokin-studio: reconcile archived projects: %v\n", err)
 	}
 	// Persist any migrations applied by LoadConfig.
 	s.saveConfig()
@@ -72,6 +224,23 @@ func (s *Studio) Startup(ctx context.Context) {
 		fmt.Fprintf(os.Stderr, "gokin-studio: event log replay failed: %v\n", err)
 	}
 	s.eventLog.SetPersistPath(eventLogPath)
+	if err := s.loadLocalEnvironment(); err != nil {
+		fmt.Fprintf(os.Stderr, "gokin-studio: local environment unavailable: %v\n", err)
+		s.LogEvent("warn", "local-environment", fmt.Sprintf("secure local environment unavailable: %v", err))
+	}
+	if s.config.Settings.QuickEntryEnabled {
+		if err := s.setQuickEntryEnabled(true, s.config.Settings.QuickEntryShortcut); err != nil {
+			s.LogEvent("warn", "quick-entry", fmt.Sprintf("global shortcut unavailable: %v", err))
+		}
+	}
+	if s.config.Settings.VoiceShortcutEnabled {
+		if err := s.setVoiceShortcutEnabled(true, s.config.Settings.VoiceShortcut); err != nil {
+			s.LogEvent("warn", "quick-entry", fmt.Sprintf("voice shortcut unavailable: %v", err))
+		}
+	}
+	if err := s.refreshScheduledWakeNeed(); err != nil {
+		s.LogEvent("warn", "wake", fmt.Sprintf("scheduled wake status unavailable: %v", err))
+	}
 
 	// Surface any session-history files quarantined during project load (a
 	// corrupt/unreadable file was moved aside rather than silently dropping the
@@ -94,20 +263,50 @@ func (s *Studio) Startup(ctx context.Context) {
 	// iter 970+: safeGoFn replaces inline defer/recover so panics surface in
 	// the event log (visible via Diagnostics → View Logs) instead of only
 	// stderr, which is invisible to users launching from a desktop launcher.
-	safeGoFn("auto-cleanup", s.LogEvent, func() {
+	s.startBackground("auto-cleanup", func() {
 		_ = s.RunAutoCleanupIfDue()
 	})
 
 	// iter 840+: background auto-backup pass — once per 24h, opt-in via
 	// Settings.AutoBackupEnabled. Writes a tar.gz snapshot to configDir/backups/
 	// and prunes the oldest beyond AutoBackupRetention.
-	safeGoFn("auto-backup", s.LogEvent, func() {
+	s.startBackground("auto-backup", func() {
 		_, _ = s.RunAutoBackupIfDue()
 	})
+
+	// Local recurring prompts are intentionally tied to the desktop lifecycle.
+	// Every attempt gets a separate child session with its own selected
+	// GLM/Kimi model, approval mode, transcript, and retained run status.
+	s.startBackground("scheduled-tasks", s.runScheduledTasks)
+	if s.config.Settings.AutoArchivePRAfterClose {
+		s.ensurePullRequestArchiveMonitor()
+	}
 }
 
 // Shutdown is called by Wails when the app closes.
 func (s *Studio) Shutdown(_ context.Context) {
+	s.shutdownOnce.Do(s.shutdown)
+}
+
+func (s *Studio) shutdown() {
+	// Close the registration gate before Wait. sync.WaitGroup forbids a new
+	// Add/Go racing with Wait when its counter may reach zero. The gate also
+	// prevents UI callbacks delivered during teardown from starting fresh work.
+	s.lifecycleMu.Lock()
+	s.shuttingDown = true
+	cancel := s.cancel
+	s.lifecycleMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	_ = s.setQuickEntryEnabled(false, "")
+	_ = s.setVoiceShortcutEnabled(false, "")
+	s.closeQuickEntryWindowForShutdown()
+	s.cancelSpeechDictationForShutdown()
+	s.setWakeEnabled(false)
+	s.stopPreviewServers("", "", true)
+	s.stopExternalBrowserTabs("", "")
+
 	// Cancel all in-progress agent runs and terminals.
 	s.mu.RLock()
 	for _, p := range s.projects {
@@ -120,6 +319,20 @@ func (s *Studio) Shutdown(_ context.Context) {
 
 	// Wait for all background goroutines (SendMessage, Dispatch) to finish.
 	s.wg.Wait()
+
+	// Release per-project provider transports and any stdio MCP child
+	// processes. Stop() only cancels active turns; without this explicit reset,
+	// idle HTTP connections and MCP servers would survive until the OS tears
+	// down the desktop process (and make graceful/headless shutdown leak
+	// resources). All tracked turns are finished above, so no caller can still
+	// be using these clients.
+	s.mu.RLock()
+	for _, p := range s.projects {
+		p.mu.Lock()
+		p.resetClientLocked()
+		p.mu.Unlock()
+	}
+	s.mu.RUnlock()
 
 	// Prune abandoned empty "Chat N" tabs before saving so they don't come
 	// back on next boot. Rule: a session with zero history entries AND a
@@ -138,6 +351,22 @@ func (s *Studio) Shutdown(_ context.Context) {
 	s.saveConfig()
 }
 
+// startBackground is the single lifecycle gate for Studio-owned goroutines.
+// It returns false after shutdown has begun. The panic barrier is inside the
+// tracked function so Done always runs (WaitGroup.Go defers it itself).
+func (s *Studio) startBackground(label string, fn func()) bool {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.shuttingDown {
+		return false
+	}
+	s.wg.Go(func() {
+		defer recoverPanic(label, s.LogEvent)
+		fn()
+	})
+	return true
+}
+
 // --- Project Management ---
 
 // BrowseDirectory opens a native directory picker dialog and returns the selected path.
@@ -153,12 +382,19 @@ func (s *Studio) BrowseDirectory() (string, error) {
 
 // AddProject registers a new project directory.
 func (s *Studio) AddProject(name, directory string) (*ProjectInfo, error) {
+	if !utf8.ValidString(name) || !utf8.ValidString(directory) {
+		return nil, fmt.Errorf("project name and directory must be valid UTF-8")
+	}
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return nil, fmt.Errorf("project name cannot be empty")
 	}
 	if len(name) > 60 {
 		name = truncateUTF8(name, 60)
+	}
+	directory = strings.TrimSpace(directory)
+	if directory == "" {
+		return nil, fmt.Errorf("project directory cannot be empty")
 	}
 	abs, err := filepath.Abs(directory)
 	if err != nil {
@@ -168,15 +404,35 @@ func (s *Studio) AddProject(name, directory string) (*ProjectInfo, error) {
 	if err != nil || !info.IsDir() {
 		return nil, fmt.Errorf("directory does not exist: %s", abs)
 	}
+	canonical, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return nil, fmt.Errorf("resolve project directory: %w", err)
+	}
+	// Resolve for identity/validity checks, but preserve the user's absolute
+	// spelling for display (on macOS /var commonly resolves to /private/var).
+	info, err = os.Stat(canonical)
+	if err != nil || !info.IsDir() {
+		return nil, fmt.Errorf("directory does not exist: %s", abs)
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	// Check for duplicate directory.
 	for _, existing := range s.projects {
-		if existing.Directory == abs {
+		existingInfo, statErr := os.Stat(existing.Directory)
+		if filepath.Clean(existing.Directory) == filepath.Clean(abs) || (statErr == nil && os.SameFile(existingInfo, info)) {
 			return nil, fmt.Errorf("project already registered: %s", abs)
 		}
+	}
+	for _, archived := range s.archived {
+		archivedInfo, statErr := os.Stat(archived.Project.Directory)
+		if filepath.Clean(archived.Project.Directory) == filepath.Clean(abs) || (statErr == nil && os.SameFile(archivedInfo, info)) {
+			return nil, fmt.Errorf("project is archived: %s", abs)
+		}
+	}
+	if len(s.projects)+len(s.archived) >= StudioConfigMaxProjects {
+		return nil, fmt.Errorf("project limit reached (%d)", StudioConfigMaxProjects)
 	}
 
 	id := GenerateID()
@@ -195,8 +451,42 @@ func (s *Studio) AddProject(name, directory string) (*ProjectInfo, error) {
 		LastUsedAt:     time.Now().UnixMilli(),
 	})
 	p.studio = s
+	// Claude-style Git isolation starts with the very first chat, not only
+	// chats created later through the + button. Persist the empty history too,
+	// so the worktree metadata always points at a session that survives restart.
+	defaultSession := p.sessions["default"]
+	if defaultSession != nil {
+		if err := provisionSessionWorktree(p, defaultSession, p.Directory); err != nil {
+			p.Close()
+			return nil, err
+		}
+		if err := SaveNewHistoryWithMetadata(projectSessionStorageKey(id, "default"), defaultSession.Name, "", nil); err != nil {
+			_ = removeSessionWorktree(p, defaultSession)
+			p.Close()
+			return nil, fmt.Errorf("persist initial chat session: %w", err)
+		}
+	}
+	projects := make([]ProjectConfig, 0, len(s.projects)+1)
+	for _, existing := range s.projects {
+		projects = append(projects, existing.ToConfig())
+	}
+	projects = append(projects, p.ToConfig())
+	candidate := &StudioConfig{Projects: projects, Settings: s.config.Settings}
+	// Publish only after the candidate config is durable. Otherwise the UI
+	// would show a project that disappears on restart after a disk failure.
+	s.configSaveMu.Lock()
+	err = candidate.Save()
+	s.configSaveMu.Unlock()
+	if err != nil {
+		if defaultSession != nil {
+			_ = removeSessionWorktree(p, defaultSession)
+			_ = deleteHistoryChecked(projectSessionStorageKey(id, "default"))
+		}
+		p.Close()
+		return nil, fmt.Errorf("persist new project: %w", err)
+	}
 	s.projects[id] = p
-	s.saveConfig()
+	s.config.Projects = projects
 	s.auditProjectAdded(name, abs)
 	return p.Info(), nil
 }
@@ -209,8 +499,56 @@ func (s *Studio) RemoveProject(id string) error {
 	if !ok {
 		return fmt.Errorf("project not found: %s", id)
 	}
+	// Managed worktrees are app-owned directories but may contain valuable
+	// uncommitted user changes. Fail before mutating config so project removal
+	// can never silently discard them.
+	p.mu.RLock()
+	for _, session := range p.sessions {
+		status := sessionWorktreeStatus(session)
+		session.mu.RLock()
+		sessionName := session.Name
+		session.mu.RUnlock()
+		if status.Error != "" {
+			p.mu.RUnlock()
+			return fmt.Errorf("cannot remove project while session %q has an unavailable worktree: %s", sessionName, status.Error)
+		}
+		if status.Dirty {
+			p.mu.RUnlock()
+			return fmt.Errorf("cannot remove project while session %q has %d uncommitted worktree change(s)", sessionName, status.ChangedFiles)
+		}
+	}
+	p.mu.RUnlock()
+	// Remove the project from the durable config before closing transports or
+	// deleting any app-owned data. If the config write fails, the operation is
+	// a clean no-op and the project remains fully usable after this call and
+	// after restart. Leftover data after a later cleanup error is recoverable;
+	// deleting data before a failed config write is not.
+	projects := make([]ProjectConfig, 0, len(s.projects)-1)
+	for projectID, existing := range s.projects {
+		if projectID != id {
+			projects = append(projects, existing.ToConfig())
+		}
+	}
+	candidate := &StudioConfig{Projects: projects, Settings: s.config.Settings}
+	s.configSaveMu.Lock()
+	err := candidate.Save()
+	s.configSaveMu.Unlock()
+	if err != nil {
+		return fmt.Errorf("persist project removal: %w", err)
+	}
+	s.config.Projects = projects
 	removedName := p.Name
-	p.Stop()
+	s.cancelSideQuestions(id, "")
+	s.stopPreviewServers(id, "", true)
+	s.stopExternalBrowserTabs(id, "")
+	p.Close()
+	p.mu.RLock()
+	for _, session := range p.sessions {
+		if err := removeSessionWorktreeAt(p, session, p.Directory); err != nil {
+			s.logf("warn", "worktree", "cleanup while removing project %q session %q: %v", id, session.ID, err)
+		}
+	}
+	p.mu.RUnlock()
 	// Close any terminals owned by this project so their PTY fd + child
 	// process + read-loop goroutine don't outlive the project. Without this,
 	// backend cleanup depended entirely on the frontend firing CloseTerminal
@@ -237,7 +575,7 @@ func (s *Studio) RemoveProject(id string) error {
 	// sessions map was empty (never opened) but legacy files exist.
 	hasDefault := false
 	for _, sid := range sessionIDs {
-		DeleteHistory(id + "_" + sid)
+		DeleteHistory(projectSessionStorageKey(id, sid))
 		DiscardReplay(id, sid)
 		if sid == "default" {
 			hasDefault = true
@@ -257,7 +595,26 @@ func (s *Studio) RemoveProject(id string) error {
 	removeProjectSessionPins(id)
 	// Same for the manual session-order file (iter 540+).
 	removeProjectSessionOrder(id)
-	s.saveConfig()
+	// Archived chats are project-owned metadata. The histories themselves were
+	// removed above; drop the archive index as well so a later project with the
+	// same generated ID cannot inherit stale hidden-session flags.
+	removeAllSessionArchiveRecords(id)
+	removeProjectSessionSuggestions(id)
+	// Recurring prompts belong to the removed local project and must not keep
+	// waking up as orphaned scheduler errors.
+	_ = removeScheduledTasksFor(id, "")
+	_ = s.refreshScheduledWakeNeed()
+	// Versioned live artifacts can contain complete copies of project HTML/SVG.
+	// Remove those private app-owned snapshots with the project.
+	_ = removeArtifactVersionsFor(id)
+	// Persisted preview sessions may contain login cookies and localStorage.
+	// They are app-owned, project-scoped secrets and must not become orphans.
+	removePreviewSessionProfiles(id, "")
+	// Project knowledge is app-owned data, unlike the user's project directory.
+	// Remove it with the project so deleted workspaces do not leave orphaned
+	// copies of potentially sensitive documents under the config directory.
+	_ = os.RemoveAll(knowledgeDir(id))
+	invalidateKnowledgeCache(id)
 	s.auditProjectRemoved(removedName)
 	return nil
 }
@@ -299,39 +656,248 @@ func (s *Studio) GetProject(id string) (*ProjectInfo, error) {
 	return p.Info(), nil
 }
 
+// RelinkProjectDirectory reconnects an existing project to a folder that was
+// moved or renamed outside Studio. The project ID and all app-owned state
+// (sessions, drafts, pins, schedules, knowledge, artifacts, settings) stay the
+// same. Path-keyed memory is cloned before the durable config commit so a
+// successful relink cannot make saved project memory disappear on restart.
+func (s *Studio) RelinkProjectDirectory(id, directory string) (*ProjectInfo, error) {
+	if !utf8.ValidString(directory) {
+		return nil, fmt.Errorf("project directory must be valid UTF-8")
+	}
+	directory = strings.TrimSpace(directory)
+	if directory == "" {
+		return nil, fmt.Errorf("project directory cannot be empty")
+	}
+	abs, err := filepath.Abs(directory)
+	if err != nil {
+		return nil, fmt.Errorf("invalid path: %w", err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil || !info.IsDir() {
+		return nil, fmt.Errorf("directory does not exist: %s", abs)
+	}
+	canonical, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return nil, fmt.Errorf("resolve project directory: %w", err)
+	}
+	info, err = os.Stat(canonical)
+	if err != nil || !info.IsDir() {
+		return nil, fmt.Errorf("directory does not exist: %s", abs)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.projects[id]
+	if !ok {
+		return nil, fmt.Errorf("project not found: %s", id)
+	}
+	if projectHasActiveSession(p) {
+		return nil, fmt.Errorf("stop all running chats in this project before reconnecting its folder")
+	}
+	for projectID, existing := range s.projects {
+		if projectID == id {
+			continue
+		}
+		existing.mu.RLock()
+		existingDir := existing.Directory
+		existing.mu.RUnlock()
+		existingInfo, statErr := os.Stat(existingDir)
+		if filepath.Clean(existingDir) == filepath.Clean(abs) || (statErr == nil && os.SameFile(existingInfo, info)) {
+			return nil, fmt.Errorf("project already registered: %s", abs)
+		}
+	}
+	for _, archived := range s.archived {
+		archivedInfo, statErr := os.Stat(archived.Project.Directory)
+		if filepath.Clean(archived.Project.Directory) == filepath.Clean(abs) || (statErr == nil && os.SameFile(archivedInfo, info)) {
+			return nil, fmt.Errorf("project is archived: %s", abs)
+		}
+	}
+
+	p.mu.RLock()
+	oldDirectory := p.Directory
+	projectName := p.Name
+	memStore := p.memoryStore
+	p.mu.RUnlock()
+	if filepath.Clean(oldDirectory) == filepath.Clean(abs) {
+		return p.Info(), nil
+	}
+	if memStore != nil {
+		if err := memStore.Flush(); err != nil {
+			return nil, fmt.Errorf("flush project memory before reconnecting folder: %w", err)
+		}
+	}
+	if err := memory.CloneProjectMemory(configDir(), oldDirectory, abs); err != nil {
+		return nil, fmt.Errorf("preserve project memory: %w", err)
+	}
+
+	projects := make([]ProjectConfig, 0, len(s.projects))
+	for projectID, existing := range s.projects {
+		pc := existing.ToConfig()
+		if projectID == id {
+			pc.Directory = abs
+		}
+		projects = append(projects, pc)
+	}
+	candidate := &StudioConfig{Projects: projects, Settings: s.config.Settings}
+	s.configSaveMu.Lock()
+	err = candidate.Save()
+	s.configSaveMu.Unlock()
+	if err != nil {
+		return nil, fmt.Errorf("persist project folder: %w", err)
+	}
+
+	// The durable path now owns the project. Tear down every path-bound runtime
+	// object so the next GLM/Kimi turn rebuilds tools, sandbox, MCP, learning,
+	// and background-task managers against the selected directory.
+	p.Stop()
+	for terminalID, terminal := range s.terminals {
+		if terminal.ProjectID == id {
+			delete(s.terminals, terminalID)
+			terminal.Close()
+		}
+	}
+	pinnedContext, _ := tools.ReadPersistedPin(abs)
+	p.mu.Lock()
+	p.Directory = abs
+	p.resetClientLocked()
+	p.registry = nil
+	p.memoryStore = nil
+	p.projectLearning = nil
+	p.taskManager = nil
+	p.readTrackers = make(map[string]*tools.FileReadTracker)
+	p.writeTrackers = make(map[string]*tools.FileWriteTracker)
+	p.pinnedContext = pinnedContext
+	p.mu.Unlock()
+	s.config.Projects = projects
+	s.auditProjectDirectory(projectName, oldDirectory, abs)
+	return p.Info(), nil
+}
+
 // SetProjectProvider changes the LLM provider and model for a project.
 func (s *Studio) SetProjectProvider(id, provider, model string) error {
+	provider, model, err := s.validatedStudioProviderModel(provider, model)
+	if err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	p, ok := s.projects[id]
 	if !ok {
 		return fmt.Errorf("project not found: %s", id)
 	}
-	p.mu.Lock()
+	if projectHasActiveSession(p) {
+		return fmt.Errorf("stop all running chats in this project before changing model settings")
+	}
+	p.mu.RLock()
 	oldProv, oldModel, name := p.Provider, p.Model, p.Name
-	p.Provider = provider
-	p.Model = model
-	p.resetClientLocked() // close + clear so the next send re-inits
-	p.mu.Unlock()
-	s.saveConfig()
+	p.mu.RUnlock()
+	if err := s.persistProjectMutationLocked(id, func(pc *ProjectConfig) {
+		pc.Provider, pc.Model = provider, model
+	}, func(p *Project) {
+		p.mu.Lock()
+		p.Provider, p.Model = provider, model
+		p.resetClientLocked()
+		p.mu.Unlock()
+	}); err != nil {
+		return err
+	}
 	s.auditProjectProvider(name, oldProv, oldModel, provider, model)
 	return nil
 }
 
+// ConfigureProjectModel atomically updates every setting exposed by the
+// project model popover. Validating and persisting one future snapshot avoids
+// the partial state that three sequential RPC calls could leave behind when a
+// later validation or disk write failed.
+func (s *Studio) ConfigureProjectModel(id, provider, model string, temperature float32, maxTokens int, mode string, budget int32) (*ProjectInfo, error) {
+	provider, model, err := s.validatedStudioProviderModel(provider, model)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateProjectModelParams(provider, model, temperature, maxTokens); err != nil {
+		return nil, err
+	}
+	if err := validateProjectThinking(mode, budget); err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.projects[id]
+	if !ok {
+		return nil, fmt.Errorf("project not found: %s", id)
+	}
+	if projectHasActiveSession(p) {
+		return nil, fmt.Errorf("stop all running chats in this project before changing model settings")
+	}
+	p.mu.RLock()
+	oldProvider, oldModel, name := p.Provider, p.Model, p.Name
+	oldTemperature, oldMaxTokens := p.Temperature, p.MaxTokens
+	oldMode, oldBudget := p.ThinkingMode, p.ThinkingBudget
+	p.mu.RUnlock()
+
+	if err := s.persistProjectMutationLocked(id, func(pc *ProjectConfig) {
+		pc.Provider, pc.Model = provider, model
+		pc.Temperature, pc.MaxTokens = temperature, maxTokens
+		pc.ThinkingMode, pc.ThinkingBudget = mode, budget
+	}, func(p *Project) {
+		p.mu.Lock()
+		p.Provider, p.Model = provider, model
+		p.Temperature, p.MaxTokens = temperature, maxTokens
+		p.ThinkingMode, p.ThinkingBudget = mode, budget
+		p.resetClientLocked()
+		p.mu.Unlock()
+	}); err != nil {
+		return nil, err
+	}
+
+	s.auditProjectProvider(name, oldProvider, oldModel, provider, model)
+	s.auditProjectModelParams(name, oldTemperature, temperature, oldMaxTokens, maxTokens)
+	s.auditProjectThinking(name, oldMode, oldBudget, mode, budget)
+	return p.Info(), nil
+}
+
+func (s *Studio) validatedStudioProviderModel(provider, model string) (string, string, error) {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	model = strings.TrimSpace(model)
+	if provider == "" || model == "" || !utf8.ValidString(provider) || !utf8.ValidString(model) {
+		return "", "", fmt.Errorf("provider and model must be non-empty valid UTF-8")
+	}
+	if len(provider) > 128 || len(model) > 256 {
+		return "", "", fmt.Errorf("provider or model identifier is too long")
+	}
+	if err := s.validateAvailableStudioProviderModel(provider, model); err != nil {
+		return "", "", err
+	}
+	return provider, model, nil
+}
+
 // SetProjectSystemPrompt changes the system prompt for a project.
 func (s *Studio) SetProjectSystemPrompt(id, prompt string) error {
+	if !utf8.ValidString(prompt) {
+		return fmt.Errorf("system prompt must be valid UTF-8")
+	}
+	prompt = truncateUTF8(prompt, 64<<10)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	p, ok := s.projects[id]
 	if !ok {
 		return fmt.Errorf("project not found: %s", id)
 	}
-	p.mu.Lock()
+	p.mu.RLock()
 	oldPrompt, name := p.SystemPrompt, p.Name
-	p.SystemPrompt = prompt
-	p.resetClientLocked() // close + clear so the next send re-inits with the new prompt
-	p.mu.Unlock()
-	s.saveConfig()
+	p.mu.RUnlock()
+	if err := s.persistProjectMutationLocked(id, func(pc *ProjectConfig) {
+		pc.SystemPrompt = prompt
+	}, func(p *Project) {
+		p.mu.Lock()
+		p.SystemPrompt = prompt
+		p.resetClientLocked()
+		p.mu.Unlock()
+	}); err != nil {
+		return err
+	}
 	s.auditProjectSystemPrompt(name, oldPrompt, prompt)
 	return nil
 }
@@ -344,81 +910,167 @@ func (s *Studio) SetProjectModelParams(id string, temperature float32, maxTokens
 	if !ok {
 		return fmt.Errorf("project not found: %s", id)
 	}
-	p.mu.Lock()
+	if projectHasActiveSession(p) {
+		return fmt.Errorf("stop all running chats in this project before changing model settings")
+	}
+	p.mu.RLock()
 	oldTemp, oldMax, name := p.Temperature, p.MaxTokens, p.Name
-	p.Temperature = temperature
-	p.MaxTokens = maxTokens
-	p.resetClientLocked() // close + clear so the next send re-inits
-	p.mu.Unlock()
-	s.saveConfig()
+	provider, model := p.Provider, p.Model
+	p.mu.RUnlock()
+	if err := validateProjectModelParams(provider, model, temperature, maxTokens); err != nil {
+		return err
+	}
+	if err := s.persistProjectMutationLocked(id, func(pc *ProjectConfig) {
+		pc.Temperature, pc.MaxTokens = temperature, maxTokens
+	}, func(p *Project) {
+		p.mu.Lock()
+		p.Temperature, p.MaxTokens = temperature, maxTokens
+		p.resetClientLocked()
+		p.mu.Unlock()
+	}); err != nil {
+		return err
+	}
 	s.auditProjectModelParams(name, oldTemp, temperature, oldMax, maxTokens)
 	return nil
 }
 
 // SetProjectThinking configures extended thinking for a project.
 // mode: "" = auto (provider default), "enabled" = on, "disabled" = off.
-// budget: max reasoning tokens; 0 means use provider default (4096).
+// budget: compatibility reasoning control; 0 uses the selected model's tuned
+// default (GLM 5.2 max effort, Kimi K3 high effort).
 func (s *Studio) SetProjectThinking(id, mode string, budget int32) error {
+	if err := validateProjectThinking(mode, budget); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.projects[id]
+	if !ok {
+		return fmt.Errorf("project not found: %s", id)
+	}
+	if projectHasActiveSession(p) {
+		return fmt.Errorf("stop all running chats in this project before changing model settings")
+	}
+	p.mu.RLock()
+	oldMode, oldBudget, name := p.ThinkingMode, p.ThinkingBudget, p.Name
+	p.mu.RUnlock()
+	if err := s.persistProjectMutationLocked(id, func(pc *ProjectConfig) {
+		pc.ThinkingMode, pc.ThinkingBudget = mode, budget
+	}, func(p *Project) {
+		p.mu.Lock()
+		p.ThinkingMode, p.ThinkingBudget = mode, budget
+		p.resetClientLocked()
+		p.mu.Unlock()
+	}); err != nil {
+		return err
+	}
+	s.auditProjectThinking(name, oldMode, oldBudget, mode, budget)
+	return nil
+}
+
+func validateProjectModelParams(provider, model string, temperature float32, maxTokens int) error {
+	if temperature < 0 || temperature > 2 || math.IsNaN(float64(temperature)) || math.IsInf(float64(temperature), 0) {
+		return fmt.Errorf("temperature must be finite and between 0 and 2")
+	}
+	if maxTokens < 0 {
+		return fmt.Errorf("max tokens must be zero (model default) or positive")
+	}
+	limit := int(maxOutputTokens(provider, model))
+	if limit <= 0 {
+		return fmt.Errorf("unsupported provider/model: %s/%s", provider, model)
+	}
+	if maxTokens > limit {
+		return fmt.Errorf("max tokens for %s/%s must be between 0 and %d", provider, model, limit)
+	}
+	return nil
+}
+
+func validateProjectThinking(mode string, budget int32) error {
 	if mode != "" && mode != "enabled" && mode != "disabled" {
 		return fmt.Errorf("invalid thinking mode %q: must be empty, \"enabled\", or \"disabled\"", mode)
 	}
 	if budget < 0 {
 		return fmt.Errorf("invalid thinking budget %d: must be >= 0", budget)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	p, ok := s.projects[id]
-	if !ok {
-		return fmt.Errorf("project not found: %s", id)
+	if budget > 1_000_000 {
+		return fmt.Errorf("invalid thinking budget %d: exceeds 1000000", budget)
 	}
-	p.mu.Lock()
-	oldMode, oldBudget, name := p.ThinkingMode, p.ThinkingBudget, p.Name
-	p.ThinkingMode = mode
-	p.ThinkingBudget = budget
-	p.resetClientLocked() // close + clear so the next send re-inits
-	p.mu.Unlock()
-	s.saveConfig()
-	s.auditProjectThinking(name, oldMode, oldBudget, mode, budget)
 	return nil
 }
 
-// SetProjectPermissionMode sets a project's change-confirmation mode. "" / "auto"
-// proceeds without asking; "ask" makes the agent confirm via the ask_user tool
-// before file/git/destructive changes (soft enforcement via a system-prompt
-// directive — the agent loop has no hard approval gate). Stored as "" for auto
-// so it round-trips with omitempty.
+// SetProjectPermissionMode sets Manual, Accept edits, reviewed Auto, or Skip.
+// Sensitive actions remain hard-gated in every mode.
 func (s *Studio) SetProjectPermissionMode(id, mode string) error {
-	if mode == "auto" {
-		mode = ""
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "ask" {
+		mode = "manual"
 	}
-	if mode != "" && mode != "ask" {
-		return fmt.Errorf("invalid permission mode %q: must be \"\", \"auto\", or \"ask\"", mode)
+	if mode == "" {
+		mode = "auto"
+	}
+	if mode == "acceptedits" || mode == "accept-edits" {
+		mode = "accept_edits"
+	}
+	if mode != "auto" && mode != "accept_edits" && mode != "manual" && mode != "skip" {
+		return fmt.Errorf("invalid permission mode %q: must be auto, accept_edits, manual, or skip", mode)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	p, ok := s.projects[id]
-	if !ok {
-		return fmt.Errorf("project not found: %s", id)
+	return s.persistProjectMutationLocked(id, func(pc *ProjectConfig) {
+		pc.PermissionMode = mode
+	}, func(p *Project) {
+		p.mu.Lock()
+		p.PermissionMode = mode
+		p.resetClientLocked()
+		p.mu.Unlock()
+	})
+}
+
+// SetProjectComputerUse enables or removes OS-level screen tools for one
+// project. The provider client is rebuilt so its tool declarations and
+// Kimi-vs-GLM screenshot behavior cannot remain stale.
+func (s *Studio) SetProjectComputerUse(id string, enabled bool) error {
+	if !enabled {
+		s.mu.RLock()
+		p, ok := s.projects[id]
+		s.mu.RUnlock()
+		if !ok {
+			return fmt.Errorf("project not found: %s", id)
+		}
+		// Cancellation is synchronous: in-flight OS commands receive a
+		// cancelled context before the computer tools are removed.
+		p.Stop()
 	}
-	p.mu.Lock()
-	p.PermissionMode = mode
-	p.resetClientLocked() // rebuild client so the directive is added/removed next send
-	p.mu.Unlock()
-	s.saveConfig()
-	return nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.persistProjectMutationLocked(id, func(pc *ProjectConfig) {
+		pc.ComputerUseEnabled = enabled
+	}, func(p *Project) {
+		p.mu.Lock()
+		p.ComputerUseEnabled = enabled
+		p.resetClientLocked()
+		p.mu.Unlock()
+	})
 }
 
 // SetProjectBudget sets the per-project monthly USD spend cap. The frontend
 // uses it to draw a progress bar in the usage modal and warn at 80%/100%.
 // Pass 0 to remove the budget. Capped at $100,000 to defend against typos.
 // Does not invalidate the cached client (no model state depends on this).
-func (s *Studio) SetProjectBudget(id string, budgetUSD float64) error {
-	if budgetUSD < 0 {
+func validateProjectBudget(budgetUSD float64) error {
+	if budgetUSD < 0 || math.IsNaN(budgetUSD) || math.IsInf(budgetUSD, 0) {
 		return fmt.Errorf("invalid budget %.2f: must be >= 0", budgetUSD)
 	}
 	const maxBudget = 100000.0
 	if budgetUSD > maxBudget {
 		return fmt.Errorf("budget %.2f exceeds maximum of %.2f", budgetUSD, maxBudget)
+	}
+	return nil
+}
+
+func (s *Studio) SetProjectBudget(id string, budgetUSD float64) error {
+	if err := validateProjectBudget(budgetUSD); err != nil {
+		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -426,13 +1078,56 @@ func (s *Studio) SetProjectBudget(id string, budgetUSD float64) error {
 	if !ok {
 		return fmt.Errorf("project not found: %s", id)
 	}
-	p.mu.Lock()
+	p.mu.RLock()
 	oldBudget, name := p.BudgetUSD, p.Name
-	p.BudgetUSD = budgetUSD
-	p.mu.Unlock()
-	s.saveConfig()
+	p.mu.RUnlock()
+	if err := s.persistProjectMutationLocked(id, func(pc *ProjectConfig) {
+		pc.BudgetUSD = budgetUSD
+	}, func(p *Project) {
+		p.mu.Lock()
+		p.BudgetUSD = budgetUSD
+		p.mu.Unlock()
+	}); err != nil {
+		return err
+	}
 	s.auditProjectBudget(name, oldBudget, budgetUSD)
 	return nil
+}
+
+// ConfigureProjectBudget atomically persists the spend cap and enforcement
+// switch exposed by the budget dialog. Keeping both fields in one config
+// transaction prevents a successful cap update followed by a failed strict-
+// mode update from leaving the desktop UI and runtime out of sync.
+func (s *Studio) ConfigureProjectBudget(id string, budgetUSD float64, enforce bool) (*ProjectInfo, error) {
+	if err := validateProjectBudget(budgetUSD); err != nil {
+		return nil, err
+	}
+	if budgetUSD == 0 {
+		enforce = false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.projects[id]
+	if !ok {
+		return nil, fmt.Errorf("project not found: %s", id)
+	}
+	p.mu.RLock()
+	oldBudget, name := p.BudgetUSD, p.Name
+	p.mu.RUnlock()
+	if err := s.persistProjectMutationLocked(id, func(pc *ProjectConfig) {
+		pc.BudgetUSD = budgetUSD
+		pc.EnforceBudget = enforce
+	}, func(p *Project) {
+		p.mu.Lock()
+		p.BudgetUSD = budgetUSD
+		p.EnforceBudget = enforce
+		p.mu.Unlock()
+	}); err != nil {
+		return nil, err
+	}
+	s.auditProjectBudget(name, oldBudget, budgetUSD)
+	return p.Info(), nil
 }
 
 // SetProjectEnforceBudget toggles the iter 1040+ strict budget enforcement
@@ -446,15 +1141,13 @@ func (s *Studio) SetProjectBudget(id string, budgetUSD float64) error {
 func (s *Studio) SetProjectEnforceBudget(id string, enforce bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	p, ok := s.projects[id]
-	if !ok {
-		return fmt.Errorf("project not found: %s", id)
-	}
-	p.mu.Lock()
-	p.EnforceBudget = enforce
-	p.mu.Unlock()
-	s.saveConfig()
-	return nil
+	return s.persistProjectMutationLocked(id, func(pc *ProjectConfig) {
+		pc.EnforceBudget = enforce
+	}, func(p *Project) {
+		p.mu.Lock()
+		p.EnforceBudget = enforce
+		p.mu.Unlock()
+	})
 }
 
 // SetProjectPinned anchors a project to the top of the sidebar (or unanchors
@@ -467,11 +1160,18 @@ func (s *Studio) SetProjectPinned(id string, pinned bool) error {
 	if !ok {
 		return fmt.Errorf("project not found: %s", id)
 	}
-	p.mu.Lock()
+	p.mu.RLock()
 	oldPinned, name := p.Pinned, p.Name
-	p.Pinned = pinned
-	p.mu.Unlock()
-	s.saveConfig()
+	p.mu.RUnlock()
+	if err := s.persistProjectMutationLocked(id, func(pc *ProjectConfig) {
+		pc.Pinned = pinned
+	}, func(p *Project) {
+		p.mu.Lock()
+		p.Pinned = pinned
+		p.mu.Unlock()
+	}); err != nil {
+		return err
+	}
 	s.auditProjectPinned(name, oldPinned, pinned)
 	return nil
 }
@@ -485,16 +1185,21 @@ func (s *Studio) ClearPinnedContext(id string) error {
 	if !ok {
 		return fmt.Errorf("project not found: %s", id)
 	}
-	p.mu.Lock()
-	p.pinnedContext = ""
+	p.mu.RLock()
 	dir := p.Directory
-	p.mu.Unlock()
+	p.mu.RUnlock()
 	// Remove the disk copy so it isn't restored on next startup. Non-fatal if
 	// the file doesn't exist (pin was never persisted or already cleaned up).
 	diskPath := filepath.Join(dir, ".gokin", "pinned_context.md")
 	if err := os.Remove(diskPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("cleared pin from memory but could not remove disk file: %w", err)
+		return fmt.Errorf("could not remove pinned context from disk: %w", err)
 	}
+	// Commit the in-memory change only after disk removal succeeds. Otherwise
+	// the UI would show an empty pin until restart, when the stale disk copy
+	// would unexpectedly reappear.
+	p.mu.Lock()
+	p.pinnedContext = ""
+	p.mu.Unlock()
 	return nil
 }
 
@@ -508,6 +1213,8 @@ func (s *Studio) CreateChatSession(projectID string) (*ChatSessionInfo, error) {
 	if !ok {
 		return nil, fmt.Errorf("project not found: %s", projectID)
 	}
+	p.metadataMu.Lock()
+	defer p.metadataMu.Unlock()
 
 	p.mu.Lock()
 	// Use max existing "Chat N" number + 1 so deletions don't create duplicates.
@@ -525,21 +1232,57 @@ func (s *Studio) CreateChatSession(projectID string) (*ChatSessionInfo, error) {
 		}
 	}
 	session := NewChatSession(fmt.Sprintf("Chat %d", maxNum+1))
-	p.sessions[session.ID] = session
+	for {
+		if _, exists := p.sessions[session.ID]; !exists {
+			break
+		}
+		session = NewChatSession(fmt.Sprintf("Chat %d", maxNum+1))
+	}
 	name := session.Name
 	sid := session.ID
+	projectDir := p.Directory
 	p.mu.Unlock()
+	if err := provisionSessionWorktree(p, session, projectDir); err != nil {
+		return nil, err
+	}
 
 	// Persist the (empty) session immediately so it survives an app restart
 	// even if the user never sends a message in it — a fresh "Chat N" tab
 	// the user opens to jot notes in tomorrow shouldn't disappear.
-	_ = SaveHistoryWithName(projectID+"_"+sid, name, nil)
+	// Do this before publishing the session in memory: returning success for an
+	// unsaved tab makes it disappear on restart and leaves the UI believing the
+	// operation was durable. metadataMu serializes the create/persist/publish
+	// transaction while p.mu stays free during the potentially slow Git call.
+	if err := SaveNewHistoryWithMetadata(projectSessionStorageKey(projectID, sid), name, "", nil); err != nil {
+		_ = removeSessionWorktree(p, session)
+		return nil, fmt.Errorf("persist new chat session: %w", err)
+	}
+	p.mu.Lock()
+	if _, exists := p.sessions[session.ID]; exists {
+		p.mu.Unlock()
+		_ = removeSessionWorktree(p, session)
+		_ = deleteHistoryChecked(projectSessionStorageKey(projectID, sid))
+		return nil, fmt.Errorf("session ID collision: %s", session.ID)
+	}
+	p.sessions[session.ID] = session
+	p.mu.Unlock()
 
 	return session.Info(), nil
 }
 
 // ListChatSessions returns all sessions for a project.
 func (s *Studio) ListChatSessions(projectID string) ([]*ChatSessionInfo, error) {
+	return s.listChatSessions(projectID, false)
+}
+
+// ListArchivedChatSessions returns only reversibly archived sessions. Their
+// history/worktree-owned data remains available for restore or explicit
+// permanent deletion, but they never appear in the active tab catalog.
+func (s *Studio) ListArchivedChatSessions(projectID string) ([]*ChatSessionInfo, error) {
+	return s.listChatSessions(projectID, true)
+}
+
+func (s *Studio) listChatSessions(projectID string, archived bool) ([]*ChatSessionInfo, error) {
 	s.mu.RLock()
 	p, ok := s.projects[projectID]
 	s.mu.RUnlock()
@@ -563,6 +1306,9 @@ func (s *Studio) ListChatSessions(projectID string) ([]*ChatSessionInfo, error) 
 	var result []*ChatSessionInfo
 	for _, sess := range p.sessions {
 		info := sess.Info()
+		if info.Archived != archived {
+			continue
+		}
 		if info.ParentID != "" {
 			if pname, ok := nameByID[info.ParentID]; ok {
 				info.ParentName = pname
@@ -575,6 +1321,15 @@ func (s *Studio) ListChatSessions(projectID string) ([]*ChatSessionInfo, error) 
 			}
 		}
 		result = append(result, info)
+	}
+	if archived {
+		sort.SliceStable(result, func(i, j int) bool {
+			if result[i].ArchivedAt != result[j].ArchivedAt {
+				return result[i].ArchivedAt > result[j].ArchivedAt
+			}
+			return result[i].ID < result[j].ID
+		})
+		return result, nil
 	}
 	// Recent-first ordering matches the project sidebar: most-recently-used
 	// session at the top, "default" (never-used) at the bottom unless it was
@@ -644,41 +1399,48 @@ func (s *Studio) SetSessionPinned(projectID, sessionID string, pinned bool) erro
 	if !ok {
 		return fmt.Errorf("project not found: %s", projectID)
 	}
+	p.metadataMu.Lock()
+	defer p.metadataMu.Unlock()
+
+	// Keep the project read-locked through persistence so session deletion or
+	// creation cannot invalidate the snapshot while it is being committed.
 	p.mu.RLock()
 	sess, exists := p.sessions[sessionID]
-	p.mu.RUnlock()
 	if !exists {
+		p.mu.RUnlock()
 		return fmt.Errorf("session not found: %s", sessionID)
 	}
-	// Update in-memory pin state under the session lock.
-	sess.mu.Lock()
-	sess.Pinned = pinned
-	sess.mu.Unlock()
-	// Read the current pin set, mutate it, write it back. We hold no project
-	// lock here so two concurrent SetSessionPinned calls for different
-	// sessions can race — last writer wins on the file. Acceptable: the
-	// in-memory truth (sess.Pinned) is what drives the sort; the file is
-	// only used to hydrate state on restart, and the user can fix any drift
-	// by clicking again. To minimize the race, we rebuild from the live
-	// session map rather than the on-disk file.
-	p.mu.RLock()
+	// Build the future persisted state from the live sessions, overriding only
+	// the requested target. Memory is changed after the durable write succeeds,
+	// so an I/O error cannot create a state that reverses after restart.
 	live := make(map[string]bool, len(p.sessions))
 	for sid, ss := range p.sessions {
 		ss.mu.RLock()
-		if ss.Pinned {
+		isPinned := ss.Pinned
+		if sid == sessionID {
+			isPinned = pinned
+		}
+		if isPinned {
 			live[sid] = true
 		}
 		ss.mu.RUnlock()
 	}
-	p.mu.RUnlock()
 	if err := savePinnedSessions(projectID, live); err != nil {
+		p.mu.RUnlock()
 		return fmt.Errorf("failed to persist session pins: %w", err)
 	}
+	sess.mu.Lock()
+	sess.Pinned = pinned
+	sess.mu.Unlock()
+	p.mu.RUnlock()
 	return nil
 }
 
 // RenameChatSession changes a session's display name.
 func (s *Studio) RenameChatSession(projectID, sessionID, newName string) error {
+	if !utf8.ValidString(newName) {
+		return fmt.Errorf("session name must be valid UTF-8")
+	}
 	newName = strings.TrimSpace(newName)
 	if newName == "" {
 		return fmt.Errorf("session name cannot be empty")
@@ -699,13 +1461,25 @@ func (s *Studio) RenameChatSession(projectID, sessionID, newName string) error {
 		return fmt.Errorf("session not found: %s", sessionID)
 	}
 	session.mu.Lock()
-	session.Name = newName
 	histSnapshot := make([]*genai.Content, len(session.history))
 	copy(histSnapshot, session.history)
+	parentID := session.ParentID
+	var usageSnapshot *SessionUsage
+	if session.usage != nil {
+		copyUsage := *session.usage
+		usageSnapshot = &copyUsage
+	}
+	// Keep the write lock through the metadata-only commit so no turn can
+	// snapshot the old name and persist it after this rename.
+	// Commit the metadata-only disk update first. Failure leaves both memory
+	// and the existing history file untouched, and no stale history snapshot
+	// is written over turns that completed concurrently.
+	if err := RenameHistory(projectSessionStorageKey(projectID, sessionID), newName, parentID, usageSnapshot, histSnapshot); err != nil {
+		session.mu.Unlock()
+		return fmt.Errorf("persist session rename: %w", err)
+	}
+	session.Name = newName
 	session.mu.Unlock()
-	// Persist immediately so a rename survives even if the session isn't
-	// touched again before restart. Ignore errors — same call path as send.
-	_ = SaveHistoryWithName(projectID+"_"+sessionID, newName, histSnapshot)
 	return nil
 }
 
@@ -721,10 +1495,10 @@ func (s *Studio) EditLastUserMessage(projectID, sessionID, newText string) error
 // text from that point. This is the engine for both "edit & re-send" and
 // "re-run as-is" flows from the message UI.
 func (s *Studio) EditUserMessage(projectID, sessionID string, userIndexFromEnd int, newText string) error {
-	newText = strings.TrimSpace(newText)
-	if newText == "" {
-		return fmt.Errorf("message cannot be empty")
+	if err := validateRPCText("message", newText, ChatMessageMaxBytes, true); err != nil {
+		return err
 	}
+	newText = strings.TrimSpace(newText)
 	if userIndexFromEnd < 0 {
 		return fmt.Errorf("userIndexFromEnd must be >= 0")
 	}
@@ -780,12 +1554,15 @@ func (s *Studio) EditUserMessage(projectID, sessionID string, userIndexFromEnd i
 		session.mu.Unlock()
 		return fmt.Errorf("user turn #%d from end not found in history", userIndexFromEnd)
 	}
-	session.history = session.history[:trimTo]
-	histSnapshot := make([]*genai.Content, len(session.history))
-	copy(histSnapshot, session.history)
+	histSnapshot := make([]*genai.Content, trimTo)
+	copy(histSnapshot, session.history[:trimTo])
 	name := session.Name
+	if err := SaveHistoryWithName(projectSessionStorageKey(projectID, sid), name, histSnapshot); err != nil {
+		session.mu.Unlock()
+		return fmt.Errorf("persist edited session: %w", err)
+	}
+	session.history = histSnapshot
 	session.mu.Unlock()
-	_ = SaveHistoryWithName(projectID+"_"+sid, name, histSnapshot)
 
 	// Kick off a fresh send via the normal path with the edited (or identical) text.
 	return s.SendMessage(projectID, newText, sid)
@@ -811,6 +1588,9 @@ func (s *Studio) ForkChatSession(projectID, sessionID string, userIndexFromEnd i
 	if userIndexFromEnd < 0 {
 		return nil, fmt.Errorf("userIndexFromEnd must be >= 0")
 	}
+	if !utf8.ValidString(newName) {
+		return nil, fmt.Errorf("session name must be valid UTF-8")
+	}
 	sid := sessionID
 	if sid == "" {
 		sid = "default"
@@ -821,12 +1601,10 @@ func (s *Studio) ForkChatSession(projectID, sessionID string, userIndexFromEnd i
 	if !ok {
 		return nil, fmt.Errorf("project not found: %s", projectID)
 	}
+	p.metadataMu.Lock()
+	defer p.metadataMu.Unlock()
 	p.mu.RLock()
 	source, exists := p.sessions[sid]
-	sourceName := ""
-	if exists {
-		sourceName = source.Name
-	}
 	p.mu.RUnlock()
 	if !exists {
 		return nil, fmt.Errorf("session not found: %s", sid)
@@ -835,6 +1613,7 @@ func (s *Studio) ForkChatSession(projectID, sessionID string, userIndexFromEnd i
 	// Snapshot source history under its lock so a concurrent SendMessage
 	// can't mutate the slice while we're cloning it.
 	source.mu.RLock()
+	sourceName := source.Name
 	srcHistory := make([]*genai.Content, len(source.history))
 	copy(srcHistory, source.history)
 	source.mu.RUnlock()
@@ -905,20 +1684,46 @@ func (s *Studio) ForkChatSession(projectID, sessionID string, userIndexFromEnd i
 		name = truncateUTF8(name, 60)
 	}
 
-	p.mu.Lock()
 	newSession := NewChatSession(name)
+	p.mu.RLock()
+	for {
+		if _, exists := p.sessions[newSession.ID]; !exists {
+			break
+		}
+		newSession = NewChatSession(name)
+	}
+	p.mu.RUnlock()
 	newSession.history = forkedHistory
 	newSession.ParentID = sid // remember which session we forked from
-	p.sessions[newSession.ID] = newSession
 	newID := newSession.ID
-	p.mu.Unlock()
+	p.mu.RLock()
+	sourceWorkDir := p.Directory
+	p.mu.RUnlock()
+	source.mu.RLock()
+	if source.WorktreeWorkDir != "" && source.WorktreeError == "" {
+		sourceWorkDir = source.WorktreeWorkDir
+	}
+	source.mu.RUnlock()
+	if err := provisionSessionWorktree(p, newSession, sourceWorkDir); err != nil {
+		return nil, err
+	}
 
 	// Persist immediately with explicit parent ID so the fork survives a
 	// restart even if the user never sends a new message in it. Use the
 	// metadata variant rather than SaveHistoryWithName so the parent ID
 	// is stamped on the FIRST write (not preserved from a non-existent
 	// previous file).
-	_ = SaveHistoryWithMetadata(projectID+"_"+newID, name, sid, forkedHistory)
+	if err := SaveNewHistoryWithMetadata(projectSessionStorageKey(projectID, newID), name, sid, forkedHistory); err != nil {
+		_ = removeSessionWorktree(p, newSession)
+		return nil, fmt.Errorf("persist forked session: %w", err)
+	}
+	p.mu.Lock()
+	if _, exists := p.sessions[newID]; exists {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("session ID collision: %s", newID)
+	}
+	p.sessions[newID] = newSession
+	p.mu.Unlock()
 
 	return newSession.Info(), nil
 }
@@ -999,33 +1804,81 @@ func (s *Studio) DeleteChatSession(projectID, sessionID string) error {
 	if !ok {
 		return fmt.Errorf("project not found: %s", projectID)
 	}
+	p.metadataMu.Lock()
+	defer p.metadataMu.Unlock()
 
 	// Hold the write lock for the guard check AND the delete so two concurrent
 	// deletion calls can't both pass the "at least 2 sessions" guard.
 	p.mu.Lock()
-	sessionCount := len(p.sessions)
 	session, exists := p.sessions[sessionID]
 	if !exists {
 		p.mu.Unlock()
 		return fmt.Errorf("session not found: %s", sessionID)
 	}
-	if sessionCount <= 1 {
+	activeSessionCount := 0
+	for _, candidate := range p.sessions {
+		candidate.mu.RLock()
+		if candidate.ArchivedAt == 0 {
+			activeSessionCount++
+		}
+		candidate.mu.RUnlock()
+	}
+	session.mu.RLock()
+	targetArchived := session.ArchivedAt > 0
+	session.mu.RUnlock()
+	if !targetArchived && activeSessionCount <= 1 {
 		p.mu.Unlock()
 		return fmt.Errorf("cannot delete the last remaining session")
 	}
+	s.cancelSideQuestions(projectID, sessionID)
+	s.stopPreviewServers(projectID, sessionID, true)
+	s.stopExternalBrowserTabs(projectID, sessionID)
+	// Cancel before taking the history-file lock. The agent loop observes the
+	// cancellation and skips its final save; an already-running save completes
+	// first under the same per-file lock and is then removed below.
+	session.Stop()
+	session.mu.RLock()
+	nameSnapshot := session.Name
+	parentSnapshot := session.ParentID
+	historySnapshot := append([]*genai.Content(nil), session.history...)
+	var usageSnapshot *SessionUsage
+	if session.usage != nil {
+		copyUsage := *session.usage
+		usageSnapshot = &copyUsage
+	}
+	session.mu.RUnlock()
+	if err := deleteHistoryChecked(projectSessionStorageKey(projectID, sessionID)); err != nil {
+		p.mu.Unlock()
+		return fmt.Errorf("delete session history: %w", err)
+	}
+	if err := removeSessionWorktreeAt(p, session, p.Directory); err != nil {
+		restoreErr := SaveHistoryWithUsage(
+			projectSessionStorageKey(projectID, sessionID), nameSnapshot, parentSnapshot, usageSnapshot, historySnapshot,
+		)
+		p.mu.Unlock()
+		if restoreErr != nil {
+			return fmt.Errorf("delete blocked by worktree safety (%v); restoring session history also failed: %w", err, restoreErr)
+		}
+		return err
+	}
 	delete(p.sessions, sessionID)
 	p.mu.Unlock()
+	_ = removeSessionArchiveRecord(projectID, sessionID)
 
-	// Cancel any active generation after releasing the lock so Stop() doesn't
-	// need to acquire any project-level lock itself.
-	session.Stop()
-	DeleteHistory(projectID + "_" + sessionID)
 	DiscardReplay(projectID, sessionID)
+	_ = removeScheduledTasksFor(projectID, sessionID)
+	_ = s.refreshScheduledWakeNeed()
 	// Drop the persisted draft for this session — once the session is gone,
 	// keeping its draft on disk just consumes inodes.
 	_ = s.ClearDraft(projectID, sessionID)
+	removeSessionSuggestions(projectID, sessionID)
 	// Same for pinned messages — pins anchor to a session that no longer exists.
 	removeSessionPins(projectID, sessionID)
+	// Session-scoped artifact snapshots can contain sensitive generated output;
+	// once their worktree is gone they have no valid restore target.
+	_ = removeArtifactVersionsForSession(projectID, sessionID)
+	// The same ownership rule applies to opt-in preview cookies/localStorage.
+	removePreviewSessionProfiles(projectID, sessionID)
 	// The deleted session is gone from p.sessions; re-derive the project cost
 	// cache so its usage no longer counts toward a strict-budget block.
 	p.invalidateCostCache()
@@ -1037,14 +1890,104 @@ func (s *Studio) DeleteChatSession(projectID, sessionID string) error {
 // SendMessage sends a message to a project's agent (async -- results via events).
 // sessionID can be empty for the default session.
 func (s *Studio) SendMessage(projectID, message, sessionID string) error {
+	if err := validateRPCText("message", message, ChatMessageMaxBytes, true); err != nil {
+		return err
+	}
+	return s.startMessage(projectID, message, nil, sessionID)
+}
+
+// SendMessageWithAttachments validates images/native documents and sends their
+// bounded model-ready parts. The regular SendMessage RPC stays text-only.
+func (s *Studio) SendMessageWithAttachments(projectID, message string, attachments []MessageAttachment, sessionID string) error {
+	if err := validateRPCText("message", message, ChatMessageMaxBytes, false); err != nil {
+		return err
+	}
+	if strings.TrimSpace(message) == "" && len(attachments) == 0 {
+		return fmt.Errorf("message or attachment is required")
+	}
 	s.mu.RLock()
 	p, ok := s.projects[projectID]
-	settings := s.config.Settings
 	s.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("project not found: %s", projectID)
 	}
+	p.mu.RLock()
+	provider, model := p.Provider, p.Model
+	p.mu.RUnlock()
+	parts, err := decodeMessageAttachments(provider, model, attachments)
+	if err != nil {
+		return err
+	}
+	return s.startMessage(projectID, message, parts, sessionID)
+}
+
+func (s *Studio) startMessage(projectID, message string, attachmentParts []*genai.Part, sessionID string) error {
+	return s.startMessageWithQueueEvent(projectID, message, attachmentParts, sessionID, nil)
+}
+
+// startMessageWithQueueEvent atomically claims an idle session and, for an
+// incoming cross-session message, publishes its user-card before releasing the
+// worker to call the provider. This prevents a very fast response from racing
+// ahead of the attributed incoming turn in the frontend transcript.
+func (s *Studio) startMessageWithQueueEvent(projectID, message string, attachmentParts []*genai.Part, sessionID string, startEvent *ChatQueueEvent) error {
+	return s.startMessageWithQueueEventPermission(projectID, message, attachmentParts, sessionID, startEvent, "")
+}
+
+func (s *Studio) startMessageWithQueueEventPermission(projectID, message string, attachmentParts []*genai.Part, sessionID string, startEvent *ChatQueueEvent, firstPermissionMode string) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.startMessageWithQueueEventPermissionLocked(projectID, message, attachmentParts, sessionID, startEvent, firstPermissionMode)
+}
+
+// startMessageWithQueueEventPermissionLocked carries the body. The caller MUST
+// already hold s.mu for reading and must keep holding it until this returns.
+//
+// It exists because sync.RWMutex read locks are not reentrant: a caller that
+// holds s.mu.RLock and then reaches a second s.mu.RLock blocks forever as soon
+// as any goroutine is waiting on s.mu.Lock (Go deliberately blocks new readers
+// so a pending writer can make progress). dispatchScheduledTask holds the read
+// lock across the whole run precisely so ArchiveProject cannot slip in between
+// creating the child session and claiming its queue worker, so it calls this
+// variant instead of the locking wrapper above.
+func (s *Studio) startMessageWithQueueEventPermissionLocked(projectID, message string, attachmentParts []*genai.Part, sessionID string, startEvent *ChatQueueEvent, firstPermissionMode string) error {
+	p, ok := s.projects[projectID]
+	settings := s.config.Settings
+	if !ok {
+		return fmt.Errorf("project not found: %s", projectID)
+	}
 	sid := sessionID
+	if sid == "" {
+		sid = "default"
+	}
+	// Resolve the explicit ID exactly while holding the project lock through
+	// the synchronous claim. Falling back to "default" here can route a queued
+	// or cross-session message into the wrong conversation if its target was
+	// concurrently deleted.
+	p.mu.RLock()
+	session, exists := p.sessions[sid]
+	if !exists || session == nil {
+		p.mu.RUnlock()
+		return fmt.Errorf("session not found: %s", sid)
+	}
+	session.mu.Lock()
+	if session.queueWorker {
+		session.mu.Unlock()
+		p.mu.RUnlock()
+		return fmt.Errorf("agent is already running in this chat; queue the follow-up instead")
+	}
+	if session.ArchivedAt > 0 {
+		session.mu.Unlock()
+		p.mu.RUnlock()
+		return fmt.Errorf("session is archived; restore it before sending messages")
+	}
+	session.queueWorker = true
+	session.queueHalt = false
+	session.mu.Unlock()
+	p.mu.RUnlock()
+	// ArchiveProject takes s.mu.Lock and checks queueWorker. The caller holds
+	// s.mu for reading across this synchronous claim, which prevents a detached
+	// project pointer from starting work immediately after the project was
+	// archived.
 	// Go 1.25's WaitGroup.Go subsumes the Add(1) + defer Done() boilerplate
 	// and scopes the goroutine to the wg lifecycle in one call.
 	//
@@ -1053,11 +1996,206 @@ func (s *Studio) SendMessage(projectID, message, sessionID string) error {
 	// closure itself panics before SendMessage starts (extremely rare but
 	// possible if `p`/`settings` capture a poisoned value), this catches it
 	// and surfaces in the event log instead of killing the process.
-	s.wg.Go(func() {
-		defer recoverPanic("send-message", s.LogEvent)
-		p.SendMessage(s.ctx, message, settings, sid)
+	startGate := make(chan struct{})
+	if !s.startBackground("send-message", func() {
+		<-startGate
+		defer func() {
+			// Keep the synchronous claim self-healing even if code between
+			// agent turns panics; startBackground's panic barrier reports the
+			// crash, while this defer ensures the session can be used again.
+			session.mu.Lock()
+			session.queueWorker = false
+			session.queueHalt = false
+			session.mu.Unlock()
+		}()
+		nextMessage := message
+		nextParts := attachmentParts
+		nextSettings := settings
+		permissionMode := firstPermissionMode
+		for {
+			if permissionMode != "" {
+				p.sendMessageWithPermissionMode(s.ctx, nextMessage, nextSettings, permissionMode, sid)
+			} else {
+				p.SendMessageWithAttachments(s.ctx, nextMessage, nextParts, nextSettings, sid)
+			}
+			permissionMode = ""
+
+			session.mu.Lock()
+			if session.queueHalt || len(session.queuedTurns) == 0 {
+				session.mu.Unlock()
+				return
+			}
+			next := session.queuedTurns[0]
+			session.queuedTurns = session.queuedTurns[1:]
+			session.mu.Unlock()
+
+			p.emitEvent(s.ctx, EventChatQueueStarted, ChatQueueEvent{
+				ProjectID: projectID,
+				SessionID: sid,
+				ID:        next.ID,
+			})
+			s.mu.RLock()
+			nextSettings = s.config.Settings
+			s.mu.RUnlock()
+			nextMessage = next.Message
+			nextParts = next.AttachmentParts
+		}
+	}) {
+		session.mu.Lock()
+		session.queueWorker = false
+		session.queueHalt = false
+		session.mu.Unlock()
+		return fmt.Errorf("studio is shutting down")
+	}
+	released := false
+	defer func() {
+		if !released {
+			close(startGate)
+		}
+	}()
+	if startEvent != nil {
+		startEvent.ProjectID = projectID
+		startEvent.SessionID = sid
+		p.emitEvent(s.ctx, EventChatQueueStarted, *startEvent)
+	}
+	close(startGate)
+	released = true
+	return nil
+}
+
+const (
+	maxQueuedTurns      = 8
+	maxQueuedMediaBytes = 64 << 20
+)
+
+// QueueMessage appends a text follow-up to the active session. queueID is
+// generated by the frontend so queue lifecycle events can be reconciled
+// without depending on RPC/event delivery order.
+func (s *Studio) QueueMessage(projectID, message, sessionID, queueID string) error {
+	if err := validateRPCText("message", message, ChatMessageMaxBytes, true); err != nil {
+		return err
+	}
+	return s.queueMessage(projectID, message, nil, sessionID, queueID)
+}
+
+// QueueMessageWithAttachments queues validated image or document attachments.
+func (s *Studio) QueueMessageWithAttachments(projectID, message string, attachments []MessageAttachment, sessionID, queueID string) error {
+	if err := validateRPCText("message", message, ChatMessageMaxBytes, false); err != nil {
+		return err
+	}
+	if strings.TrimSpace(message) == "" && len(attachments) == 0 {
+		return fmt.Errorf("message or attachment is required")
+	}
+	s.mu.RLock()
+	p, ok := s.projects[projectID]
+	s.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("project not found: %s", projectID)
+	}
+	p.mu.RLock()
+	provider, model := p.Provider, p.Model
+	p.mu.RUnlock()
+	parts, err := decodeMessageAttachments(provider, model, attachments)
+	if err != nil {
+		return err
+	}
+	return s.queueMessage(projectID, message, parts, sessionID, queueID)
+}
+
+func (s *Studio) queueMessage(projectID, message string, attachmentParts []*genai.Part, sessionID, queueID string) error {
+	queueID = strings.TrimSpace(queueID)
+	if queueID == "" || len(queueID) > 128 {
+		return fmt.Errorf("invalid queue ID")
+	}
+	s.mu.RLock()
+	p, ok := s.projects[projectID]
+	s.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("project not found: %s", projectID)
+	}
+	sid := sessionID
+	if sid == "" {
+		sid = "default"
+	}
+	// Exact lookup: an expired tab/cross-session target must never enqueue into
+	// the default chat merely because Project.GetSession has a UI convenience
+	// fallback.
+	p.mu.RLock()
+	session, exists := p.sessions[sid]
+	if !exists || session == nil {
+		p.mu.RUnlock()
+		return fmt.Errorf("session not found: %s", sid)
+	}
+
+	session.mu.Lock()
+	defer p.mu.RUnlock()
+	defer session.mu.Unlock()
+	if session.ArchivedAt > 0 {
+		return fmt.Errorf("session is archived; restore it before queueing messages")
+	}
+	if !session.queueWorker {
+		return fmt.Errorf("agent is no longer running; send this message normally")
+	}
+	if session.queueHalt {
+		return fmt.Errorf("agent is stopping; wait for the session to become idle")
+	}
+	if len(session.queuedTurns) >= maxQueuedTurns {
+		return fmt.Errorf("message queue is full (maximum %d)", maxQueuedTurns)
+	}
+	queuedMediaBytes := 0
+	for _, turn := range session.queuedTurns {
+		if turn == nil {
+			continue
+		}
+		if turn.ID == queueID {
+			return fmt.Errorf("duplicate queue ID")
+		}
+		queuedMediaBytes += attachmentPartsBytes(turn.AttachmentParts)
+	}
+	queuedMediaBytes += attachmentPartsBytes(attachmentParts)
+	if queuedMediaBytes > maxQueuedMediaBytes {
+		return fmt.Errorf("queued attachments exceed the %d MiB limit", maxQueuedMediaBytes>>20)
+	}
+	session.queuedTurns = append(session.queuedTurns, &queuedTurn{
+		ID:              queueID,
+		Message:         message,
+		AttachmentParts: attachmentParts,
+		QueuedAt:        time.Now().UnixMilli(),
 	})
 	return nil
+}
+
+func attachmentPartsBytes(parts []*genai.Part) int {
+	total := 0
+	for _, part := range parts {
+		if part != nil && part.InlineData != nil {
+			total += len(part.InlineData.Data)
+		}
+	}
+	return total
+}
+
+// RemoveQueuedMessage removes one not-yet-started follow-up.
+func (s *Studio) RemoveQueuedMessage(projectID, sessionID, queueID string) error {
+	s.mu.RLock()
+	p, ok := s.projects[projectID]
+	s.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("project not found: %s", projectID)
+	}
+	session := p.GetSession(sessionID)
+	if session == nil {
+		return fmt.Errorf("session not found: %s", sessionID)
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	for i, turn := range session.queuedTurns {
+		if turn != nil && turn.ID == queueID {
+			session.queuedTurns = append(session.queuedTurns[:i], session.queuedTurns[i+1:]...)
+			return nil
+		}
+	}
+	return fmt.Errorf("queued message not found")
 }
 
 // StopGeneration cancels the current agent run for a specific session (or all if empty).
@@ -1069,9 +2207,21 @@ func (s *Studio) StopGeneration(projectID, sessionID string) error {
 		return fmt.Errorf("project not found: %s", projectID)
 	}
 	if sessionID == "" {
-		p.Stop()
+		removed := p.Stop()
+		for sid, ids := range removed {
+			if len(ids) > 0 {
+				p.emitEvent(s.ctx, EventChatQueueCleared, ChatQueueEvent{
+					ProjectID: projectID, SessionID: sid, IDs: ids,
+				})
+			}
+		}
 	} else {
-		p.StopSession(sessionID)
+		ids := p.StopSession(sessionID)
+		if len(ids) > 0 {
+			p.emitEvent(s.ctx, EventChatQueueCleared, ChatQueueEvent{
+				ProjectID: projectID, SessionID: sessionID, IDs: ids,
+			})
+		}
 	}
 	return nil
 }
@@ -1092,20 +2242,38 @@ func (s *Studio) ClearHistory(projectID, sessionID string) error {
 	if session == nil {
 		return fmt.Errorf("session not found: %s", sid)
 	}
+	s.cancelSideQuestions(projectID, sid)
+	// Invalidate the snapshot held by any side question before touching disk.
+	// A second bump after the clear closes the small window in which a brand-new
+	// side question could snapshot the old transcript while deletion runs.
+	session.mu.Lock()
+	session.historyEpoch++
+	session.mu.Unlock()
 	// Stop any active generation first. Clearing mid-turn otherwise leaves
 	// the agent goroutine appending a model response into a freshly-emptied
 	// history, ending with "model" as the only turn — which then fails the
 	// next LLM call. The Stop call is synchronous via cancelFn; the goroutine
 	// will exit on its next ctx.Err() check and skip its final SaveHistory.
-	session.Stop()
+	removedQueueIDs := session.Stop()
+	if len(removedQueueIDs) > 0 {
+		p.emitEvent(s.ctx, EventChatQueueCleared, ChatQueueEvent{
+			ProjectID: projectID, SessionID: sid, IDs: removedQueueIDs,
+		})
+	}
+	// Delete the durable copy before mutating memory. If the disk operation
+	// fails, keep the conversation visible instead of claiming it was cleared
+	// only to restore it after restart.
+	if err := deleteHistoryChecked(projectSessionStorageKey(projectID, sid)); err != nil {
+		return fmt.Errorf("clear session history: %w", err)
+	}
 	session.mu.Lock()
 	session.history = nil
 	// The session's recorded usage was attributed to the history we're deleting,
 	// so clear it too — otherwise the cumulative cost (and a strict-budget block)
 	// would keep counting tokens from a conversation that no longer exists.
 	session.usage = nil
+	session.historyEpoch++
 	session.mu.Unlock()
-	DeleteHistory(projectID + "_" + sid)
 	// Any in-flight replay buffer references a history we just wiped — drop
 	// it so the recovery banner doesn't resurrect a turn the user wanted gone.
 	DiscardReplay(projectID, sid)
@@ -1145,13 +2313,36 @@ func (s *Studio) GetHistory(projectID, sessionID string) ([]ChatMessage, error) 
 	if session == nil {
 		return nil, nil
 	}
+	consumedSuggestions, _ := loadConsumedSessionSuggestions(projectID, sid)
 
 	session.mu.RLock()
 	defer session.mu.RUnlock()
 
 	var msgs []ChatMessage
 	for _, c := range session.history {
+		for _, part := range c.Parts {
+			if part == nil || part.FunctionCall == nil || part.FunctionCall.Name != "session_agent" ||
+				!strings.EqualFold(strings.TrimSpace(stringArg(part.FunctionCall.Args, "action")), "suggest") {
+				continue
+			}
+			args := make(map[string]any, len(part.FunctionCall.Args))
+			for key, value := range part.FunctionCall.Args {
+				args[key] = value
+			}
+			title := strings.TrimSpace(stringArg(args, "name"))
+			prompt := strings.TrimSpace(stringArg(args, "message"))
+			if title == "" || prompt == "" {
+				continue
+			}
+			success := true
+			msgs = append(msgs, ChatMessage{
+				ID: GenerateID(), Role: "tool", ToolName: "session_agent", ToolArgs: args,
+				ToolSuccess: &success, Content: "Suggested as a separate task.",
+				Consumed: consumedSuggestions[sessionSuggestionKey(title, prompt)],
+			})
+		}
 		text := ""
+		var attachments []ChatAttachment
 		for _, part := range c.Parts {
 			// Exclude thinking (reasoning) parts — they are internal model
 			// deliberation and should not appear as regular assistant text when
@@ -1162,8 +2353,17 @@ func (s *Studio) GetHistory(projectID, sessionID string) ([]ChatMessage, error) 
 			if part.Text != "" {
 				text += part.Text
 			}
+			if part.InlineData != nil && len(part.InlineData.Data) > 0 {
+				attachments = append(attachments, ChatAttachment{
+					Name:     attachmentDisplayName(len(attachments), part.InlineData),
+					MIMEType: part.InlineData.MIMEType,
+					Data:     base64.StdEncoding.EncodeToString(part.InlineData.Data),
+					Size:     len(part.InlineData.Data),
+				})
+			}
 		}
-		if text == "" {
+		text = stripDocumentAttachmentContext(text)
+		if text == "" && len(attachments) == 0 {
 			continue
 		}
 		role := c.Role
@@ -1171,10 +2371,11 @@ func (s *Studio) GetHistory(projectID, sessionID string) ([]ChatMessage, error) 
 			role = "assistant"
 		}
 		msgs = append(msgs, ChatMessage{
-			ID:        GenerateID(),
-			Role:      role,
-			Content:   text,
-			Timestamp: 0,
+			ID:          GenerateID(),
+			Role:        role,
+			Content:     text,
+			Timestamp:   0,
+			Attachments: attachments,
 		})
 	}
 	return msgs, nil
@@ -1205,7 +2406,8 @@ type SearchHit struct {
 	MessageIdx  int    `json:"messageIdx"`  // index of the matched message within the session's filtered history
 	Role        string `json:"role"`        // "user" or "assistant"
 	Snippet     string `json:"snippet"`     // ~120-char window around the first match, with the match preserved
-	MatchOffset int    `json:"matchOffset"` // index of the match within Snippet (for highlighting)
+	MatchOffset int    `json:"matchOffset"` // UTF-16 index within Snippet (JavaScript String.slice compatible)
+	MessageHash string `json:"messageHash"` // SHA-256 of normalized role + visible message text for reliable post-load jumps
 }
 
 // SearchProjectHistory does a case-insensitive substring search of every
@@ -1213,11 +2415,15 @@ type SearchHit struct {
 // return no hits. Each session contributes at most 5 hits so a noisy match
 // can't overwhelm the UI. Caps total result count at 200.
 func (s *Studio) SearchProjectHistory(projectID, query string) ([]SearchHit, error) {
+	if err := validateRPCText("search query", query, HistoryQueryMaxBytes, false); err != nil {
+		return nil, err
+	}
 	q := strings.TrimSpace(query)
 	if q == "" {
 		return []SearchHit{}, nil
 	}
 	needle := strings.ToLower(q)
+	needleRunes := utf8.RuneCountInString(needle)
 
 	s.mu.RLock()
 	p, ok := s.projects[projectID]
@@ -1226,20 +2432,48 @@ func (s *Studio) SearchProjectHistory(projectID, query string) ([]SearchHit, err
 		return nil, fmt.Errorf("project not found: %s", projectID)
 	}
 
-	// Snapshot session IDs + names under p.mu so we can release the lock before
-	// taking each session's lock — avoids holding two locks at once.
+	// Snapshot session pointers under p.mu so we can release the project lock
+	// before reading session-owned metadata — avoids holding two locks at once.
 	p.mu.RLock()
 	type sessRef struct {
-		id   string
-		sess *ChatSession
+		id         string
+		name       string
+		lastUsedAt int64
+		pinned     bool
+		sess       *ChatSession
 	}
 	sessions := make([]sessRef, 0, len(p.sessions))
 	for sid, sess := range p.sessions {
-		// Don't read sess.Name here under p.mu — it's owned by session.mu.
-		// Captured inside the per-session lock below instead.
+		// Name/order metadata is captured under session.mu below.
 		sessions = append(sessions, sessRef{id: sid, sess: sess})
 	}
 	p.mu.RUnlock()
+	for i := range sessions {
+		sessions[i].sess.mu.RLock()
+		sessions[i].name = sessions[i].sess.Name
+		sessions[i].lastUsedAt = sessions[i].sess.lastUsedAt
+		sessions[i].pinned = sessions[i].sess.Pinned
+		sessions[i].sess.mu.RUnlock()
+	}
+	// Stable, useful ordering: pinned sessions first, then most recently used,
+	// then name/ID. Map iteration order must never reshuffle keyboard-selected
+	// search results between identical queries.
+	sort.SliceStable(sessions, func(i, j int) bool {
+		if sessions[i].pinned != sessions[j].pinned {
+			return sessions[i].pinned
+		}
+		if sessions[i].lastUsedAt != sessions[j].lastUsedAt {
+			return sessions[i].lastUsedAt > sessions[j].lastUsedAt
+		}
+		nameI, nameJ := strings.ToLower(sessions[i].name), strings.ToLower(sessions[j].name)
+		if nameI != nameJ {
+			return nameI < nameJ
+		}
+		if sessions[i].name != sessions[j].name {
+			return sessions[i].name < sessions[j].name
+		}
+		return sessions[i].id < sessions[j].id
+	})
 
 	const (
 		perSessionCap = 5
@@ -1250,45 +2484,62 @@ func (s *Studio) SearchProjectHistory(projectID, query string) ([]SearchHit, err
 
 	for _, ref := range sessions {
 		ref.sess.mu.RLock()
-		sessName := ref.sess.Name
+		sessName := ref.name
 		filteredIdx := -1
 		count := 0
 		for _, c := range ref.sess.history {
-			text := ""
+			var textBuilder strings.Builder
+			hasAttachment := false
 			for _, part := range c.Parts {
 				if part.Thought {
 					continue
 				}
 				if part.Text != "" {
-					text += part.Text
+					textBuilder.WriteString(part.Text)
+				}
+				if part.InlineData != nil && len(part.InlineData.Data) > 0 {
+					hasAttachment = true
 				}
 			}
-			if text == "" {
+			text := stripDocumentAttachmentContext(textBuilder.String())
+			if text == "" && !hasAttachment {
 				continue
 			}
 			filteredIdx++
-			lo := strings.ToLower(text)
-			matchAt := strings.Index(lo, needle)
-			if matchAt < 0 {
+			if text == "" {
 				continue
 			}
+			lo := strings.ToLower(text)
+			matchByte := strings.Index(lo, needle)
+			if matchByte < 0 {
+				continue
+			}
+			// strings.ToLower applies a one-rune-to-one-rune Unicode mapping, so
+			// the rune index in lo maps back to the original text even when the
+			// encoded byte lengths differ. Build the window in runes to avoid
+			// slicing through UTF-8, then report a UTF-16 offset because React's
+			// String.slice indexes JavaScript code units, not UTF-8 bytes.
+			matchRune := utf8.RuneCountInString(lo[:matchByte])
+			textRunes := []rune(text)
 			role := c.Role
 			if role == "model" {
 				role = "assistant"
 			}
-			start := max(matchAt-snippetWindow, 0)
-			end := min(matchAt+len(needle)+snippetWindow, len(text))
-			snippet := text[start:end]
+			messageDigest := sha256.Sum256([]byte(role + "\x00" + text))
+			start := max(matchRune-snippetWindow, 0)
+			end := min(matchRune+needleRunes+snippetWindow, len(textRunes))
+			snippetCore := string(textRunes[start:end])
+			matchPrefix := string(textRunes[start:matchRune])
+			snippet := snippetCore
+			prefix := ""
 			if start > 0 {
-				snippet = "…" + snippet
+				prefix = "…"
+				snippet = prefix + snippet
 			}
-			if end < len(text) {
+			if end < len(textRunes) {
 				snippet += "…"
 			}
-			matchOff := matchAt - start
-			if start > 0 {
-				matchOff += len("…") // 3 bytes in UTF-8; matchOff is byte-indexed
-			}
+			matchOff := len(utf16.Encode([]rune(prefix + matchPrefix)))
 			hits = append(hits, SearchHit{
 				SessionID:   ref.id,
 				SessionName: sessName,
@@ -1296,6 +2547,7 @@ func (s *Studio) SearchProjectHistory(projectID, query string) ([]SearchHit, err
 				Role:        role,
 				Snippet:     snippet,
 				MatchOffset: matchOff,
+				MessageHash: hex.EncodeToString(messageDigest[:]),
 			})
 			count++
 			if count >= perSessionCap {
@@ -1457,6 +2709,52 @@ func (s *Studio) DeleteMemoryEntry(projectID, entryID string) error {
 		return fmt.Errorf("memory entry not found: %s", entryID)
 	}
 	return nil
+}
+
+// UpdateMemoryEntry lets the user correct a remembered fact without changing
+// its identity, scope, timestamp, reinforcement, or retrieval history. The
+// memory store rebuilds automatic tags and invalidates its context cache.
+func (s *Studio) UpdateMemoryEntry(projectID, entryID, content string) (MemoryEntryInfo, error) {
+	if err := validateRPCText("memory entry ID", entryID, MemoryEntryIDMaxBytes, true); err != nil {
+		return MemoryEntryInfo{}, err
+	}
+	if err := validateRPCText("memory content", content, MemoryContentMaxBytes, true); err != nil {
+		return MemoryEntryInfo{}, err
+	}
+	s.mu.RLock()
+	p, ok := s.projects[projectID]
+	s.mu.RUnlock()
+	if !ok {
+		return MemoryEntryInfo{}, fmt.Errorf("project not found: %s", projectID)
+	}
+	p.mu.RLock()
+	store := p.memoryStore
+	p.mu.RUnlock()
+	if store == nil {
+		return MemoryEntryInfo{}, fmt.Errorf("memory not initialised for this project")
+	}
+	if err := store.Edit(entryID, content); err != nil {
+		return MemoryEntryInfo{}, err
+	}
+	// A direct user edit should survive an immediate crash/restart instead of
+	// waiting for the store's normal two-second agent-write debounce.
+	if err := store.Flush(); err != nil {
+		return MemoryEntryInfo{}, fmt.Errorf("persist memory update: %w", err)
+	}
+	entry, ok := store.GetByID(entryID)
+	if !ok || entry == nil {
+		return MemoryEntryInfo{}, fmt.Errorf("memory entry not found after update: %s", entryID)
+	}
+	return MemoryEntryInfo{
+		ID:            entry.ID,
+		Key:           entry.Key,
+		Content:       entry.Content,
+		Type:          string(entry.Type),
+		Tags:          entry.Tags,
+		Timestamp:     entry.Timestamp.UnixMilli(),
+		Project:       entry.Project,
+		Reinforcement: entry.Reinforcement,
+	}, nil
 }
 
 // ExportChat exports a single session's chat history as markdown. sessionID
@@ -1648,6 +2946,19 @@ func (s *Studio) OpenTerminal(projectID string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("project not found: %s", projectID)
 	}
+	p.mu.RLock()
+	workDir := p.Directory
+	p.mu.RUnlock()
+	return s.openTerminalAt(projectID, workDir)
+}
+
+// OpenSessionTerminal opens a PTY in the active chat's isolated checkout.
+// Legacy/non-Git sessions intentionally resolve to the project directory.
+func (s *Studio) OpenSessionTerminal(projectID, sessionID string) (string, error) {
+	return s.OpenSessionTerminalAt(projectID, sessionID, "")
+}
+
+func (s *Studio) openTerminalAt(projectID, workDir string) (string, error) {
 
 	termID := "term-" + uuid.New().String()[:8]
 	// onExit drops the registry entry when the shell exits on its own so a
@@ -1660,7 +2971,7 @@ func (s *Studio) OpenTerminal(projectID string) (string, error) {
 		delete(s.terminals, id)
 		s.mu.Unlock()
 	}
-	t, err := newTerminalWithLogger(s.ctx, p.Directory, projectID, termID, s.LogEvent, onExit)
+	t, err := newTerminalWithLogger(s.ctx, workDir, projectID, termID, s.LogEvent, onExit)
 	if err != nil {
 		return "", fmt.Errorf("open terminal: %w", err)
 	}
@@ -1673,6 +2984,12 @@ func (s *Studio) OpenTerminal(projectID string) (string, error) {
 
 // WriteTerminal sends input to a terminal.
 func (s *Studio) WriteTerminal(termID, data string) error {
+	if !utf8.ValidString(data) {
+		return fmt.Errorf("terminal input must be valid UTF-8")
+	}
+	if len(data) > TerminalWriteMaxBytes {
+		return fmt.Errorf("terminal input exceeds the %d-byte limit", TerminalWriteMaxBytes)
+	}
 	s.mu.RLock()
 	t, ok := s.terminals[termID]
 	s.mu.RUnlock()
@@ -1684,6 +3001,9 @@ func (s *Studio) WriteTerminal(termID, data string) error {
 
 // ResizeTerminal changes terminal dimensions.
 func (s *Studio) ResizeTerminal(termID string, cols, rows int) error {
+	if cols < 1 || rows < 1 || cols > TerminalDimensionMax || rows > TerminalDimensionMax {
+		return fmt.Errorf("terminal dimensions must be between 1 and %d", TerminalDimensionMax)
+	}
 	s.mu.RLock()
 	t, ok := s.terminals[termID]
 	s.mu.RUnlock()
@@ -1726,23 +3046,49 @@ func (s *Studio) ListDirectory(projectID, subPath string) ([]FileEntry, error) {
 	if !ok {
 		return nil, fmt.Errorf("project not found: %s", projectID)
 	}
+	p.mu.RLock()
+	workDir := p.Directory
+	p.mu.RUnlock()
+	return listDirectoryAt(workDir, subPath)
+}
 
-	dir := filepath.Join(p.Directory, subPath)
-	abs, err := filepath.Abs(dir)
+// ListSessionDirectory browses the files visible to one chat session.
+func (s *Studio) ListSessionDirectory(projectID, sessionID, subPath string) ([]FileEntry, error) {
+	p, session, err := s.projectSession(projectID, sessionID)
 	if err != nil {
 		return nil, err
 	}
-	projAbs, _ := filepath.Abs(p.Directory)
-	// Proper prefix check: must be the project root itself or have the
-	// separator immediately after. Plain prefix matching would treat
-	// "/home/user/foobar" as "inside" "/home/user/foo".
-	if !isInsidePath(abs, projAbs) {
-		return nil, fmt.Errorf("path outside project directory")
-	}
-
-	entries, err := os.ReadDir(abs)
+	workDir, err := sessionWorkingDirectory(p, session)
 	if err != nil {
 		return nil, err
+	}
+	return listDirectoryAt(workDir, subPath)
+}
+
+func listDirectoryAt(workDir, subPath string) ([]FileEntry, error) {
+	root, rel, err := openProjectPath(workDir, subPath)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	info, err := root.Stat(rel)
+	if err != nil {
+		return nil, fmt.Errorf("stat project directory: %w", err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("project path is not a directory")
+	}
+	dir, err := root.Open(rel)
+	if err != nil {
+		return nil, fmt.Errorf("open project directory: %w", err)
+	}
+	defer dir.Close()
+	entries, err := dir.ReadDir(projectDirectoryMaxEntries + 1)
+	if err != nil && err != io.EOF {
+		return nil, fmt.Errorf("read project directory: %w", err)
+	}
+	if len(entries) > projectDirectoryMaxEntries {
+		entries = entries[:projectDirectoryMaxEntries]
 	}
 
 	var result []FileEntry
@@ -1752,16 +3098,24 @@ func (s *Studio) ListDirectory(projectID, subPath string) ([]FileEntry, error) {
 		if len(name) == 0 || name[0] == '.' || name == "node_modules" || name == "__pycache__" {
 			continue
 		}
-		info, _ := e.Info()
-		size := int64(0)
-		if info != nil {
-			size = info.Size()
+		base := rel
+		if base == "." {
+			base = ""
+		}
+		entryRel := filepath.Join(base, name)
+		// Resolve through os.Root rather than DirEntry.Info so safe internal
+		// symlinks get their target type, while outward/absolute symlinks are
+		// rejected and omitted. Special files are not actionable in the text
+		// browser and may block if opened, so hide them as well.
+		entryInfo, statErr := root.Stat(entryRel)
+		if statErr != nil || (!entryInfo.IsDir() && !entryInfo.Mode().IsRegular()) {
+			continue
 		}
 		result = append(result, FileEntry{
 			Name:  name,
-			Path:  filepath.Join(subPath, name),
-			IsDir: e.IsDir(),
-			Size:  size,
+			Path:  entryRel,
+			IsDir: entryInfo.IsDir(),
+			Size:  entryInfo.Size(),
 		})
 	}
 
@@ -1784,31 +3138,31 @@ func (s *Studio) ReadFileContent(projectID, subPath string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("project not found: %s", projectID)
 	}
+	p.mu.RLock()
+	workDir := p.Directory
+	p.mu.RUnlock()
+	return readProjectTextFile(workDir, subPath)
+}
 
-	filePath := filepath.Join(p.Directory, subPath)
-	abs, err := filepath.Abs(filePath)
+// ReadSessionFileContent reads an @mentioned file from the same isolated
+// checkout used by the session's agent tools.
+func (s *Studio) ReadSessionFileContent(projectID, sessionID, subPath string) (string, error) {
+	p, session, err := s.projectSession(projectID, sessionID)
 	if err != nil {
 		return "", err
 	}
-	projAbs, _ := filepath.Abs(p.Directory)
-	if !isInsidePath(abs, projAbs) {
-		return "", fmt.Errorf("path outside project directory")
-	}
-
-	data, err := os.ReadFile(abs)
+	workDir, err := sessionWorkingDirectory(p, session)
 	if err != nil {
 		return "", err
 	}
-
-	// Limit to 100KB to avoid sending huge files.
-	if len(data) > 100*1024 {
-		return string(data[:100*1024]) + "\n\n[truncated at 100KB]", nil
-	}
-	return string(data), nil
+	return readProjectTextFile(workDir, subPath)
 }
 
 // RenameProject changes a project's display name.
 func (s *Studio) RenameProject(id, newName string) error {
+	if !utf8.ValidString(newName) {
+		return fmt.Errorf("name must be valid UTF-8")
+	}
 	newName = strings.TrimSpace(newName)
 	if newName == "" {
 		return fmt.Errorf("name cannot be empty")
@@ -1822,11 +3176,18 @@ func (s *Studio) RenameProject(id, newName string) error {
 	if !ok {
 		return fmt.Errorf("project not found: %s", id)
 	}
-	p.mu.Lock()
+	p.mu.RLock()
 	oldName := p.Name
-	p.Name = newName
-	p.mu.Unlock()
-	s.saveConfig()
+	p.mu.RUnlock()
+	if err := s.persistProjectMutationLocked(id, func(pc *ProjectConfig) {
+		pc.Name = newName
+	}, func(p *Project) {
+		p.mu.Lock()
+		p.Name = newName
+		p.mu.Unlock()
+	}); err != nil {
+		return err
+	}
 	s.auditProjectRenamed(oldName, newName)
 	return nil
 }
@@ -1835,33 +3196,108 @@ func (s *Studio) RenameProject(id, newName string) error {
 
 // ProviderInfo describes a provider and its models for the frontend dropdown.
 type ProviderInfo struct {
-	ID     string   `json:"id"`
-	Name   string   `json:"name"`
-	Models []string `json:"models"`
+	ID           string              `json:"id"`
+	Name         string              `json:"name"`
+	Models       []string            `json:"models"`
+	ModelDetails []ProviderModelInfo `json:"modelDetails"`
+}
+
+// ProviderModelInfo exposes the verified GLM/Kimi capability contract to the
+// picker. Keeping it beside the allowlist prevents context/output/reasoning
+// labels in the UI from drifting away from the model actually sent on wire.
+type ProviderModelInfo struct {
+	ID                     string   `json:"id"`
+	ContextWindow          int      `json:"contextWindow"`
+	DefaultMaxOutputTokens int32    `json:"defaultMaxOutputTokens"`
+	MaxOutputTokens        int32    `json:"maxOutputTokens"`
+	InputModalities        []string `json:"inputModalities"`
+	ReasoningControl       string   `json:"reasoningControl"`
+	Description            string   `json:"description"`
+	Latest                 bool     `json:"latest"`
+	Recommended            bool     `json:"recommended"`
 }
 
 // GetProviders returns the list of available LLM providers and models.
 func (s *Studio) GetProviders() []*ProviderInfo {
-	// Lineup mirrors internal/engine/client.AvailableModels (cloud providers)
-	// so the picker never drifts from what the engine can actually construct.
-	// glm-5.2 is the current flagship/default.
-	return []*ProviderInfo{
-		{ID: "glm", Name: "GLM (Zhipu AI)", Models: []string{
-			"glm-5.2", "glm-5.1", "glm-5", "glm-5-turbo", "glm-4.7", "glm-4.5",
-		}},
-		{ID: "minimax", Name: "MiniMax", Models: []string{
-			"MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.5", "MiniMax-M2.5-highspeed",
-		}},
-		{ID: "kimi", Name: "Kimi for Coding", Models: []string{
-			"kimi-for-coding",
-		}},
-		{ID: "deepseek", Name: "DeepSeek", Models: []string{
-			"deepseek-v4-pro", "deepseek-v4-flash",
-		}},
-		{ID: "ollama", Name: "Ollama (Local)", Models: []string{
-			"qwen3", "llama3.3", "deepseek-r1", "gemma3", "codellama", "phi4",
-		}},
+	dynamic := make(map[string]map[string]bool)
+	addDynamic := func(provider, model string) {
+		if !isFutureStudioModelID(provider, model) {
+			return
+		}
+		if dynamic[provider] == nil {
+			dynamic[provider] = make(map[string]bool)
+		}
+		dynamic[provider][model] = true
 	}
+	s.mu.RLock()
+	if s.config != nil {
+		addDynamic(s.config.Settings.DefaultProvider, s.config.Settings.DefaultModel)
+	}
+	for provider, models := range s.discoveredModels {
+		if checkedAt := s.discoveredModelsAt[provider]; checkedAt.IsZero() || time.Since(checkedAt) > studioModelDiscoveryTTL {
+			continue
+		}
+		for model := range models {
+			addDynamic(provider, model)
+		}
+	}
+	for _, project := range s.projects {
+		project.mu.RLock()
+		addDynamic(project.Provider, project.Model)
+		project.mu.RUnlock()
+	}
+	s.mu.RUnlock()
+
+	providers := make([]*ProviderInfo, 0, len(studioProviderCatalog))
+	for i := range studioProviderCatalog {
+		provider := studioProviderCatalog[i]
+		provider.Models = append([]string(nil), provider.Models...)
+		provider.ModelDetails = append([]ProviderModelInfo(nil), provider.ModelDetails...)
+		for j := range provider.ModelDetails {
+			provider.ModelDetails[j].InputModalities = append(
+				[]string(nil), provider.ModelDetails[j].InputModalities...,
+			)
+		}
+		known := make(map[string]bool, len(provider.Models))
+		for _, model := range provider.Models {
+			known[model] = true
+		}
+		extra := make([]string, 0, len(dynamic[provider.ID]))
+		for model := range dynamic[provider.ID] {
+			if !known[model] {
+				extra = append(extra, model)
+			}
+		}
+		sort.Slice(extra, func(i, j int) bool {
+			if compared := modelVersionCompare(provider.ID, extra[i], extra[j]); compared != 0 {
+				return compared > 0
+			}
+			return extra[i] < extra[j]
+		})
+		if len(extra) > 0 {
+			provider.Models = append(extra, provider.Models...)
+			newestIsFuture := modelVersionCompare(provider.ID, extra[0], defaultModelForProvider(provider.ID)) > 0
+			if newestIsFuture {
+				for j := range provider.ModelDetails {
+					provider.ModelDetails[j].Latest = false
+					provider.ModelDetails[j].Recommended = false
+				}
+			}
+			for _, model := range extra {
+				if detail := modelDefinition(provider.ID, model); detail != nil {
+					inferred := *detail
+					if newestIsFuture {
+						inferred.Latest = model == extra[0]
+						inferred.Recommended = model == extra[0]
+					}
+					inferred.InputModalities = append([]string(nil), inferred.InputModalities...)
+					provider.ModelDetails = append(provider.ModelDetails, inferred)
+				}
+			}
+		}
+		providers = append(providers, &provider)
+	}
+	return providers
 }
 
 // --- Settings ---
@@ -1882,39 +3318,178 @@ func (s *Studio) GetSettings() *StudioConfig {
 // without this, users reported "I added my key but the agent still says
 // 'configure key in settings'" until they restarted the app.
 func (s *Studio) UpdateSettings(cfg StudioConfig) error {
+	defaults := defaultConfig().Settings
+	if cfg.Settings.Theme == "" {
+		cfg.Settings.Theme = defaults.Theme
+	}
+	if cfg.Settings.DefaultProvider == "" {
+		cfg.Settings.DefaultProvider = defaults.DefaultProvider
+	}
+	if cfg.Settings.DefaultModel == "" {
+		cfg.Settings.DefaultModel = defaults.DefaultModel
+	}
+	if strings.TrimSpace(cfg.Settings.QuickEntryShortcut) == "" {
+		cfg.Settings.QuickEntryShortcut = defaults.QuickEntryShortcut
+	}
+	normalizedShortcut, err := normalizeQuickEntryShortcut(cfg.Settings.QuickEntryShortcut)
+	if err != nil {
+		return fmt.Errorf("invalid Quick Entry shortcut: %w", err)
+	}
+	cfg.Settings.QuickEntryShortcut = normalizedShortcut
+	if strings.TrimSpace(cfg.Settings.VoiceShortcut) == "" {
+		cfg.Settings.VoiceShortcut = defaults.VoiceShortcut
+	}
+	normalizedVoiceShortcut, err := normalizeVoiceShortcut(cfg.Settings.VoiceShortcut)
+	if err != nil {
+		return fmt.Errorf("invalid voice shortcut: %w", err)
+	}
+	cfg.Settings.VoiceShortcut = normalizedVoiceShortcut
 	// Trim whitespace from keys/URLs so a paste with leading/trailing spaces
 	// doesn't silently break authentication.
 	cfg.Settings.GLMKey = strings.TrimSpace(cfg.Settings.GLMKey)
-	cfg.Settings.MiniMaxKey = strings.TrimSpace(cfg.Settings.MiniMaxKey)
 	cfg.Settings.KimiKey = strings.TrimSpace(cfg.Settings.KimiKey)
-	cfg.Settings.DeepSeekKey = strings.TrimSpace(cfg.Settings.DeepSeekKey)
-	cfg.Settings.OllamaURL = strings.TrimSpace(cfg.Settings.OllamaURL)
-	if cfg.Settings.DefaultThinkingBudget < 0 {
+	cfg.Settings.GlobalInstructions = strings.TrimSpace(cfg.Settings.GlobalInstructions)
+	if cfg.Settings.DefaultThinkingMode != "" && cfg.Settings.DefaultThinkingMode != "enabled" && cfg.Settings.DefaultThinkingMode != "disabled" {
+		return fmt.Errorf("invalid default thinking mode %q", cfg.Settings.DefaultThinkingMode)
+	}
+	if cfg.Settings.DefaultThinkingBudget < 0 || cfg.Settings.DefaultThinkingBudget > 1_000_000 {
 		cfg.Settings.DefaultThinkingBudget = 0
 	}
 	// Mirror the per-project budget validation: clamp negatives to 0 and
 	// reject typo-sized values (10000000 instead of 100). Both are silent
 	// clamps rather than errors so a malformed UI input doesn't block save.
-	if cfg.Settings.DefaultBudgetUSD < 0 {
+	if cfg.Settings.DefaultBudgetUSD < 0 || math.IsNaN(cfg.Settings.DefaultBudgetUSD) || math.IsInf(cfg.Settings.DefaultBudgetUSD, 0) {
 		cfg.Settings.DefaultBudgetUSD = 0
 	}
 	if cfg.Settings.DefaultBudgetUSD > 100000 {
 		cfg.Settings.DefaultBudgetUSD = 100000
 	}
+	if cfg.Settings.Theme != "dark" && cfg.Settings.Theme != "light" && cfg.Settings.Theme != "system" {
+		return fmt.Errorf("invalid theme %q", cfg.Settings.Theme)
+	}
+	stringFields := []string{
+		cfg.Settings.DefaultProvider, cfg.Settings.DefaultModel, cfg.Settings.GLMKey,
+		cfg.Settings.KimiKey, cfg.Settings.GlobalInstructions,
+	}
+	for _, value := range stringFields {
+		if !utf8.ValidString(value) {
+			return fmt.Errorf("settings must contain valid UTF-8")
+		}
+	}
+	if strings.TrimSpace(cfg.Settings.DefaultProvider) == "" || strings.TrimSpace(cfg.Settings.DefaultModel) == "" {
+		return fmt.Errorf("default provider and model cannot be empty")
+	}
+	cfg.Settings.DefaultProvider = truncateUTF8(strings.ToLower(strings.TrimSpace(cfg.Settings.DefaultProvider)), 128)
+	cfg.Settings.DefaultModel = truncateUTF8(strings.TrimSpace(cfg.Settings.DefaultModel), 256)
+	if err := s.validateAvailableStudioProviderModel(cfg.Settings.DefaultProvider, cfg.Settings.DefaultModel); err != nil {
+		return err
+	}
+	cfg.Settings.GLMKey = truncateUTF8(cfg.Settings.GLMKey, 64<<10)
+	cfg.Settings.KimiKey = truncateUTF8(cfg.Settings.KimiKey, 64<<10)
+	cfg.Settings.GlobalInstructions = truncateUTF8(cfg.Settings.GlobalInstructions, GlobalInstructionsMaxBytes)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// iter 800+: audit each changed field to the event log so users can
 	// answer "wait, why is X enabled now?" after a settings change. API key
 	// VALUES are never logged — see diffSettings for the secrets policy.
 	oldSettings := s.config.Settings
+	quickEntryAffected := oldSettings.QuickEntryEnabled != cfg.Settings.QuickEntryEnabled ||
+		(oldSettings.QuickEntryEnabled && cfg.Settings.QuickEntryEnabled && oldSettings.QuickEntryShortcut != cfg.Settings.QuickEntryShortcut)
+	voiceShortcutAffected := oldSettings.VoiceShortcutEnabled != cfg.Settings.VoiceShortcutEnabled ||
+		(oldSettings.VoiceShortcutEnabled && cfg.Settings.VoiceShortcutEnabled && oldSettings.VoiceShortcut != cfg.Settings.VoiceShortcut)
+	quickEntryOldStopped := false
+	voiceShortcutOldStopped := false
+	quickEntryNewStarted := false
+	voiceShortcutNewStarted := false
+	rollbackShortcuts := func() error {
+		var failures []string
+		if voiceShortcutNewStarted {
+			if stopErr := s.setVoiceShortcutEnabled(false, ""); stopErr != nil {
+				failures = append(failures, "stop new voice shortcut: "+stopErr.Error())
+			}
+		}
+		if quickEntryNewStarted {
+			if stopErr := s.setQuickEntryEnabled(false, ""); stopErr != nil {
+				failures = append(failures, "stop new Quick Entry shortcut: "+stopErr.Error())
+			}
+		}
+		if quickEntryOldStopped {
+			if startErr := s.setQuickEntryEnabled(true, oldSettings.QuickEntryShortcut); startErr != nil {
+				failures = append(failures, "restore old Quick Entry shortcut: "+startErr.Error())
+			}
+		}
+		if voiceShortcutOldStopped {
+			if startErr := s.setVoiceShortcutEnabled(true, oldSettings.VoiceShortcut); startErr != nil {
+				failures = append(failures, "restore old voice shortcut: "+startErr.Error())
+			}
+		}
+		if len(failures) > 0 {
+			return fmt.Errorf("%s", strings.Join(failures, "; "))
+		}
+		return nil
+	}
+	shortcutFailure := func(primary error) error {
+		if rollbackErr := rollbackShortcuts(); rollbackErr != nil {
+			return fmt.Errorf("%w; shortcut rollback also failed: %v", primary, rollbackErr)
+		}
+		return primary
+	}
+	// Stop every affected old registration before starting replacements. This
+	// permits disabling one shortcut in favour of the same chord, and even
+	// swapping the text and voice chords, without a transient OS collision.
+	if quickEntryAffected && oldSettings.QuickEntryEnabled {
+		if err := s.setQuickEntryEnabled(false, ""); err != nil {
+			return fmt.Errorf("stop previous Quick Entry shortcut: %w", err)
+		}
+		quickEntryOldStopped = true
+	}
+	if voiceShortcutAffected && oldSettings.VoiceShortcutEnabled {
+		if err := s.setVoiceShortcutEnabled(false, ""); err != nil {
+			return shortcutFailure(fmt.Errorf("stop previous voice shortcut: %w", err))
+		}
+		voiceShortcutOldStopped = true
+	}
+	if quickEntryAffected && cfg.Settings.QuickEntryEnabled {
+		if err := s.setQuickEntryEnabled(true, cfg.Settings.QuickEntryShortcut); err != nil {
+			return shortcutFailure(fmt.Errorf("register Quick Entry shortcut: %w", err))
+		}
+		quickEntryNewStarted = true
+	}
+	if voiceShortcutAffected && cfg.Settings.VoiceShortcutEnabled {
+		if err := s.setVoiceShortcutEnabled(true, cfg.Settings.VoiceShortcut); err != nil {
+			return shortcutFailure(fmt.Errorf("register voice shortcut: %w", err))
+		}
+		voiceShortcutNewStarted = true
+	}
+	projects := make([]ProjectConfig, 0, len(s.projects))
+	for _, p := range s.projects {
+		projects = append(projects, p.ToConfig())
+	}
+	candidate := &StudioConfig{Projects: projects, Settings: cfg.Settings}
+	s.configSaveMu.Lock()
+	err = candidate.Save()
+	s.configSaveMu.Unlock()
+	if err != nil {
+		return shortcutFailure(err)
+	}
+	if oldSettings.GLMKey != cfg.Settings.GLMKey {
+		delete(s.discoveredModels, "glm")
+		delete(s.discoveredModelsAt, "glm")
+	}
+	if oldSettings.KimiKey != cfg.Settings.KimiKey {
+		delete(s.discoveredModels, "kimi")
+		delete(s.discoveredModelsAt, "kimi")
+	}
 	s.config.Settings = cfg.Settings
+	s.config.Projects = projects
 	for _, p := range s.projects {
 		p.mu.Lock()
 		p.resetClientLocked() // close + clear so the next send re-inits with new settings
 		p.mu.Unlock()
 	}
-	if err := s.config.Save(); err != nil {
-		return err
+	s.setWakeEnabled(cfg.Settings.KeepAwakeEnabled)
+	if cfg.Settings.AutoArchivePRAfterClose {
+		s.ensurePullRequestArchiveMonitor()
 	}
 	s.logSettingsChanges(oldSettings, cfg.Settings)
 	return nil
@@ -1948,11 +3523,11 @@ func (s *Studio) ApplyDefaultToProjects() error {
 // the result can route back to the same chat, not the default one. Empty
 // string falls back to "default" for backward compat with older bindings.
 func (s *Studio) Dispatch(fromID, toID, fromSessionID, task string) error {
+	if err := validateRPCText("task description", task, DispatchTaskMaxBytes, true); err != nil {
+		return err
+	}
 	if fromID == toID {
 		return fmt.Errorf("cannot dispatch to self; pick a different target project")
-	}
-	if strings.TrimSpace(task) == "" {
-		return fmt.Errorf("task description cannot be empty")
 	}
 	fromSid := fromSessionID
 	if fromSid == "" {
@@ -1979,10 +3554,11 @@ func (s *Studio) Dispatch(fromID, toID, fromSessionID, task string) error {
 	// second project's LLM client; any panic there (provider library bug,
 	// nil-deref on a race) previously killed the whole app. Now surfaces in
 	// the event log.
-	s.wg.Go(func() {
-		defer recoverPanic("dispatch", s.LogEvent)
+	if !s.startBackground("dispatch", func() {
 		dispatchFn(from, to, fromSid, task, settings)
-	})
+	}) {
+		return fmt.Errorf("studio is shutting down")
+	}
 	return nil
 }
 
@@ -2048,6 +3624,41 @@ func (s *Studio) dispatchInternal(from, to *Project, fromSid, task string, setti
 
 // --- Internal ---
 
+// persistProjectMutationLocked commits one project's future config before
+// publishing the corresponding in-memory state. Caller must hold s.mu.Lock.
+// Keeping all project-setting APIs on this path gives them the same contract:
+// success survives restart; failure changes neither the project nor its cached
+// provider/MCP transports.
+func (s *Studio) persistProjectMutationLocked(id string, mutate func(*ProjectConfig), publish func(*Project)) error {
+	p, ok := s.projects[id]
+	if !ok {
+		return fmt.Errorf("project not found: %s", id)
+	}
+	projects := make([]ProjectConfig, 0, len(s.projects))
+	found := false
+	for projectID, existing := range s.projects {
+		pc := existing.ToConfig()
+		if projectID == id {
+			mutate(&pc)
+			found = true
+		}
+		projects = append(projects, pc)
+	}
+	if !found {
+		return fmt.Errorf("project not found: %s", id)
+	}
+	candidate := &StudioConfig{Projects: projects, Settings: s.config.Settings}
+	s.configSaveMu.Lock()
+	err := candidate.Save()
+	s.configSaveMu.Unlock()
+	if err != nil {
+		return fmt.Errorf("persist project settings: %w", err)
+	}
+	publish(p)
+	s.config.Projects = projects
+	return nil
+}
+
 // isInsidePath returns true if path is equal to root or a descendant of it,
 // using a proper path-separator-aware prefix check. Plain string prefix
 // matching would incorrectly accept "/home/user/foobar" for root
@@ -2070,6 +3681,8 @@ func isInsidePath(path, root string) bool {
 // don't hold s.mu (e.g. agent goroutines bumping lastUsedAt) must use
 // saveConfigAsync, which takes its own read lock and writes outside of it.
 func (s *Studio) saveConfig() {
+	s.configSaveMu.Lock()
+	defer s.configSaveMu.Unlock()
 	s.config.Projects = s.config.Projects[:0]
 	for _, p := range s.projects {
 		s.config.Projects = append(s.config.Projects, p.ToConfig())
@@ -2085,6 +3698,11 @@ func (s *Studio) saveConfig() {
 // for background paths (agent goroutines) that don't already hold s.mu.
 func (s *Studio) saveConfigAsync() {
 	s.mu.RLock()
+	// Acquire in s.mu -> configSaveMu order, matching saveConfig callers that
+	// already hold s.mu. Holding the commit lock through Save prevents an older
+	// async snapshot from finishing after and overwriting a newer one.
+	s.configSaveMu.Lock()
+	defer s.configSaveMu.Unlock()
 	projects := make([]ProjectConfig, 0, len(s.projects))
 	for _, p := range s.projects {
 		projects = append(projects, p.ToConfig())

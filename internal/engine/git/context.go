@@ -3,7 +3,6 @@ package git
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -274,8 +273,7 @@ func isHex(s string) bool {
 
 // runGit executes a git command and returns its output.
 func (p *GitContextProvider) runGit(ctx context.Context, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = p.workDir
+	cmd := newCommandContext(ctx, p.workDir, args...)
 	output, err := cmd.Output()
 	return string(output), err
 }

@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { FolderOpen, MessageSquare, Settings, FolderTree, Plus, Trash2, Search, Database, PanelLeftClose, CheckCircle, Bot, Sparkles } from 'lucide-react'
+import { FolderOpen, MessageSquare, Settings, FolderTree, Plus, Trash2, Search, Database, PanelLeftClose, CheckCircle, Bot, Sparkles, PanelsTopLeft, Monitor, TerminalSquare, LayoutDashboard, FileDiff, ListChecks, CalendarClock, Crosshair } from 'lucide-react'
 import { useProjectStore } from '../../stores/projectStore'
 import { useChatStore } from '../../stores/chatStore'
 
@@ -17,19 +17,24 @@ type Props = {
   onSwitchProject: (id: string) => void
   onOpenSettings: () => void
   onOpenFiles: () => void
+  onOpenArtifacts: () => void
   onNewChat: () => void
   onClearChat: () => void
   onOpenMemory: () => void
   onToggleSidebar: () => void
 }
 
-export function CommandPalette({ onClose, onSwitchProject, onOpenSettings, onOpenFiles, onNewChat, onClearChat, onOpenMemory, onToggleSidebar }: Props) {
+export function CommandPalette({ onClose, onSwitchProject, onOpenSettings, onOpenFiles, onOpenArtifacts, onNewChat, onClearChat, onOpenMemory, onToggleSidebar }: Props) {
   const projects = useProjectStore((s) => s.projects)
   const activeProjectId = useProjectStore((s) => s.activeProjectId)
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState(0)
   const listRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  const paletteRef = useRef<HTMLDivElement>(null)
+  const returnFocusRef = useRef<HTMLElement | null>(
+    document.activeElement instanceof HTMLElement ? document.activeElement : null,
+  )
 
   const actions = useMemo<Action[]>(() => {
     const projectActions: Action[] = projects.map((p) => ({
@@ -45,7 +50,7 @@ export function CommandPalette({ onClose, onSwitchProject, onOpenSettings, onOpe
       {
         id: 'new-chat',
         label: 'New chat',
-        hint: 'Ctrl+T',
+        hint: 'Ctrl+N',
         icon: <Plus size={14} />,
         group: 'Actions',
         onSelect: () => { onNewChat(); onClose() },
@@ -91,10 +96,18 @@ export function CommandPalette({ onClose, onSwitchProject, onOpenSettings, onOpe
       {
         id: 'open-settings',
         label: 'Open settings',
-        hint: 'Ctrl+3',
+        hint: 'Ctrl/Cmd+, · Ctrl+3',
         icon: <Settings size={14} />,
         group: 'Navigate',
         onSelect: () => { onOpenSettings(); onClose() },
+      },
+      {
+        id: 'open-artifacts',
+        label: 'Open artifacts library',
+        hint: 'Ctrl+4',
+        icon: <PanelsTopLeft size={14} />,
+        group: 'Navigate',
+        onSelect: () => { onOpenArtifacts(); onClose() },
       },
       {
         id: 'toggle-sidebar',
@@ -105,19 +118,112 @@ export function CommandPalette({ onClose, onSwitchProject, onOpenSettings, onOpe
         onSelect: () => { onToggleSidebar(); onClose() },
       },
       {
+        id: 'toggle-live-preview',
+        label: 'Toggle live app preview',
+        hint: 'Ctrl+Shift+B',
+        icon: <Monitor size={14} />,
+        group: 'Navigate',
+        onSelect: () => {
+          onClose()
+          requestAnimationFrame(() => window.dispatchEvent(new CustomEvent('gokin:toggle-live-preview')))
+        },
+      },
+      {
+        id: 'select-preview-element',
+        label: 'Select element in app preview',
+        hint: 'Ctrl+Shift+S',
+        icon: <Crosshair size={14} />,
+        group: 'Actions',
+        onSelect: () => {
+          onClose()
+          requestAnimationFrame(() => window.dispatchEvent(new CustomEvent('gokin:select-preview-element')))
+        },
+      },
+      {
+        id: 'open-workspace-terminal',
+        label: 'Toggle terminal pane',
+        hint: 'Ctrl+`',
+        icon: <TerminalSquare size={14} />,
+        group: 'Workspace panes',
+        onSelect: () => {
+          onClose()
+          requestAnimationFrame(() => window.dispatchEvent(new CustomEvent('gokin:toggle-workspace-terminal')))
+        },
+      },
+      {
+        id: 'open-workspace-diff',
+        label: 'Toggle diff pane',
+        hint: 'Ctrl+Shift+D',
+        icon: <FileDiff size={14} />,
+        group: 'Workspace panes',
+        onSelect: () => {
+          onClose()
+          requestAnimationFrame(() => window.dispatchEvent(new CustomEvent('gokin:toggle-diff-pane')))
+        },
+      },
+      {
+        id: 'open-workspace-plan',
+        label: 'Open plan pane',
+        icon: <ListChecks size={14} />,
+        group: 'Workspace panes',
+        onSelect: () => {
+          onClose()
+          requestAnimationFrame(() => window.dispatchEvent(new CustomEvent('gokin:open-workspace-pane', { detail: 'plan' })))
+        },
+      },
+      {
+        id: 'open-workspace-tasks',
+        label: 'Open scheduled tasks pane',
+        icon: <CalendarClock size={14} />,
+        group: 'Workspace panes',
+        onSelect: () => {
+          onClose()
+          requestAnimationFrame(() => window.dispatchEvent(new CustomEvent('gokin:open-workspace-pane', { detail: 'tasks' })))
+        },
+      },
+      {
+        id: 'open-workspace-files',
+        label: 'Open files beside chat',
+        icon: <FolderTree size={14} />,
+        group: 'Workspace panes',
+        onSelect: () => {
+          onClose()
+          requestAnimationFrame(() => window.dispatchEvent(new CustomEvent('gokin:open-workspace-pane', { detail: 'files' })))
+        },
+      },
+      {
+        id: 'open-workspace-artifacts',
+        label: 'Open artifacts beside chat',
+        icon: <PanelsTopLeft size={14} />,
+        group: 'Workspace panes',
+        onSelect: () => {
+          onClose()
+          requestAnimationFrame(() => window.dispatchEvent(new CustomEvent('gokin:open-workspace-pane', { detail: 'artifacts' })))
+        },
+      },
+      {
+        id: 'open-workspace-context',
+        label: 'Open context pane',
+        hint: 'Ctrl+J',
+        icon: <LayoutDashboard size={14} />,
+        group: 'Workspace panes',
+        onSelect: () => {
+          onClose()
+          requestAnimationFrame(() => window.dispatchEvent(new CustomEvent('gokin:open-workspace-pane', { detail: 'context' })))
+        },
+      },
+      {
         id: 'focus-sidebar-search',
         label: 'Search projects in sidebar',
-        hint: 'Ctrl+Shift+P',
+        hint: 'Ctrl+Shift+G',
         icon: <PanelLeftClose size={14} />,
         group: 'Navigate',
         onSelect: () => {
           onClose()
-          // Defer one tick so the palette unmount finishes before we focus.
-          // Without this the focus call lands while the palette is still
-          // tearing down and the input never visibly receives focus.
+          // Let the sidebar reveal the search even when it is collapsed or
+          // normally hidden for a short project list, then own the focus.
           requestAnimationFrame(() => {
-            const el = document.querySelector('.sidebar-search-input') as HTMLInputElement | null
-            if (el) { el.focus(); el.select() }
+            window.dispatchEvent(new CustomEvent('gokin:focus-project-search'))
           })
         },
       },
@@ -164,7 +270,7 @@ export function CommandPalette({ onClose, onSwitchProject, onOpenSettings, onOpe
     ]
 
     return [...projectActions, ...miscActions]
-  }, [projects, activeProjectId, onSwitchProject, onOpenSettings, onOpenFiles, onNewChat, onClearChat, onOpenMemory, onToggleSidebar, onClose])
+  }, [projects, activeProjectId, onSwitchProject, onOpenSettings, onOpenFiles, onOpenArtifacts, onNewChat, onClearChat, onOpenMemory, onToggleSidebar, onClose])
 
   const q = query.trim().toLowerCase()
   const filtered = useMemo(() => {
@@ -186,6 +292,10 @@ export function CommandPalette({ onClose, onSwitchProject, onOpenSettings, onOpe
 
   useEffect(() => {
     inputRef.current?.focus()
+    return () => {
+      const target = returnFocusRef.current
+      requestAnimationFrame(() => { if (target?.isConnected) target.focus() })
+    }
   }, [])
 
   // Keep selected item in view
@@ -196,15 +306,24 @@ export function CommandPalette({ onClose, onSwitchProject, onOpenSettings, onOpe
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.nativeEvent.isComposing || e.keyCode === 229) return
-    if (e.key === 'Escape') { e.preventDefault(); onClose(); return }
     if (e.key === 'ArrowDown') {
       e.preventDefault()
-      setSelected((s) => Math.min(s + 1, filtered.length - 1))
+      if (filtered.length > 0) setSelected((s) => Math.min(s + 1, filtered.length - 1))
       return
     }
     if (e.key === 'ArrowUp') {
       e.preventDefault()
-      setSelected((s) => Math.max(s - 1, 0))
+      if (filtered.length > 0) setSelected((s) => Math.max(s - 1, 0))
+      return
+    }
+    if (e.key === 'Home') {
+      e.preventDefault()
+      if (filtered.length > 0) setSelected(0)
+      return
+    }
+    if (e.key === 'End') {
+      e.preventDefault()
+      if (filtered.length > 0) setSelected(filtered.length - 1)
       return
     }
     if (e.key === 'Enter') {
@@ -221,10 +340,34 @@ export function CommandPalette({ onClose, onSwitchProject, onOpenSettings, onOpe
   return (
     <div className="palette-backdrop" onMouseDown={onClose}>
       <div
+        ref={paletteRef}
         className="palette"
         onMouseDown={(e) => e.stopPropagation()}
         role="dialog"
+        aria-modal="true"
         aria-label="Command palette"
+        onKeyDown={(event) => {
+          if (event.key === 'Escape') {
+            event.preventDefault()
+            event.stopPropagation()
+            onClose()
+            return
+          }
+          if (event.key !== 'Tab') return
+          const focusable = Array.from(paletteRef.current?.querySelectorAll<HTMLElement>(
+            'button:not([disabled]):not([tabindex="-1"]), input:not([disabled]):not([tabindex="-1"]), [tabindex]:not([tabindex="-1"])',
+          ) || [])
+          if (focusable.length === 0) return
+          const first = focusable[0]
+          const last = focusable[focusable.length - 1]
+          if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault()
+            last.focus()
+          } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault()
+            first.focus()
+          }
+        }}
       >
         <div className="palette-input-wrap">
           <Search size={14} className="palette-search-icon" />
@@ -236,10 +379,22 @@ export function CommandPalette({ onClose, onSwitchProject, onOpenSettings, onOpe
             onKeyDown={handleKeyDown}
             placeholder="Switch project, run action…"
             maxLength={200}
+            role="combobox"
+            aria-label="Search projects and actions"
+            aria-autocomplete="list"
+            aria-expanded="true"
+            aria-controls="command-palette-results"
+            aria-activedescendant={filtered.length > 0 ? `command-palette-option-${selected}` : undefined}
           />
           <span className="palette-esc">Esc</span>
         </div>
-        <div className="palette-list" ref={listRef}>
+        <div
+          id="command-palette-results"
+          className="palette-list"
+          ref={listRef}
+          role="listbox"
+          aria-label="Projects and actions"
+        >
           {filtered.length === 0 ? (
             <div className="palette-empty">No results</div>
           ) : (
@@ -247,13 +402,17 @@ export function CommandPalette({ onClose, onSwitchProject, onOpenSettings, onOpe
               const showGroup = a.group !== lastGroup
               lastGroup = a.group
               return (
-                <div key={a.id}>
-                  {showGroup && <div className="palette-group">{a.group}</div>}
+                <div key={a.id} role="presentation">
+                  {showGroup && <div className="palette-group" role="presentation">{a.group}</div>}
                   <button
+                    id={`command-palette-option-${idx}`}
                     data-idx={idx}
                     className={`palette-item ${selected === idx ? 'selected' : ''}`}
                     onMouseEnter={() => setSelected(idx)}
                     onClick={() => a.onSelect()}
+                    role="option"
+                    aria-selected={selected === idx}
+                    tabIndex={-1}
                   >
                     <span className="palette-item-icon">{a.icon}</span>
                     <span className="palette-item-label">{a.label}</span>
@@ -265,7 +424,7 @@ export function CommandPalette({ onClose, onSwitchProject, onOpenSettings, onOpe
           )}
         </div>
         <div className="palette-footer">
-          <span><kbd>↑↓</kbd> navigate</span>
+          <span><kbd>↑↓</kbd> <kbd>Home End</kbd> navigate</span>
           <span><kbd>↵</kbd> select</span>
           <span><kbd>Esc</kbd> close</span>
         </div>

@@ -65,13 +65,14 @@ func (l *EventLog) Log(level, source, message string) {
 		return
 	}
 	level = normalizeLogLevel(level)
+	source = truncateUTF8(source, 128)
 	// iter 870+: redact likely secrets BEFORE truncation so a key landing
 	// in the first 2 KB doesn't leak through. Applied to both frontend
 	// (ErrorBoundary/window.onerror/unhandledrejection) and backend
 	// (audit/save-failure) log entries.
 	message = sanitizeLogMessage(message)
 	if len(message) > 2048 {
-		message = message[:2048] + "…"
+		message = truncateUTF8(message, 2048) + "…"
 	}
 	nowMs := time.Now().UnixMilli()
 	key := level + "\x00" + source + "\x00" + message

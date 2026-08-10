@@ -259,6 +259,11 @@ func (fc *FallbackClient) WithModel(modelName string) Client {
 		logging.Debug("FallbackClient.WithModel: NewFallbackClient failed", "error", err)
 		return fc.clients[fc.current].WithModel(modelName)
 	}
+	// Preserve the provider selected by previous successful failover. Per-turn
+	// clones must not restart at an already unhealthy primary on every request.
+	if fc.current >= 0 && fc.current < len(newClients) {
+		fb.current = fc.current
+	}
 	return fb
 }
 

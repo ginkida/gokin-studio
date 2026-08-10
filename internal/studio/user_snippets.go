@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -34,16 +36,20 @@ type UserSnippet struct {
 }
 
 const (
-	UserSnippetNameMaxBytes = 30
-	UserSnippetBodyMaxBytes = 10 * 1024 // 10 KB matches a generous prompt body
+	UserSnippetNameMaxBytes  = 30
+	UserSnippetBodyMaxBytes  = 10 * 1024 // 10 KB matches a generous prompt body
+	UserSnippetsMaxCount     = 200
+	UserSnippetsFileMaxBytes = 3 << 20
 )
+
+var userSnippetsMu sync.Mutex
 
 func userSnippetsPath() string {
 	return filepath.Join(configDir(), "user_snippets.json")
 }
 
 func loadUserSnippets() ([]UserSnippet, error) {
-	data, err := os.ReadFile(userSnippetsPath())
+	data, err := readRegularFileLimited(userSnippetsPath(), UserSnippetsFileMaxBytes)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -57,10 +63,82 @@ func loadUserSnippets() ([]UserSnippet, error) {
 	if err := json.Unmarshal(data, &snips); err != nil {
 		return nil, fmt.Errorf("corrupt user_snippets.json: %w", err)
 	}
-	return snips, nil
+	// Load is lenient on purpose. Save-time validation below stays strict, but
+	// the set of reserved names grows between releases (this release added
+	// /btw, /sessions and friends), so a library saved by an older build can
+	// contain an entry that is only invalid now. Failing the whole file there
+	// would silently wipe every snippet the user ever wrote; drop just the
+	// entries that no longer qualify.
+	return usableUserSnippets(snips), nil
+}
+
+// usableUserSnippets keeps the entries that still satisfy the current rules,
+// preserving order and resolving ID/name collisions in favour of the first.
+func usableUserSnippets(snips []UserSnippet) []UserSnippet {
+	if len(snips) > UserSnippetsMaxCount {
+		snips = snips[:UserSnippetsMaxCount]
+	}
+	ids := make(map[string]struct{}, len(snips))
+	names := make(map[string]struct{}, len(snips))
+	kept := make([]UserSnippet, 0, len(snips))
+	for _, snippet := range snips {
+		if !validUserSnippet(snippet) {
+			continue
+		}
+		lname := strings.ToLower(snippet.Name)
+		if _, duplicate := ids[snippet.ID]; duplicate {
+			continue
+		}
+		if _, duplicate := names[lname]; duplicate {
+			continue
+		}
+		ids[snippet.ID] = struct{}{}
+		names[lname] = struct{}{}
+		kept = append(kept, snippet)
+	}
+	return kept
+}
+
+func validUserSnippet(snippet UserSnippet) bool {
+	validName := snippet.Name != "" && len(snippet.Name) <= UserSnippetNameMaxBytes && utf8.ValidString(snippet.Name)
+	for _, r := range snippet.Name {
+		validName = validName && validSnippetNameRune(r)
+	}
+	return snippet.ID != "" && len(snippet.ID) <= 128 && utf8.ValidString(snippet.ID) &&
+		validName && !isReservedSnippetName(snippet.Name) &&
+		strings.TrimSpace(snippet.Body) != "" && len(snippet.Body) <= UserSnippetBodyMaxBytes &&
+		utf8.ValidString(snippet.Body) && snippet.UpdatedAt >= 0
+}
+
+func validateUserSnippets(snips []UserSnippet) error {
+	if len(snips) > UserSnippetsMaxCount {
+		return fmt.Errorf("too many user snippets (%d, maximum %d)", len(snips), UserSnippetsMaxCount)
+	}
+	ids := make(map[string]struct{}, len(snips))
+	names := make(map[string]struct{}, len(snips))
+	for i, snippet := range snips {
+		if !validUserSnippet(snippet) {
+			return fmt.Errorf("corrupt user_snippets.json: invalid snippet at index %d", i)
+		}
+		lname := strings.ToLower(snippet.Name)
+		if _, duplicate := ids[snippet.ID]; duplicate {
+			return fmt.Errorf("corrupt user_snippets.json: duplicate ID %q", snippet.ID)
+		}
+		if _, duplicate := names[lname]; duplicate {
+			return fmt.Errorf("corrupt user_snippets.json: duplicate name %q", snippet.Name)
+		}
+		ids[snippet.ID] = struct{}{}
+		names[lname] = struct{}{}
+	}
+	return nil
 }
 
 func saveUserSnippets(snips []UserSnippet) error {
+	// Strict on the way out: loading tolerates entries an older build wrote,
+	// but nothing invalid may be written back.
+	if err := validateUserSnippets(snips); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(configDir(), 0o700); err != nil {
 		return err
 	}
@@ -75,6 +153,9 @@ func saveUserSnippets(snips []UserSnippet) error {
 	if err != nil {
 		return err
 	}
+	if len(data) > UserSnippetsFileMaxBytes {
+		return fmt.Errorf("user snippets file would exceed %d bytes", UserSnippetsFileMaxBytes)
+	}
 	return atomicWriteFile(userSnippetsPath(), data, 0o600)
 }
 
@@ -88,6 +169,16 @@ func validSnippetNameRune(r rune) bool {
 		r == '-' || r == '_'
 }
 
+func isReservedSnippetName(name string) bool {
+	switch strings.ToLower(name) {
+	case "btw", "clear", "export", "exportall", "summarize", "system", "search", "memory", "budget",
+		"sessions", "exportjson", "importsession", "help":
+		return true
+	default:
+		return false
+	}
+}
+
 // SaveUserSnippet persists a new snippet OR updates one with the same Name
 // (case-insensitive). Returns the snippet's ID.
 //
@@ -99,6 +190,9 @@ func validSnippetNameRune(r rune) bool {
 //     reserved — refusing them prevents the user from accidentally shadowing
 //     a built-in
 func (s *Studio) SaveUserSnippet(name, body string) (string, error) {
+	if !utf8.ValidString(name) || !utf8.ValidString(body) {
+		return "", fmt.Errorf("snippet fields must be valid UTF-8")
+	}
 	name = strings.TrimSpace(name)
 	name = strings.TrimPrefix(name, "/")
 	if name == "" {
@@ -114,12 +208,7 @@ func (s *Studio) SaveUserSnippet(name, body string) (string, error) {
 	}
 	// Reserve names that conflict with built-in slash commands. Keep this in
 	// sync with the SLASH_COMMANDS array in ChatPanel.tsx.
-	reserved := map[string]bool{
-		"clear": true, "export": true, "exportall": true,
-		"summarize": true, "system": true, "search": true,
-		"memory": true, "budget": true, "help": true,
-	}
-	if reserved[strings.ToLower(name)] {
+	if isReservedSnippetName(name) {
 		return "", fmt.Errorf("%q is a built-in command name and cannot be used as a snippet", name)
 	}
 	body = strings.TrimRight(body, " \t\r\n")
@@ -127,9 +216,11 @@ func (s *Studio) SaveUserSnippet(name, body string) (string, error) {
 		return "", fmt.Errorf("snippet body cannot be empty")
 	}
 	if len(body) > UserSnippetBodyMaxBytes {
-		body = body[:UserSnippetBodyMaxBytes]
+		body = truncateUTF8(body, UserSnippetBodyMaxBytes)
 	}
 
+	userSnippetsMu.Lock()
+	defer userSnippetsMu.Unlock()
 	snips, err := loadUserSnippets()
 	if err != nil {
 		return "", err
@@ -150,6 +241,9 @@ func (s *Studio) SaveUserSnippet(name, body string) (string, error) {
 		}
 	}
 
+	if len(snips) >= UserSnippetsMaxCount {
+		return "", fmt.Errorf("user snippet limit reached (%d)", UserSnippetsMaxCount)
+	}
 	newS := UserSnippet{
 		ID:        uuid.New().String()[:12],
 		Name:      name,
@@ -169,6 +263,8 @@ func (s *Studio) DeleteUserSnippet(id string) error {
 	if id == "" {
 		return fmt.Errorf("id cannot be empty")
 	}
+	userSnippetsMu.Lock()
+	defer userSnippetsMu.Unlock()
 	snips, err := loadUserSnippets()
 	if err != nil {
 		return err
@@ -188,6 +284,8 @@ func (s *Studio) DeleteUserSnippet(id string) error {
 // edited"). Returns an empty slice rather than nil for easy frontend
 // handling.
 func (s *Studio) ListUserSnippets() ([]UserSnippet, error) {
+	userSnippetsMu.Lock()
+	defer userSnippetsMu.Unlock()
 	snips, err := loadUserSnippets()
 	if err != nil {
 		return nil, err

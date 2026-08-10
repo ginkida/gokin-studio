@@ -3,7 +3,6 @@ package tools
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"strings"
 
 	"google.golang.org/genai"
@@ -97,8 +96,7 @@ func (t *GitAddTool) Execute(ctx context.Context, args map[string]any) (ToolResu
 		}
 	}
 
-	cmd := exec.CommandContext(ctx, "git", cmdArgs...)
-	cmd.Dir = t.workDir
+	cmd := newGitCommand(ctx, t.workDir, cmdArgs...)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -106,8 +104,7 @@ func (t *GitAddTool) Execute(ctx context.Context, args map[string]any) (ToolResu
 	}
 
 	// Get status after add to show what was staged
-	statusCmd := exec.CommandContext(ctx, "git", "status", "--short")
-	statusCmd.Dir = t.workDir
+	statusCmd := newGitCommand(ctx, t.workDir, "status", "--short")
 	statusOutput, _ := statusCmd.Output()
 
 	result := "Files staged for commit."

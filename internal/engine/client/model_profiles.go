@@ -2,7 +2,7 @@ package client
 
 import "strings"
 
-// ModelProfile contains metadata about an Ollama model family.
+// ModelProfile contains metadata about a model family.
 type ModelProfile struct {
 	Family        string // e.g., "llama", "qwen", "mistral", "phi", "codellama"
 	ContextWindow int    // approximate context window size
@@ -64,24 +64,27 @@ var knownModelProfiles = map[string]ModelProfile{
 	"deepseek-chat":     {Family: "deepseek", ContextWindow: 64000, SupportsTools: true, IsCoding: true},
 	"deepseek-reasoner": {Family: "deepseek", ContextWindow: 64000, SupportsTools: true, IsCoding: true},
 
-	// GLM family — context windows verified via Z.AI API (Jun 2026)
-	"glm-5.2":     {Family: "glm", ContextWindow: 1000000, SupportsTools: true, IsCoding: true}, // 1M context
+	// GLM family — context windows verified via Z.AI API (Jul 2026)
+	"glm-5.2":     {Family: "glm", ContextWindow: 1000000, SupportsTools: true, IsCoding: true},
 	"glm-5.1":     {Family: "glm", ContextWindow: 200000, SupportsTools: true, IsCoding: true},
 	"glm-5":       {Family: "glm", ContextWindow: 200000, SupportsTools: true, IsCoding: true},
 	"glm-5-turbo": {Family: "glm", ContextWindow: 200000, SupportsTools: true, IsCoding: true},
-	"glm-4.7":     {Family: "glm", ContextWindow: 128000, SupportsTools: true, IsCoding: true},
+	"glm-4.7":     {Family: "glm", ContextWindow: 200000, SupportsTools: true, IsCoding: true},
 	"glm-4.6":     {Family: "glm", ContextWindow: 128000, SupportsTools: true, IsCoding: true},
 	"glm-4.5":     {Family: "glm", ContextWindow: 128000, SupportsTools: true},
 	"glm-4.5-air": {Family: "glm", ContextWindow: 128000, SupportsTools: true},
 	"glm-4":       {Family: "glm", ContextWindow: 128000, SupportsTools: true},
 	"glm":         {Family: "glm", ContextWindow: 128000, SupportsTools: true},
 
-	// Kimi / Moonshot family
-	"kimi-for-coding": {Family: "kimi", ContextWindow: 262144, SupportsTools: true, IsCoding: true},
-	"kimi-k2.5":       {Family: "kimi", ContextWindow: 256000, SupportsTools: true, IsCoding: true},
-	"kimi-k2":         {Family: "kimi", ContextWindow: 256000, SupportsTools: true, IsCoding: true},
-	"kimi":            {Family: "kimi", ContextWindow: 128000, SupportsTools: true},
-	"moonshot":        {Family: "kimi", ContextWindow: 128000, SupportsTools: true},
+	// Kimi Code family
+	"kimi-for-coding-highspeed": {Family: "kimi", ContextWindow: 262144, SupportsTools: true, IsCoding: true},
+	"kimi-for-coding":           {Family: "kimi", ContextWindow: 262144, SupportsTools: true, IsCoding: true},
+	"k3-256k":                   {Family: "kimi", ContextWindow: 262144, SupportsTools: true, IsCoding: true},
+	"k3":                        {Family: "kimi", ContextWindow: 1048576, SupportsTools: true, IsCoding: true},
+	"kimi-k2.5":                 {Family: "kimi", ContextWindow: 256000, SupportsTools: true, IsCoding: true},
+	"kimi-k2":                   {Family: "kimi", ContextWindow: 256000, SupportsTools: true, IsCoding: true},
+	"kimi":                      {Family: "kimi", ContextWindow: 128000, SupportsTools: true},
+	"moonshot":                  {Family: "kimi", ContextWindow: 128000, SupportsTools: true},
 
 	// Gemini family
 	"gemini-3.1-pro":   {Family: "gemini", ContextWindow: 1000000, SupportsTools: true, IsCoding: true},

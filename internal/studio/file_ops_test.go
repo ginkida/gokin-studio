@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // TestListDirectory_UnknownProject verifies that an unknown project ID returns
@@ -242,6 +243,162 @@ func TestReadFileContent_MissingFile(t *testing.T) {
 
 	if _, err := s.ReadFileContent(info.ID, "does-not-exist.txt"); err == nil {
 		t.Error("expected error for missing file, got nil")
+	}
+}
+
+func TestReadFileContentRejectsSymlinkEscape(t *testing.T) {
+	s := newStudioForTest(t)
+	root := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("must stay outside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "escape.txt")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	info, err := s.AddProject("Symlink", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content, err := s.ReadFileContent(info.ID, "escape.txt"); err == nil {
+		t.Fatalf("symlink escape read outside content %q", content)
+	}
+}
+
+func TestListDirectoryRejectsSymlinkEscapeButAllowsInternalRelativeLink(t *testing.T) {
+	s := newStudioForTest(t)
+	root := t.TempDir()
+	realDir := filepath.Join(root, "real")
+	if err := os.Mkdir(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realDir, "inside.txt"), []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("real", filepath.Join(root, "internal")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(root, "outside")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	info, err := s.AddProject("Symlink dirs", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := s.ListDirectory(info.ID, "internal")
+	if err != nil || len(entries) != 1 || entries[0].Name != "inside.txt" {
+		t.Fatalf("safe relative symlink listing = %#v, %v", entries, err)
+	}
+	if _, err := s.ListDirectory(info.ID, "outside"); err == nil {
+		t.Fatal("directory symlink escaped project root")
+	}
+	rootEntries, err := s.ListDirectory(info.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundInternal := false
+	for _, entry := range rootEntries {
+		if entry.Name == "outside" {
+			t.Fatal("outward symlink leaked into project tree")
+		}
+		if entry.Name == "internal" {
+			foundInternal = entry.IsDir
+		}
+	}
+	if !foundInternal {
+		t.Fatal("safe internal directory symlink was not exposed as a directory")
+	}
+}
+
+func TestReadFileContentRejectsBinaryAndDirectory(t *testing.T) {
+	s := newStudioForTest(t)
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "binary.dat"), []byte{'a', 0, 'b'}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := s.AddProject("Binary", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReadFileContent(info.ID, "binary.dat"); err == nil {
+		t.Fatal("binary file accepted as text")
+	}
+	if _, err := s.ReadFileContent(info.ID, "."); err == nil {
+		t.Fatal("directory accepted as a regular file")
+	}
+}
+
+func TestReadFileContentTruncatesOnUTF8Boundary(t *testing.T) {
+	s := newStudioForTest(t)
+	root := t.TempDir()
+	data := []byte(strings.Repeat("x", projectFilePreviewMaxBytes-1) + "€tail")
+	if err := os.WriteFile(filepath.Join(root, "unicode.txt"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := s.AddProject("UTF8", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := s.ReadFileContent(info.ID, "unicode.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !utf8.ValidString(content) || !strings.Contains(content, "[truncated at 100KB]") {
+		t.Fatalf("truncated preview is invalid or unmarked")
+	}
+}
+
+func TestProjectPathRejectsAbsoluteAndNUL(t *testing.T) {
+	s := newStudioForTest(t)
+	info := addTestProject(t, s, "Paths")
+	for _, path := range []string{string(filepath.Separator) + "etc", "bad\x00path"} {
+		if _, err := s.ReadFileContent(info.ID, path); err == nil {
+			t.Fatalf("unsafe path %q accepted", path)
+		}
+	}
+}
+
+func TestListDirectoryEmptyDirectoryReturnsEmptySlice(t *testing.T) {
+	s := newStudioForTest(t)
+	info := addTestProject(t, s, "Empty")
+	entries, err := s.ListDirectory(info.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("empty directory returned entries: %#v", entries)
+	}
+}
+
+func TestReadProjectRegularFileAnchorsRelativeAndAbsolutePaths(t *testing.T) {
+	root := t.TempDir()
+	inside := filepath.Join(root, "src", "main.go")
+	if err := os.MkdirAll(filepath.Dir(inside), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(inside, []byte("package main"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{filepath.Join("src", "main.go"), inside} {
+		data, resolved, err := readProjectRegularFile(root, path, 1024)
+		if err != nil || string(data) != "package main" || resolved != inside {
+			t.Fatalf("readProjectRegularFile(%q) = %q, %q, %v", path, data, resolved, err)
+		}
+	}
+	outside := filepath.Join(t.TempDir(), "outside.go")
+	if err := os.WriteFile(outside, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := readProjectRegularFile(root, outside, 1024); err == nil {
+		t.Fatal("absolute path outside project was accepted")
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "escape.go")); err == nil {
+		if _, _, err := readProjectRegularFile(root, "escape.go", 1024); err == nil {
+			t.Fatal("validator read escaped through symlink")
+		}
+	}
+	if _, _, err := readProjectRegularFile(root, filepath.Join("src", "main.go"), 4); err == nil {
+		t.Fatal("validator read ignored byte limit")
 	}
 }
 

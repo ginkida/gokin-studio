@@ -38,6 +38,19 @@ func diffSettings(oldS, newS Settings) []settingsAuditEntry {
 			Message: fmt.Sprintf("default model: %q → %q", oldS.DefaultModel, newS.DefaultModel),
 		})
 	}
+	if oldS.GlobalInstructions != newS.GlobalInstructions {
+		state := "updated"
+		switch {
+		case oldS.GlobalInstructions == "":
+			state = "set"
+		case newS.GlobalInstructions == "":
+			state = "cleared"
+		}
+		out = append(out, settingsAuditEntry{
+			Field:   "globalInstructions",
+			Message: fmt.Sprintf("global instructions: %s (%d chars, content not logged)", state, len([]rune(newS.GlobalInstructions))),
+		})
+	}
 	// API keys: never log the value itself. Just "set"/"cleared".
 	for _, k := range []struct {
 		name     string
@@ -45,9 +58,7 @@ func diffSettings(oldS, newS Settings) []settingsAuditEntry {
 		newValue string
 	}{
 		{"GLM API key", oldS.GLMKey, newS.GLMKey},
-		{"MiniMax API key", oldS.MiniMaxKey, newS.MiniMaxKey},
 		{"Kimi API key", oldS.KimiKey, newS.KimiKey},
-		{"DeepSeek API key", oldS.DeepSeekKey, newS.DeepSeekKey},
 	} {
 		// Compare presence, not value — replacing a key with another key is
 		// reported as "updated" (we don't reveal whether they're identical).
@@ -79,14 +90,6 @@ func diffSettings(oldS, newS Settings) []settingsAuditEntry {
 			})
 		}
 	}
-	if oldS.OllamaURL != newS.OllamaURL {
-		// Ollama URL is not a secret — it's a localhost/network endpoint
-		// the user controls. Log the value for debugging.
-		out = append(out, settingsAuditEntry{
-			Field:   "ollamaUrl",
-			Message: fmt.Sprintf("Ollama URL: %q → %q", oldS.OllamaURL, newS.OllamaURL),
-		})
-	}
 	if oldS.DefaultThinkingMode != newS.DefaultThinkingMode {
 		out = append(out, settingsAuditEntry{
 			Field:   "defaultThinkingMode",
@@ -113,6 +116,68 @@ func diffSettings(oldS, newS Settings) []settingsAuditEntry {
 		out = append(out, settingsAuditEntry{
 			Field:   "autoCleanupDisabled",
 			Message: fmt.Sprintf("auto-cleanup on startup: %s", state),
+		})
+	}
+	if oldS.QuickEntryEnabled != newS.QuickEntryEnabled {
+		state := "disabled"
+		if newS.QuickEntryEnabled {
+			state = "enabled"
+		}
+		out = append(out, settingsAuditEntry{
+			Field:   "quickEntryEnabled",
+			Message: fmt.Sprintf("Quick Entry global shortcut: %s", state),
+		})
+	}
+	if oldS.QuickEntryShortcut != newS.QuickEntryShortcut {
+		out = append(out, settingsAuditEntry{
+			Field:   "quickEntryShortcut",
+			Message: fmt.Sprintf("Quick Entry shortcut: %q → %q", oldS.QuickEntryShortcut, newS.QuickEntryShortcut),
+		})
+	}
+	if oldS.VoiceShortcutEnabled != newS.VoiceShortcutEnabled {
+		state := "disabled"
+		if newS.VoiceShortcutEnabled {
+			state = "enabled"
+		}
+		out = append(out, settingsAuditEntry{
+			Field:   "voiceShortcutEnabled",
+			Message: "Global voice shortcut " + state,
+		})
+	}
+	if oldS.VoiceShortcut != newS.VoiceShortcut {
+		out = append(out, settingsAuditEntry{
+			Field:   "voiceShortcut",
+			Message: fmt.Sprintf("Voice shortcut: %q → %q", oldS.VoiceShortcut, newS.VoiceShortcut),
+		})
+	}
+	if oldS.KeepAwakeEnabled != newS.KeepAwakeEnabled {
+		state := "disabled"
+		if newS.KeepAwakeEnabled {
+			state = "enabled"
+		}
+		out = append(out, settingsAuditEntry{
+			Field:   "keepAwakeEnabled",
+			Message: fmt.Sprintf("keep awake for active and scheduled tasks: %s", state),
+		})
+	}
+	if oldS.AutoUpdateCheckDisabled != newS.AutoUpdateCheckDisabled {
+		state := "enabled"
+		if newS.AutoUpdateCheckDisabled {
+			state = "disabled"
+		}
+		out = append(out, settingsAuditEntry{
+			Field:   "autoUpdateCheckDisabled",
+			Message: fmt.Sprintf("automatic release checks: %s", state),
+		})
+	}
+	if oldS.AutoArchivePRAfterClose != newS.AutoArchivePRAfterClose {
+		state := "disabled"
+		if newS.AutoArchivePRAfterClose {
+			state = "enabled"
+		}
+		out = append(out, settingsAuditEntry{
+			Field:   "autoArchivePRAfterClose",
+			Message: fmt.Sprintf("auto-archive chats after pull request merge or close: %s", state),
 		})
 	}
 	return out

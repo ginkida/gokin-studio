@@ -20,7 +20,7 @@ import (
 // user explicitly drags them).
 
 func sessionOrderPath(projectID string) string {
-	return filepath.Join(configDir(), "session-order", projectID+".json")
+	return filepath.Join(configDir(), "session-order", safeStorageKey(projectID)+".json")
 }
 
 // loadSessionOrder reads the on-disk session order for a project. Returns
@@ -32,7 +32,7 @@ func loadSessionOrder(projectID string) ([]string, error) {
 	if projectID == "" {
 		return []string{}, nil
 	}
-	data, err := os.ReadFile(sessionOrderPath(projectID))
+	data, err := readRegularFileLimited(sessionOrderPath(projectID), 256<<10)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return []string{}, nil

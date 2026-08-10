@@ -1,6 +1,7 @@
 package studio
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -130,6 +131,37 @@ func TestCompactHistory_EmptyHistory(t *testing.T) {
 	}
 	if out := compactHistory([]*genai.Content{}, 128000); len(out) != 0 {
 		t.Errorf("compactHistory([]) len = %d, want 0", len(out))
+	}
+}
+
+func TestEmergencyCompactHistory_KeepsNewestExchange(t *testing.T) {
+	var history []*genai.Content
+	for i := 0; i < 8; i++ {
+		history = append(history,
+			genai.NewContentFromText(fmt.Sprintf("request-%d", i), genai.RoleUser),
+			genai.NewContentFromText(strings.Repeat("answer ", 100), genai.RoleModel),
+		)
+	}
+	got, dropped, target := emergencyCompactHistory(history, 1048576)
+	if dropped <= 0 || len(got) >= len(history) {
+		t.Fatalf("emergency compaction did not shrink: dropped=%d before=%d after=%d", dropped, len(history), len(got))
+	}
+	if target != 131072 {
+		t.Fatalf("target = %d, want 131072", target)
+	}
+	lastText := got[len(got)-1].Parts[0].Text
+	if !strings.Contains(lastText, "answer") {
+		t.Fatalf("newest exchange was not preserved: %q", lastText)
+	}
+}
+
+func TestEmergencyCompactHistory_DoesNotDropOnlyCurrentExchange(t *testing.T) {
+	history := []*genai.Content{
+		genai.NewContentFromText("current request", genai.RoleUser),
+	}
+	got, dropped, _ := emergencyCompactHistory(history, 262144)
+	if dropped != 0 || len(got) != 1 || got[0] != history[0] {
+		t.Fatalf("single exchange changed: dropped=%d got=%#v", dropped, got)
 	}
 }
 

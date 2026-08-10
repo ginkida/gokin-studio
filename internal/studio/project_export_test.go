@@ -218,6 +218,54 @@ func TestImportProjectJSON_FreshDefaults(t *testing.T) {
 	}
 }
 
+// TestImportProjectJSON_ProviderBoundary ensures an old export cannot bypass
+// the GLM/Kimi-only runtime contract. Unsupported providers keep the fresh
+// project's safe GLM default, while a valid K3 selection is preserved.
+func TestImportProjectJSON_ProviderBoundary(t *testing.T) {
+	s := newStudioForTest(t)
+	// Make the creation-time default Kimi so the test proves import migration
+	// is based on the source provider, not whichever default happens to be set.
+	s.mu.Lock()
+	s.config.Settings.DefaultProvider = "kimi"
+	s.config.Settings.DefaultModel = "k3"
+	s.mu.Unlock()
+
+	legacy, err := s.ImportProjectJSON(
+		`{"version":1,"name":"Legacy","provider":"deepseek","model":"deepseek-v4-pro","sessions":[]}`,
+		t.TempDir(),
+	)
+	if err != nil {
+		t.Fatalf("import legacy project: %v", err)
+	}
+	if legacy.Provider != defaultStudioProvider || legacy.Model != defaultStudioModel {
+		t.Errorf("legacy provider escaped boundary: got %s/%s, want %s/%s",
+			legacy.Provider, legacy.Model, defaultStudioProvider, defaultStudioModel)
+	}
+
+	legacyGLM, err := s.ImportProjectJSON(
+		`{"version":1,"name":"Old GLM","provider":"glm","model":"glm-4-flash","sessions":[]}`,
+		t.TempDir(),
+	)
+	if err != nil {
+		t.Fatalf("import legacy GLM project: %v", err)
+	}
+	if legacyGLM.Provider != "glm" || legacyGLM.Model != defaultModelForProvider("glm") {
+		t.Errorf("legacy GLM did not stay on GLM: got %s/%s, want glm/%s",
+			legacyGLM.Provider, legacyGLM.Model, defaultModelForProvider("glm"))
+	}
+
+	k3, err := s.ImportProjectJSON(
+		`{"version":1,"name":"K3","provider":"kimi","model":"k3","sessions":[]}`,
+		t.TempDir(),
+	)
+	if err != nil {
+		t.Fatalf("import K3 project: %v", err)
+	}
+	if k3.Provider != "kimi" || k3.Model != "k3" {
+		t.Errorf("valid K3 selection was not preserved: got %s/%s", k3.Provider, k3.Model)
+	}
+}
+
 // TestImportProjectJSON_DeletesDefaultAfterImport pins down the iter 590+
 // fix: after importing real sessions, the empty default is removed.
 func TestImportProjectJSON_DeletesDefaultAfterImport(t *testing.T) {

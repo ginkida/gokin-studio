@@ -1,6 +1,7 @@
 package studio
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/ginkida/gokin-studio/internal/engine/memory"
@@ -161,5 +162,110 @@ func TestDeleteMemoryEntry_Success(t *testing.T) {
 	}
 	if len(infos) != 0 {
 		t.Errorf("expected 0 entries after delete, got %d", len(infos))
+	}
+}
+
+func TestUpdateMemoryEntryPreservesIdentityAndMetadata(t *testing.T) {
+	s := newStudioForTest(t)
+	p := NewProject(ProjectConfig{ID: "pid-editok", Name: "P", Directory: t.TempDir()})
+	p.studio = s
+	s.projects[p.ID] = p
+
+	store := newMemStore(t)
+	p.mu.Lock()
+	p.memoryStore = store
+	p.mu.Unlock()
+
+	entry := memory.NewEntry("use package oldname", memory.MemoryProject).WithKey("convention").WithTags([]string{"manual-tag"})
+	entry.Reinforcement = 3
+	if err := store.Add(entry); err != nil {
+		t.Fatal(err)
+	}
+	before, ok := store.GetByID(entry.ID)
+	if !ok {
+		t.Fatal("entry missing before update")
+	}
+
+	updated, err := s.UpdateMemoryEntry(p.ID, entry.ID, "use package newname")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.ID != before.ID || updated.Key != before.Key || updated.Type != string(before.Type) ||
+		updated.Timestamp != before.Timestamp.UnixMilli() || updated.Reinforcement != before.Reinforcement {
+		t.Fatalf("metadata changed: before=%#v after=%#v", before, updated)
+	}
+	if updated.Content != "use package newname" {
+		t.Fatalf("content = %q", updated.Content)
+	}
+	if len(updated.Tags) != 1 || updated.Tags[0] != "newname" {
+		t.Fatalf("automatic tags were not rebuilt: %#v", updated.Tags)
+	}
+}
+
+func TestUpdateMemoryEntryValidatesBeforeMutation(t *testing.T) {
+	s := newStudioForTest(t)
+	p := NewProject(ProjectConfig{ID: "pid-editvalidation", Name: "P", Directory: t.TempDir()})
+	p.studio = s
+	s.projects[p.ID] = p
+	store := newMemStore(t)
+	p.mu.Lock()
+	p.memoryStore = store
+	p.mu.Unlock()
+	entry := memory.NewEntry("original", memory.MemoryProject)
+	if err := store.Add(entry); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, content := range map[string]string{
+		"blank":    " \n\t",
+		"NUL":      "unsafe\x00content",
+		"oversize": strings.Repeat("x", MemoryContentMaxBytes+1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := s.UpdateMemoryEntry(p.ID, entry.ID, content); err == nil {
+				t.Fatal("invalid memory content accepted")
+			}
+			got, ok := store.GetByID(entry.ID)
+			if !ok || got.Content != "original" {
+				t.Fatalf("entry mutated after rejection: %#v", got)
+			}
+		})
+	}
+	if _, err := s.UpdateMemoryEntry(p.ID, strings.Repeat("i", MemoryEntryIDMaxBytes+1), "valid"); err == nil {
+		t.Fatal("oversized memory ID accepted")
+	}
+	if _, err := s.UpdateMemoryEntry(p.ID, "missing", "valid"); err == nil {
+		t.Fatal("missing memory entry accepted")
+	}
+}
+
+func TestUpdateMemoryEntryPersistsImmediately(t *testing.T) {
+	configDir := t.TempDir()
+	projectDir := t.TempDir()
+	store, err := memory.NewStore(configDir, projectDir, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := memory.NewEntry("before restart", memory.MemoryProject)
+	if err := store.Add(entry); err != nil {
+		t.Fatal(err)
+	}
+
+	s := newStudioForTest(t)
+	p := NewProject(ProjectConfig{ID: "pid-editpersist", Name: "P", Directory: projectDir})
+	p.studio = s
+	p.memoryStore = store
+	s.projects[p.ID] = p
+	if _, err := s.UpdateMemoryEntry(p.ID, entry.ID, "after restart"); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded, err := memory.NewStore(configDir, projectDir, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := reloaded.GetByID(entry.ID)
+	if !ok || got.Content != "after restart" {
+		t.Fatalf("reloaded entry = %#v, found=%v", got, ok)
 	}
 }

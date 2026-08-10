@@ -50,10 +50,9 @@ func TestIsReadOnlyForPlanMode(t *testing.T) {
 		"read", "glob", "grep", "list_dir", "tree", "diff",
 		"web_fetch", "web_search",
 		"env", "tools_list",
-		"git_status", "git_diff", "git_log", "git_blame", "git_branch",
-		"ask_user", "todo", "task_output", "get_plan_status",
-		"memory", "history_search", "pin_context",
-		"enter_plan_mode", "exit_plan_mode", "update_plan_progress",
+		"git_status", "git_diff", "git_log", "git_blame",
+		"ask_user", "task_output", "get_plan_status",
+		"history_search", "plugin_resource",
 	}
 	for _, name := range allowed {
 		if !IsReadOnlyForPlanMode(name) {
@@ -66,6 +65,8 @@ func TestIsReadOnlyForPlanMode(t *testing.T) {
 		"write", "edit", "delete", "move", "copy", "mkdir",
 		"bash", "ssh", "kill_shell", "run_tests",
 		"git_add", "git_commit", "git_pr",
+		"git_branch", "todo", "memory", "pin_context",
+		"enter_plan_mode", "exit_plan_mode", "update_plan_progress",
 		"ask_agent", "coordinate", "shared_memory", "update_scratchpad",
 		"request_tool", "task", "task_stop",
 		"memorize", "batch", "refactor", "verify_code", "check_impact",
@@ -95,7 +96,7 @@ func TestPlanModeDeclarations_FiltersRegistry(t *testing.T) {
 	reg.MustRegister(stubTool{name: "edit"})
 	reg.MustRegister(stubTool{name: "bash"})
 	reg.MustRegister(stubTool{name: "grep"})
-	reg.MustRegister(stubTool{name: "enter_plan_mode"})
+	reg.MustRegister(stubTool{name: "get_plan_status"})
 
 	fullNames := namesFromDeclarations(reg.Declarations())
 	if !containsToolName(fullNames, "write") || !containsToolName(fullNames, "read") {
@@ -103,7 +104,7 @@ func TestPlanModeDeclarations_FiltersRegistry(t *testing.T) {
 	}
 
 	planNames := namesFromDeclarations(reg.PlanModeDeclarations())
-	wantAllowed := []string{"read", "grep", "enter_plan_mode"}
+	wantAllowed := []string{"read", "grep", "get_plan_status"}
 	wantBlocked := []string{"write", "edit", "bash"}
 
 	for _, name := range wantAllowed {

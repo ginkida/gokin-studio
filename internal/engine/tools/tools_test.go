@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ginkida/gokin-studio/internal/engine/memory"
 	"github.com/ginkida/gokin-studio/internal/engine/plan"
@@ -112,6 +113,111 @@ func TestPinContext_ClearFlag(t *testing.T) {
 	}
 }
 
+func TestPinContext_ClearFlagIgnoresStaleOversizedContent(t *testing.T) {
+	dir := t.TempDir()
+	pinned := "existing"
+	tool := NewPinContextTool(func(c string) { pinned = c })
+	tool.SetWorkDir(dir)
+	if err := tool.Validate(map[string]any{
+		"content": strings.Repeat("x", MaxPinnedContextBytes+1),
+		"clear":   true,
+	}); err != nil {
+		t.Fatalf("clear request rejected by stale content: %v", err)
+	}
+	result, err := tool.Execute(context.Background(), map[string]any{
+		"content": strings.Repeat("x", MaxPinnedContextBytes+1),
+		"clear":   true,
+	})
+	if err != nil || !result.Success || pinned != "" {
+		t.Fatalf("clear result=%#v err=%v pinned=%q", result, err, pinned)
+	}
+}
+
+func TestPinContext_PersistFailureDoesNotChangeMemory(t *testing.T) {
+	dir := t.TempDir()
+	blockedWorkDir := filepath.Join(dir, "not-a-directory")
+	if err := os.WriteFile(blockedWorkDir, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	pinned := "previous value"
+	tool := NewPinContextTool(func(c string) { pinned = c })
+	tool.SetWorkDir(blockedWorkDir)
+	result, err := tool.Execute(context.Background(), map[string]any{"content": "new value"})
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if result.Success || !strings.Contains(result.Error, "failed to persist") {
+		t.Fatalf("expected persistence failure, got %#v", result)
+	}
+	if pinned != "previous value" {
+		t.Fatalf("memory changed despite persistence failure: %q", pinned)
+	}
+}
+
+func TestPinContext_ClearFailureDoesNotChangeMemory(t *testing.T) {
+	dir := t.TempDir()
+	pinPath := filepath.Join(dir, ".gokin", "pinned_context.md")
+	if err := os.MkdirAll(filepath.Join(pinPath, "child"), 0750); err != nil {
+		t.Fatal(err)
+	}
+
+	pinned := "keep me"
+	tool := NewPinContextTool(func(c string) { pinned = c })
+	tool.SetWorkDir(dir)
+	result, err := tool.Execute(context.Background(), map[string]any{"content": "", "clear": true})
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if result.Success || !strings.Contains(result.Error, "failed to clear") {
+		t.Fatalf("expected clear failure, got %#v", result)
+	}
+	if pinned != "keep me" {
+		t.Fatalf("memory changed despite clear failure: %q", pinned)
+	}
+}
+
+func TestPinContext_HonorsCancellationBeforeMutation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	called := false
+	tool := NewPinContextTool(func(string) { called = true })
+	tool.SetWorkDir(t.TempDir())
+
+	result, err := tool.Execute(ctx, map[string]any{"content": "must not persist"})
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if result.Success || !strings.Contains(result.Error, "cancelled") {
+		t.Fatalf("expected cancellation result, got %#v", result)
+	}
+	if called {
+		t.Fatal("updater called for a cancelled operation")
+	}
+}
+
+func TestPinContext_PersistsPrivatelyAndReturnsValidUTF8(t *testing.T) {
+	dir := t.TempDir()
+	content := strings.Repeat("🙂", 121)
+	tool := NewPinContextTool(func(string) {})
+	tool.SetWorkDir(dir)
+
+	result, err := tool.Execute(context.Background(), map[string]any{"content": content})
+	if err != nil || !result.Success {
+		t.Fatalf("Execute() = %#v, %v", result, err)
+	}
+	if !utf8.ValidString(result.Content) {
+		t.Fatalf("success preview is invalid UTF-8: %q", result.Content)
+	}
+	info, err := os.Stat(filepath.Join(dir, ".gokin", "pinned_context.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0600 {
+		t.Fatalf("pin permissions = %#o, want 0600", got)
+	}
+}
+
 func TestPinContext_NilUpdater(t *testing.T) {
 	tool := NewPinContextTool(nil)
 	result, err := tool.Execute(context.Background(), map[string]any{"content": "note"})
@@ -148,6 +254,73 @@ func TestPinContext_LoadPersistedPin_NoFile(t *testing.T) {
 	if called {
 		t.Error("updater should not be called when no pin file exists")
 	}
+}
+
+func TestPinContext_RejectsOversizedContentWithoutMutation(t *testing.T) {
+	dir := t.TempDir()
+	called := false
+	tool := NewPinContextTool(func(string) { called = true })
+	tool.SetWorkDir(dir)
+	content := strings.Repeat("x", MaxPinnedContextBytes+1)
+
+	if err := tool.Validate(map[string]any{"content": content}); err == nil {
+		t.Fatal("Validate accepted oversized pinned context")
+	}
+	result, err := tool.Execute(context.Background(), map[string]any{"content": content})
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if result.Success || !strings.Contains(result.Error, "too large") {
+		t.Fatalf("expected size error, got %#v", result)
+	}
+	if called {
+		t.Fatal("updater called for oversized pinned context")
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".gokin", "pinned_context.md")); !os.IsNotExist(err) {
+		t.Fatalf("oversized pin was persisted: %v", err)
+	}
+}
+
+func TestPinContext_DoesNotRestoreOversizedOrSymlinkedFile(t *testing.T) {
+	t.Run("oversized", func(t *testing.T) {
+		dir := t.TempDir()
+		pinPath := filepath.Join(dir, ".gokin", "pinned_context.md")
+		if err := os.MkdirAll(filepath.Dir(pinPath), 0750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(pinPath, []byte(strings.Repeat("x", MaxPinnedContextBytes+1)), 0600); err != nil {
+			t.Fatal(err)
+		}
+		called := false
+		tool := NewPinContextTool(func(string) { called = true })
+		tool.SetWorkDir(dir)
+		tool.LoadPersistedPin()
+		if called {
+			t.Fatal("oversized persisted pin was restored")
+		}
+	})
+
+	t.Run("symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		outside := filepath.Join(t.TempDir(), "secret.txt")
+		if err := os.WriteFile(outside, []byte("outside secret"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		pinPath := filepath.Join(dir, ".gokin", "pinned_context.md")
+		if err := os.MkdirAll(filepath.Dir(pinPath), 0750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, pinPath); err != nil {
+			t.Fatal(err)
+		}
+		called := false
+		tool := NewPinContextTool(func(string) { called = true })
+		tool.SetWorkDir(dir)
+		tool.LoadPersistedPin()
+		if called {
+			t.Fatal("symlinked persisted pin was restored")
+		}
+	})
 }
 
 func TestPinContext_SuccessMessageEchoesContent(t *testing.T) {

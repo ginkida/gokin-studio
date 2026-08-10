@@ -1,6 +1,7 @@
 package studio
 
 import (
+	"strings"
 	"testing"
 
 	"google.golang.org/genai"
@@ -215,5 +216,45 @@ func TestNewProject_RestoresUsageFromDisk(t *testing.T) {
 	}
 	if sess.usage.TotalCostUSD != 0.77 || sess.usage.TurnCount != 4 {
 		t.Errorf("usage not restored: %+v", sess.usage)
+	}
+}
+
+// A tool result can put media in history that the composer attachment
+// allowlist rejects — `read` on an .svg/.bmp/.ico/.tiff produces exactly such
+// a MIME on the vision-capable provider. Aborting the write there froze the
+// session's transcript permanently: the offending part stays in memory, so
+// every later save failed too and the whole conversation was lost on restart.
+// The save must drop the blob and keep the conversation.
+func TestSaveHistorySkipsUnpersistableAttachment(t *testing.T) {
+	withTempHistoryDir(t)
+	hist := []*genai.Content{
+		{Role: "user", Parts: []*genai.Part{genai.NewPartFromText("look at this diagram")}},
+		{Role: "user", Parts: []*genai.Part{
+			genai.NewPartFromText("tool read result"),
+			{InlineData: &genai.Blob{MIMEType: "image/svg+xml", Data: []byte("<svg/>")}},
+		}},
+		{Role: "model", Parts: []*genai.Part{genai.NewPartFromText("it is a flow chart")}},
+	}
+	if err := SaveHistoryWithUsage("p1_svg", "Diagram", "", nil, hist); err != nil {
+		t.Fatalf("unsupported inline media must not fail the whole save: %v", err)
+	}
+	loaded, err := LoadHistory("p1_svg")
+	if err != nil {
+		t.Fatalf("LoadHistory: %v", err)
+	}
+	if len(loaded) != 3 {
+		t.Fatalf("entries = %d, want 3 (the conversation must survive)", len(loaded))
+	}
+	var joined string
+	for _, entry := range loaded {
+		for _, part := range entry.Parts {
+			joined += part.Text
+		}
+	}
+	if !strings.Contains(joined, "it is a flow chart") {
+		t.Fatalf("later turns were lost: %q", joined)
+	}
+	if !strings.Contains(joined, "attachment omitted from saved history") {
+		t.Fatalf("dropped attachment must leave a visible marker: %q", joined)
 	}
 }

@@ -2,6 +2,7 @@ package studio
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 )
@@ -158,5 +159,44 @@ func TestCancelRegistry_ClosesChannel(t *testing.T) {
 	// A second cancel on the same id must return false (already removed).
 	if r.cancel("qid-cancel") {
 		t.Error("second cancel should return false")
+	}
+}
+
+func TestAskUserRegistryResolveCancelRaceHasSingleWinner(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		r := newAskUserRegistry()
+		ch := r.register("qid-race")
+		start := make(chan struct{})
+		results := make(chan bool, 2)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			results <- r.resolve("qid-race", "allow")
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			results <- r.cancel("qid-race")
+		}()
+		close(start)
+		wg.Wait()
+		close(results)
+
+		winners := 0
+		for won := range results {
+			if won {
+				winners++
+			}
+		}
+		if winners != 1 {
+			t.Fatalf("iteration %d had %d winners, want exactly one", i, winners)
+		}
+		if _, ok := <-ch; ok {
+			if _, stillOpen := <-ch; stillOpen {
+				t.Fatalf("iteration %d left resolved channel open", i)
+			}
+		}
 	}
 }

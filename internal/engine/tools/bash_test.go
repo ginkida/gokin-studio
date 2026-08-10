@@ -355,6 +355,27 @@ func TestBashTool_Execute_EnvVar(t *testing.T) {
 	}
 }
 
+func TestBashTool_Execute_SandboxedStdin(t *testing.T) {
+	tool := NewBashTool(t.TempDir())
+	if !tool.WorkspaceIsolationStatus().Enforced {
+		t.Skip("workspace sandbox is unavailable on this host")
+	}
+
+	result, err := tool.Execute(context.Background(), map[string]any{
+		"command": "IFS= read -r line; printf 'received:%s' \"$line\"",
+		"stdin":   "hello from stdin\n",
+	})
+	if err != nil {
+		t.Fatalf("Execute() unexpected error: %v", err)
+	}
+	if !result.Success {
+		t.Fatalf("Execute() result.Success = false: %s", result.Error)
+	}
+	if !strings.Contains(result.Content, "received:hello from stdin") {
+		t.Fatalf("Execute() content = %q, want stdin echoed", result.Content)
+	}
+}
+
 // ============================================================
 // BashTool Configuration Tests
 // ============================================================

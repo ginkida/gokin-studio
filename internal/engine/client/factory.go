@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -48,17 +49,72 @@ const (
 // body: anthropic.go gates the thinking block on budget > 0.
 const ThinkingDisabledSentinel int32 = -1
 
-// DefaultThinkingBudget returns the thinking budget the application layer
-// applies when a user enables thinking without specifying a budget. It mirrors
-// each provider's effective auto-mode budget so toggling a project from auto to
-// explicitly-enabled keeps the budget stable: GLM 8192 (its newGLMClient
-// factory canon), every other provider 4096. normalizeThinkingBudget still
-// clamps out-of-range values at the factory.
+// DefaultThinkingBudget returns the provider-level compatibility default.
+// New callers that know the model should prefer DefaultThinkingBudgetForModel.
 func DefaultThinkingBudget(provider string) int32 {
-	if provider == "glm" {
+	if provider == "glm" || provider == "kimi" {
 		return defaultGLMThinkingBudget
 	}
 	return 4096
+}
+
+// DefaultThinkingBudgetForModel preserves the persisted numeric control while
+// selecting the native effort default documented by each flagship protocol:
+// GLM 5.2+ defaults to max; Kimi K3+ defaults to high on the Coding endpoint.
+func DefaultThinkingBudgetForModel(provider, model string) int32 {
+	if strings.EqualFold(strings.TrimSpace(provider), "glm") && supportsGLMNativeReasoningEffort(model) {
+		return 32768 // maps to native max effort
+	}
+	return DefaultThinkingBudget(provider)
+}
+
+// numericModelVersion parses the numeric family immediately after prefix and
+// rejects unrelated lookalikes. It intentionally understands only the narrow
+// API ID shapes accepted by Studio (for example glm-5.3, k4, kimi-k4.1).
+func numericModelVersion(model, prefix string) (major, minor int, ok bool) {
+	value := strings.ToLower(strings.TrimSpace(model))
+	if !strings.HasPrefix(value, prefix) {
+		return 0, 0, false
+	}
+	version := strings.TrimPrefix(value, prefix)
+	end := 0
+	for end < len(version) && ((version[end] >= '0' && version[end] <= '9') || version[end] == '.') {
+		end++
+	}
+	if end == 0 || (end < len(version) && version[end] != '-') {
+		return 0, 0, false
+	}
+	parts := strings.Split(version[:end], ".")
+	if len(parts) == 0 || parts[0] == "" {
+		return 0, 0, false
+	}
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, false
+	}
+	if len(parts) > 1 {
+		if parts[1] == "" {
+			return 0, 0, false
+		}
+		minor, err = strconv.Atoi(parts[1])
+		if err != nil {
+			return 0, 0, false
+		}
+	}
+	return major, minor, true
+}
+
+func modelVersionAtLeast(model, prefix string, wantMajor, wantMinor int) bool {
+	major, minor, ok := numericModelVersion(model, prefix)
+	return ok && (major > wantMajor || major == wantMajor && minor >= wantMinor)
+}
+
+func supportsGLMNativeReasoningEffort(model string) bool {
+	return modelVersionAtLeast(model, "glm-", 5, 2)
+}
+
+func supportsKimiNativeReasoningEffort(model string) bool {
+	return modelVersionAtLeast(model, "k", 3, 0) || modelVersionAtLeast(model, "kimi-k", 3, 0)
 }
 
 // normalizeThinkingBudget repairs a configured budget before an API call.
@@ -368,12 +424,14 @@ func newGLMClient(cfg *config.Config, modelID string) (Client, error) {
 		thinkingBudget = 0
 	} else if !enableThinking && thinkingBudget == 0 && SupportsGLMThinking(modelID) {
 		enableThinking = true
-		thinkingBudget = defaultGLMThinkingBudget
+		thinkingBudget = DefaultThinkingBudgetForModel("glm", modelID)
 	}
 	// Repair any out-of-range budget (hand-edited config.yaml typo) so we
 	// don't send a value the provider will reject with a cryptic 400.
 	if enableThinking {
-		thinkingBudget = normalizeThinkingBudget(thinkingBudget, defaultGLMThinkingBudget)
+		thinkingBudget = normalizeThinkingBudget(
+			thinkingBudget, DefaultThinkingBudgetForModel("glm", modelID),
+		)
 	}
 
 	anthropicConfig := AnthropicConfig{
@@ -398,17 +456,17 @@ func newGLMClient(cfg *config.Config, modelID string) (Client, error) {
 
 // SupportsGLMThinking returns true for GLM models that support extended thinking.
 func SupportsGLMThinking(modelID string) bool {
-	m := strings.ToLower(modelID)
-	return strings.HasPrefix(m, "glm-5") || strings.HasPrefix(m, "glm-4.7")
+	return modelVersionAtLeast(modelID, "glm-", 4, 7)
 }
 
 // SupportsKimiThinking returns true for Kimi models that implement Extended
 // Thinking on the Coding Plan endpoint. kimi-for-coding and the kimi-k2* prefix
 // cover current and future K2.x variants. (Ported from gokin.)
 func SupportsKimiThinking(modelID string) bool {
-	m := strings.ToLower(modelID)
+	m := strings.ToLower(strings.TrimSpace(modelID))
 	return strings.HasPrefix(m, "kimi-for-coding") ||
-		strings.HasPrefix(m, "kimi-k2")
+		strings.HasPrefix(m, "kimi-k2") ||
+		supportsKimiNativeReasoningEffort(m)
 }
 
 // SupportsDeepSeekThinking reports whether a DeepSeek model supports Extended

@@ -2,10 +2,19 @@ package studio
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
+)
+
+const (
+	StudioConfigMaxBytes       = 4 << 20
+	StudioConfigMaxProjects    = 500
+	GlobalInstructionsMaxBytes = 64 << 10
 )
 
 // StudioConfig is the top-level configuration saved to disk.
@@ -25,15 +34,24 @@ type ProjectConfig struct {
 	Temperature  float32 `yaml:"temperature,omitempty" json:"temperature,omitempty"`
 	MaxTokens    int     `yaml:"max_tokens,omitempty" json:"maxTokens,omitempty"`
 	// Extended thinking control. "" = auto (provider default), "enabled" = on,
-	// "disabled" = off. ThinkingBudget is the max reasoning tokens (0 = use
-	// provider default of 4096 when thinking is enabled).
+	// "disabled" = off. ThinkingBudget is the backwards-compatible reasoning
+	// control (0 = model default; native effort models map it to named levels).
 	ThinkingMode   string `yaml:"thinking_mode,omitempty" json:"thinkingMode,omitempty"`
 	ThinkingBudget int32  `yaml:"thinking_budget,omitempty" json:"thinkingBudget,omitempty"`
 	// PermissionMode controls how cautious the agent is about changes.
-	// "" / "auto" = proceed without asking; "ask" = confirm via the ask_user
-	// tool before file/git/destructive changes (soft enforcement: a directive
-	// appended to the system prompt, since the agent loop has no hard gate).
+	// "" / "auto" = reviewed Auto; "accept_edits" = automatically approve
+	// bounded file edits; "manual" = ask; "skip" = bypass ordinary approvals.
+	// Legacy "ask" is migrated to "manual".
 	PermissionMode string `yaml:"permission_mode,omitempty" json:"permissionMode,omitempty"`
+	// ComputerUseEnabled exposes OS-level screen tools to this project. It is
+	// opt-in and computer_* calls remain runtime-gated even in auto mode.
+	ComputerUseEnabled  bool     `yaml:"computer_use_enabled,omitempty" json:"computerUseEnabled,omitempty"`
+	ComputerAllowedApps []string `yaml:"computer_allowed_apps,omitempty" json:"computerAllowedApps,omitempty"`
+	ComputerBlockedApps []string `yaml:"computer_blocked_apps,omitempty" json:"computerBlockedApps,omitempty"`
+	// ToolPermissions are explicit project-scoped "Always allow" grants for a
+	// small allowlist of ordinary local tools. Arguments and file contents are
+	// never persisted, and hard-gated variants are reclassified on every call.
+	ToolPermissions []ToolPermissionRule `yaml:"tool_permissions,omitempty" json:"toolPermissions,omitempty"`
 	// BudgetUSD is the user-set monthly spend cap. The UI uses it to render
 	// progress vs. accumulated session usage and warn at 80%/100%. 0 = no
 	// budget set (no warnings). Capped at $100,000 to defend against typos.
@@ -61,10 +79,11 @@ type Settings struct {
 	DefaultProvider string `yaml:"default_provider" json:"defaultProvider"`
 	DefaultModel    string `yaml:"default_model" json:"defaultModel"`
 	GLMKey          string `yaml:"glm_key,omitempty" json:"glmKey,omitempty"`
-	MiniMaxKey      string `yaml:"minimax_key,omitempty" json:"minimaxKey,omitempty"`
 	KimiKey         string `yaml:"kimi_key,omitempty" json:"kimiKey,omitempty"`
-	DeepSeekKey     string `yaml:"deepseek_key,omitempty" json:"deepseekKey,omitempty"`
-	OllamaURL       string `yaml:"ollama_url,omitempty" json:"ollamaUrl,omitempty"`
+	// GlobalInstructions are user-authored preferences applied to every GLM
+	// and Kimi project. Project-specific instructions are placed after them
+	// and therefore remain the more specific override.
+	GlobalInstructions string `yaml:"global_instructions,omitempty" json:"globalInstructions,omitempty"`
 	// DefaultThinkingMode is applied to new projects created via AddProject.
 	// "" = auto (provider default), "enabled", "disabled".
 	DefaultThinkingMode   string `yaml:"default_thinking_mode,omitempty" json:"defaultThinkingMode,omitempty"`
@@ -83,6 +102,28 @@ type Settings struct {
 	// (10-70 MB total at 7-day retention). When enabled, oldest backups
 	// beyond AutoBackupRetention are pruned automatically.
 	AutoBackupEnabled bool `yaml:"auto_backup_enabled,omitempty" json:"autoBackupEnabled,omitempty"`
+	// QuickEntryEnabled registers QuickEntryShortcut as a native global
+	// shortcut while the desktop app is running. It is opt-in so Gokin never
+	// steals a system shortcut without the user's explicit choice.
+	QuickEntryEnabled  bool   `yaml:"quick_entry_enabled,omitempty" json:"quickEntryEnabled,omitempty"`
+	QuickEntryShortcut string `yaml:"quick_entry_shortcut,omitempty" json:"quickEntryShortcut,omitempty"`
+	// VoiceShortcutEnabled is separate from QuickEntryEnabled: a user may
+	// dictate through Caps Lock without also reserving the text-entry gesture,
+	// or keep Quick Entry enabled without granting speech/accessibility access.
+	VoiceShortcutEnabled bool   `yaml:"voice_shortcut_enabled,omitempty" json:"voiceShortcutEnabled,omitempty"`
+	VoiceShortcut        string `yaml:"voice_shortcut,omitempty" json:"voiceShortcut,omitempty"`
+	// KeepAwakeEnabled holds an OS sleep-inhibition lease while any GLM/Kimi
+	// run is active or at least one local scheduled task is enabled. Opt-in
+	// because an always-enabled schedule can increase laptop battery use.
+	KeepAwakeEnabled bool `yaml:"keep_awake_enabled,omitempty" json:"keepAwakeEnabled,omitempty"`
+	// AutoUpdateCheckDisabled opts out of the once-per-24h release check.
+	// Checks are notify-only: Studio never downloads or installs an artifact in
+	// the background, because community builds are not code-signed yet.
+	AutoUpdateCheckDisabled bool `yaml:"auto_update_check_disabled,omitempty" json:"autoUpdateCheckDisabled,omitempty"`
+	// AutoArchivePRAfterClose hides a finished local chat after its associated
+	// GitHub pull request reaches MERGED or CLOSED. Disabled by default; dirty,
+	// running, unavailable, and last-active sessions always remain visible.
+	AutoArchivePRAfterClose bool `yaml:"auto_archive_pr_after_close,omitempty" json:"autoArchivePRAfterClose,omitempty"`
 }
 
 func configDir() string {
@@ -102,12 +143,29 @@ func configPath() string {
 // LoadConfig reads the config from disk or returns defaults.
 func LoadConfig() *StudioConfig {
 	cfg := defaultConfig()
-	data, err := os.ReadFile(configPath())
+	data, err := readRegularFileLimited(configPath(), StudioConfigMaxBytes)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			// quarantineInvalidConfig only renames a real regular file, so an
+			// unloadable one (oversized, wrong type) is set aside with its
+			// bytes preserved, while the common dotfiles setup — config.yaml
+			// symlinked into a repo, which readRegularFileLimited now refuses
+			// on purpose — is left untouched. Unlinking that symlink would
+			// silently detach the user's config and start with no projects and
+			// no API keys.
+			quarantined := quarantineInvalidConfig()
+			fmt.Fprintf(os.Stderr, "gokin-studio: config unreadable, using defaults: %v%s\n", err, quarantined)
+		}
 		return cfg
 	}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "gokin-studio: invalid config, using defaults: %v\n", err)
+		quarantined := quarantineInvalidConfig()
+		fmt.Fprintf(os.Stderr, "gokin-studio: invalid config, using defaults: %v%s\n", err, quarantined)
+		return defaultConfig()
+	}
+	if len(cfg.Projects) > StudioConfigMaxProjects {
+		quarantined := quarantineInvalidConfig()
+		fmt.Fprintf(os.Stderr, "gokin-studio: config has too many projects (%d, maximum %d), using defaults%s\n", len(cfg.Projects), StudioConfigMaxProjects, quarantined)
 		return defaultConfig()
 	}
 
@@ -122,65 +180,163 @@ func LoadConfig() *StudioConfig {
 	if cfg.Settings.Theme == "" {
 		cfg.Settings.Theme = defaults.Settings.Theme
 	}
-	if cfg.Settings.OllamaURL == "" {
-		cfg.Settings.OllamaURL = defaults.Settings.OllamaURL
+	if cfg.Settings.QuickEntryShortcut == "" {
+		cfg.Settings.QuickEntryShortcut = defaults.Settings.QuickEntryShortcut
+	} else if normalized, err := normalizeQuickEntryShortcut(cfg.Settings.QuickEntryShortcut); err == nil {
+		cfg.Settings.QuickEntryShortcut = normalized
+	} else {
+		cfg.Settings.QuickEntryShortcut = defaults.Settings.QuickEntryShortcut
 	}
+	if cfg.Settings.VoiceShortcut == "" {
+		cfg.Settings.VoiceShortcut = defaults.Settings.VoiceShortcut
+	} else if normalized, err := normalizeVoiceShortcut(cfg.Settings.VoiceShortcut); err == nil {
+		cfg.Settings.VoiceShortcut = normalized
+	} else {
+		cfg.Settings.VoiceShortcut = defaults.Settings.VoiceShortcut
+	}
+	if cfg.Settings.Theme != "dark" && cfg.Settings.Theme != "light" && cfg.Settings.Theme != "system" {
+		cfg.Settings.Theme = defaults.Settings.Theme
+	}
+	if cfg.Settings.DefaultThinkingMode != "" && cfg.Settings.DefaultThinkingMode != "enabled" && cfg.Settings.DefaultThinkingMode != "disabled" {
+		cfg.Settings.DefaultThinkingMode = ""
+	}
+	if cfg.Settings.DefaultThinkingBudget < 0 || cfg.Settings.DefaultThinkingBudget > 1_000_000 {
+		cfg.Settings.DefaultThinkingBudget = 0
+	}
+	cfg.Settings.GLMKey = strings.TrimSpace(cfg.Settings.GLMKey)
+	cfg.Settings.KimiKey = strings.TrimSpace(cfg.Settings.KimiKey)
+	cfg.Settings.GlobalInstructions = truncateUTF8(strings.TrimSpace(cfg.Settings.GlobalInstructions), GlobalInstructionsMaxBytes)
 
-	// Migrate deprecated models to current versions.
-	// DeepSeek V4 series replaces v3 / chat / reasoner naming (legacy
-	// aliases are dropped 2026-07-24 by DeepSeek; we move users to the
-	// V4 lineup proactively). deepseek-reasoner → v4-pro (thinking),
-	// deepseek-chat → v4-flash (non-thinking).
-	deprecatedModels := map[string]string{
-		"glm-4-plus":        "glm-5.2",
-		"glm-4-air":         "glm-5.2",
-		"glm-4-flash":       "glm-5.2",
-		"glm-4-long":        "glm-5.2",
-		"deepseek-chat":     "deepseek-v4-flash",
-		"deepseek-reasoner": "deepseek-v4-pro",
+	// Repair identifiers from hand-edited/legacy configs before the projects
+	// enter the runtime map. Empty/duplicate IDs otherwise overwrite each other
+	// during Startup. Entries without a directory are unusable and unsafe
+	// (filepath.Abs("") means the process cwd), so omit them.
+	seenIDs := make(map[string]struct{}, len(cfg.Projects))
+	normalized := make([]ProjectConfig, 0, len(cfg.Projects))
+	for _, project := range cfg.Projects {
+		project.Directory = strings.TrimSpace(project.Directory)
+		if project.Directory == "" {
+			continue
+		}
+		project.ID = strings.TrimSpace(project.ID)
+		if project.ID == "" {
+			project.ID = GenerateID()
+		}
+		if _, duplicate := seenIDs[project.ID]; duplicate {
+			for {
+				project.ID = GenerateID()
+				if _, exists := seenIDs[project.ID]; !exists {
+					break
+				}
+			}
+		}
+		seenIDs[project.ID] = struct{}{}
+		if strings.TrimSpace(project.Name) == "" {
+			project.Name = filepath.Base(project.Directory)
+			if project.Name == "." || project.Name == string(filepath.Separator) || project.Name == "" {
+				project.Name = "Project"
+			}
+		}
+		normalized = append(normalized, project)
 	}
-	if replacement, ok := deprecatedModels[cfg.Settings.DefaultModel]; ok {
-		cfg.Settings.DefaultModel = replacement
-	}
+	cfg.Projects = normalized
 
-	// Providers no longer supported — migrate to GLM. iter 940+ note:
-	// DeepSeek is BACK on this list as a supported provider as of V4,
-	// so it's removed from removedProviders. Anthropic + Gemini stay
-	// removed.
-	removedProviders := map[string]bool{
-		"anthropic": true,
-		"gemini":    true,
-	}
-
-	// Migrate settings default provider if it was removed.
-	if removedProviders[cfg.Settings.DefaultProvider] {
-		cfg.Settings.DefaultProvider = "glm"
-		cfg.Settings.DefaultModel = "glm-5.2"
-	}
+	cfg.Settings.DefaultProvider, cfg.Settings.DefaultModel = normalizeStudioProviderModel(
+		cfg.Settings.DefaultProvider,
+		cfg.Settings.DefaultModel,
+	)
 
 	// Migrate project-level provider/model: projects that still reference
 	// empty or removed providers get the current default.
 	for i := range cfg.Projects {
 		p := &cfg.Projects[i]
-		if p.Provider == "" || removedProviders[p.Provider] {
-			p.Provider = "glm"
-			p.Model = "glm-5.2"
+		p.Name = truncateUTF8(strings.TrimSpace(p.Name), 60)
+		p.Directory = strings.TrimSpace(p.Directory)
+		p.SystemPrompt = truncateUTF8(p.SystemPrompt, 64<<10)
+		if p.Temperature < 0 || p.Temperature > 2 || math.IsNaN(float64(p.Temperature)) || math.IsInf(float64(p.Temperature), 0) {
+			p.Temperature = 0
 		}
-		if p.Model == "" {
-			p.Model = cfg.Settings.DefaultModel
+		if p.BudgetUSD < 0 || p.BudgetUSD > 100_000 || math.IsNaN(p.BudgetUSD) || math.IsInf(p.BudgetUSD, 0) {
+			p.BudgetUSD = 0
 		}
-		if replacement, ok := deprecatedModels[p.Model]; ok {
-			p.Model = replacement
+		if p.LastUsedAt < 0 {
+			p.LastUsedAt = 0
 		}
+		if p.ThinkingMode != "" && p.ThinkingMode != "enabled" && p.ThinkingMode != "disabled" {
+			p.ThinkingMode = ""
+		}
+		if p.ThinkingBudget < 0 || p.ThinkingBudget > 1_000_000 {
+			p.ThinkingBudget = 0
+		}
+		if p.PermissionMode == "ask" {
+			p.PermissionMode = "manual"
+		}
+		if p.PermissionMode == "acceptEdits" || p.PermissionMode == "accept-edits" {
+			p.PermissionMode = "accept_edits"
+		}
+		if p.PermissionMode != "" && p.PermissionMode != "auto" && p.PermissionMode != "accept_edits" &&
+			p.PermissionMode != "manual" && p.PermissionMode != "skip" {
+			p.PermissionMode = ""
+		}
+		p.ComputerAllowedApps = sanitizeComputerAppIDs(p.ComputerAllowedApps)
+		p.ComputerBlockedApps = sanitizeComputerAppIDs(p.ComputerBlockedApps)
+		p.ToolPermissions = sanitizeToolPermissionRules(p.ToolPermissions)
+		if len(p.ComputerBlockedApps) > 0 && len(p.ComputerAllowedApps) > 0 {
+			blocked := make(map[string]bool, len(p.ComputerBlockedApps))
+			for _, id := range p.ComputerBlockedApps {
+				blocked[id] = true
+			}
+			allowed := p.ComputerAllowedApps[:0]
+			for _, id := range p.ComputerAllowedApps {
+				if !blocked[id] {
+					allowed = append(allowed, id)
+				}
+			}
+			p.ComputerAllowedApps = allowed
+		}
+		if p.BudgetUSD == 0 {
+			p.EnforceBudget = false
+		}
+		p.Provider, p.Model = normalizeStudioProviderModel(p.Provider, p.Model)
+		if p.MaxTokens < 0 || p.MaxTokens > int(maxOutputTokens(p.Provider, p.Model)) {
+			p.MaxTokens = 0
+		}
+	}
+	if cfg.Settings.DefaultBudgetUSD < 0 || cfg.Settings.DefaultBudgetUSD > 100_000 ||
+		math.IsNaN(cfg.Settings.DefaultBudgetUSD) || math.IsInf(cfg.Settings.DefaultBudgetUSD, 0) {
+		cfg.Settings.DefaultBudgetUSD = 0
 	}
 
 	return cfg
+}
+
+func quarantineInvalidConfig() string {
+	path := configPath()
+	info, err := os.Lstat(path)
+	// Only a real, regular file may be quarantined. A symlink points at
+	// something the user owns elsewhere (a dotfiles repo, typically); renaming
+	// the link would unlink their config without touching — or explaining —
+	// the actual file.
+	if err != nil || !info.Mode().IsRegular() {
+		return ""
+	}
+	dst := path + ".corrupt-" + time.Now().Format("20060102-150405.000")
+	if err := os.Rename(path, dst); err != nil {
+		return ""
+	}
+	return "; quarantined as " + filepath.Base(dst)
 }
 
 // Save writes the config to disk with restrictive permissions (0600).
 // Atomic via the same write-temp-then-rename pattern history files use, so a
 // crash mid-write doesn't corrupt the user's project list / API keys.
 func (c *StudioConfig) Save() error {
+	if c == nil {
+		return fmt.Errorf("cannot save nil config")
+	}
+	if len(c.Projects) > StudioConfigMaxProjects {
+		return fmt.Errorf("too many projects (%d, maximum %d)", len(c.Projects), StudioConfigMaxProjects)
+	}
 	if err := os.MkdirAll(configDir(), 0o700); err != nil {
 		return err
 	}
@@ -188,16 +344,20 @@ func (c *StudioConfig) Save() error {
 	if err != nil {
 		return err
 	}
+	if len(data) > StudioConfigMaxBytes {
+		return fmt.Errorf("config is too large (%d bytes, maximum %d)", len(data), StudioConfigMaxBytes)
+	}
 	return atomicWriteFile(configPath(), data, 0o600)
 }
 
 func defaultConfig() *StudioConfig {
 	return &StudioConfig{
 		Settings: Settings{
-			Theme:           "dark",
-			DefaultProvider: "glm",
-			DefaultModel:    "glm-5.2",
-			OllamaURL:       "http://localhost:11434",
+			Theme:              "dark",
+			DefaultProvider:    defaultStudioProvider,
+			DefaultModel:       defaultStudioModel,
+			QuickEntryShortcut: defaultQuickEntryShortcut(),
+			VoiceShortcut:      defaultVoiceShortcut(),
 		},
 	}
 }

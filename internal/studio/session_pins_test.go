@@ -3,6 +3,7 @@ package studio
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -55,6 +56,70 @@ func TestSetSessionPinned(t *testing.T) {
 	got, _ = s.ListChatSessions(info.ID)
 	if got[0].Pinned {
 		t.Errorf("session Pinned after unpin = true, want false")
+	}
+}
+
+func TestSetSessionPinned_ConcurrentUpdatesRemainDurable(t *testing.T) {
+	s := newStudioForTest(t)
+	info := addTestProject(t, s, "Concurrent Session Pins")
+	ids := []string{"default"}
+	for i := 0; i < 15; i++ {
+		session, err := s.CreateChatSession(info.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, session.ID)
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, len(ids))
+	for _, id := range ids {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			errs <- s.SetSessionPinned(info.ID, id, true)
+		}(id)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("SetSessionPinned: %v", err)
+		}
+	}
+	persisted, err := loadPinnedSessions(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted) != len(ids) {
+		t.Fatalf("persisted %d/%d concurrent pin updates", len(persisted), len(ids))
+	}
+	for _, id := range ids {
+		if !persisted[id] {
+			t.Errorf("session %q missing from persisted pins", id)
+		}
+	}
+}
+
+func TestSetSessionPinned_PersistenceFailureDoesNotChangeMemory(t *testing.T) {
+	s := newStudioForTest(t)
+	info := addTestProject(t, s, "Failed Session Pin")
+	path := sessionPinsPath(info.ID)
+	if err := os.MkdirAll(filepath.Join(path, "child"), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.SetSessionPinned(info.ID, "default", true); err == nil {
+		t.Fatal("expected persistence error")
+	}
+	sessions, err := s.ListChatSessions(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, session := range sessions {
+		if session.ID == "default" && session.Pinned {
+			t.Fatal("in-memory pin changed despite persistence failure")
+		}
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ginkida/gokin-studio/internal/engine/client"
 	"google.golang.org/genai"
 )
 
@@ -43,18 +44,18 @@ func TestDeriveSessionName(t *testing.T) {
 
 func TestIsDefaultSessionName(t *testing.T) {
 	cases := map[string]bool{
-		"Chat 1":          true,
-		"Chat 12":         true,
-		"Chat abc1":       true,
-		"  Chat 2  ":      true,
-		"Chat":            false,
-		"Chat ":           false,
-		"Chat first":      false, // 5 non-hex chars → len(rest)!=4 path
-		"Chat wxyz":       false, // 4 non-hex chars → !isHex return-false path
-		"fix the bug":     false,
-		"Chat 1 renamed":  false, // space
-		"My Chat":         false,
-		"":                false,
+		"Chat 1":         true,
+		"Chat 12":        true,
+		"Chat abc1":      true,
+		"  Chat 2  ":     true,
+		"Chat":           false,
+		"Chat ":          false,
+		"Chat first":     false, // 5 non-hex chars → len(rest)!=4 path
+		"Chat wxyz":      false, // 4 non-hex chars → !isHex return-false path
+		"fix the bug":    false,
+		"Chat 1 renamed": false, // space
+		"My Chat":        false,
+		"":               false,
 	}
 	for in, want := range cases {
 		if got := isDefaultSessionName(in); got != want {
@@ -94,7 +95,10 @@ func TestHumanizeAPIError(t *testing.T) {
 		{"nil", ""}, // special-cased below
 		{"401 Unauthorized: bad key", "API key"},
 		{"Error: 429 rate limit exceeded", "Rate limited"},
-		{"context length exceeded for this model", "/clear"},
+		{"GLM quota/balance exhausted — top up your GLM plan", "usage quota"},
+		{"API error 429: insufficient_quota: check billing", "provider account"},
+		{"API error 403: quota exceeded", "usage quota"},
+		{"context length exceeded for this model", "Start a new chat"},
 		{"no such host: foo.bar.com", "internet connection"},
 		{"request timeout after 60s", "timed out"},
 		{"403 forbidden", "Access denied"},
@@ -114,6 +118,9 @@ func TestHumanizeAPIError(t *testing.T) {
 				t.Errorf("humanizeAPIError(%q) = %q, want substring %q", tc.in, got, tc.wantSubstr)
 			}
 		})
+	}
+	if got := humanizeAPIError(&client.HTTPError{StatusCode: 413, Message: "payload too large"}); !strings.Contains(got, "automatic compaction") {
+		t.Errorf("humanizeAPIError(413) = %q, want automatic-compaction guidance", got)
 	}
 }
 

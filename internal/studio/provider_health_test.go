@@ -47,6 +47,22 @@ func TestCheckProviderHealth_GLM_NoKeySet(t *testing.T) {
 	}
 }
 
+func TestCheckProviderHealthWithKey_DoesNotRequirePersistedKey(t *testing.T) {
+	s := newStudioForTest(t)
+	info := s.CheckProviderHealthWithKey("glm", "")
+	if info.OK || !strings.Contains(info.Error, "no API key") {
+		t.Fatalf("expected explicit empty key to fail before probing, got %+v", info)
+	}
+}
+
+func TestCheckProviderHealthWithKey_RejectsUnsupportedProvider(t *testing.T) {
+	s := newStudioForTest(t)
+	info := s.CheckProviderHealthWithKey("openai", "secret")
+	if info.OK || !strings.Contains(info.Error, "unknown provider") {
+		t.Fatalf("expected unsupported provider error, got %+v", info)
+	}
+}
+
 func TestProbe_2xxIsHealthy(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -62,6 +78,57 @@ func TestProbe_2xxIsHealthy(t *testing.T) {
 	}
 	if info.LatencyMs < 0 {
 		t.Errorf("LatencyMs = %d, want >=0", info.LatencyMs)
+	}
+}
+
+func TestProbe_DiscoversOnlyAllowlistedModelsInCatalogOrder(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"data": [
+				{"id":"kimi-for-coding"},
+				{"id":"unrelated-provider-model"},
+				{"id":"k3-256k"},
+				{"id":"k3"}
+			]
+		}`))
+	}))
+	defer srv.Close()
+
+	info := &ProviderHealthInfo{Provider: "kimi"}
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/v1/models", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doProbe(info, req)
+	if !info.OK {
+		t.Fatalf("probe failed: %+v", info)
+	}
+	want := []string{"k3", "k3-256k", "kimi-for-coding"}
+	if strings.Join(info.AvailableModels, ",") != strings.Join(want, ",") {
+		t.Fatalf("AvailableModels = %v, want %v", info.AvailableModels, want)
+	}
+	if info.RecommendedModel != "k3" {
+		t.Fatalf("RecommendedModel = %q, want k3", info.RecommendedModel)
+	}
+}
+
+func TestPopulateAvailableStudioModels_AcceptsGLMOneMillionAlias(t *testing.T) {
+	info := &ProviderHealthInfo{Provider: "glm"}
+	populateAvailableStudioModels(info, []byte(`{"models":["glm-4.7",{"name":"glm-5.2[1m]"}]}`))
+	if len(info.AvailableModels) != 2 || info.AvailableModels[0] != "glm-5.2" || info.AvailableModels[1] != "glm-4.7" {
+		t.Fatalf("AvailableModels = %v", info.AvailableModels)
+	}
+	if info.RecommendedModel != "glm-5.2" {
+		t.Fatalf("RecommendedModel = %q", info.RecommendedModel)
+	}
+}
+
+func TestPopulateAvailableStudioModels_MalformedResponseIsNonFatal(t *testing.T) {
+	info := &ProviderHealthInfo{Provider: "kimi", OK: true}
+	populateAvailableStudioModels(info, []byte(`not-json`))
+	if !info.OK || len(info.AvailableModels) != 0 || info.RecommendedModel != "" {
+		t.Fatalf("malformed optional discovery changed health: %+v", info)
 	}
 }
 
@@ -159,38 +226,9 @@ func TestProbe_UnreachableHostFailsCleanly(t *testing.T) {
 	}
 }
 
-// TestCheckProviderHealth_GLM_AgainstFakeServer wires the full
-// CheckProviderHealth path through a fake server by overriding the GLM
-// base URL. This exercises probeAnthropicCompat end-to-end.
-//
-// We can't override the base URL via settings (it's compiled in via
-// client.DefaultGLMBaseURL), so we instead test ollama which DOES read
-// the URL from settings.
-func TestCheckProviderHealth_OllamaWithCustomURL(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasSuffix(r.URL.Path, "/api/tags") {
-			t.Errorf("expected /api/tags, got %q", r.URL.Path)
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"models":[]}`))
-	}))
-	defer srv.Close()
-
-	s := newStudioForTest(t)
-	s.config.Settings.OllamaURL = srv.URL
-
-	info := s.CheckProviderHealth("ollama")
-	if !info.OK {
-		t.Errorf("expected OK=true, got %+v", info)
-	}
-	if !strings.Contains(info.Endpoint, "/api/tags") {
-		t.Errorf("Endpoint = %q, expected /api/tags suffix", info.Endpoint)
-	}
-}
-
 // TestProbeAnthropicCompat_AgainstFakeServer drives probeAnthropicCompat
 // directly (it's package-private) so we can exercise the auth header
-// + endpoint construction without hitting the real GLM/Kimi/MiniMax API.
+// + endpoint construction without hitting the real GLM/Kimi API.
 // Verifies the Authorization Bearer header lands on the request.
 func TestProbeAnthropicCompat_AgainstFakeServer(t *testing.T) {
 	var sawAuth, sawAnthropicVersion bool
@@ -237,20 +275,5 @@ func TestProbeAnthropicCompat_NoKeyShortCircuits(t *testing.T) {
 	}
 	if info.Error == "" {
 		t.Error("expected an Error message")
-	}
-}
-
-// TestCheckProviderHealth_OllamaDefaultURL verifies the empty-URL fallback
-// to localhost:11434 — important so users who haven't configured Ollama
-// don't see "no URL set"; instead they see "unreachable" if their local
-// Ollama isn't running.
-func TestCheckProviderHealth_OllamaDefaultURL(t *testing.T) {
-	s := newStudioForTest(t)
-	s.config.Settings.OllamaURL = "" // empty → default
-	info := s.CheckProviderHealth("ollama")
-	// Either OK (if user has Ollama running on the default port) or
-	// unreachable. Either way, Endpoint should reflect the default URL.
-	if !strings.Contains(info.Endpoint, "11434") {
-		t.Errorf("expected default port 11434 in endpoint, got %q", info.Endpoint)
 	}
 }

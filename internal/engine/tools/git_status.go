@@ -76,8 +76,7 @@ func (t *GitStatusTool) Execute(ctx context.Context, args map[string]any) (ToolR
 	// ONE porcelain invocation with branch info covers everything: the
 	// structured summary below names every file, so a second `git status`
 	// subprocess would only duplicate content and double the cost per call.
-	cmd := exec.CommandContext(ctx, "git", "status", "--porcelain", "-b")
-	cmd.Dir = path
+	cmd := newGitCommand(ctx, path, "status", "--porcelain", "-b")
 
 	output, err := cmd.Output()
 	if err != nil {

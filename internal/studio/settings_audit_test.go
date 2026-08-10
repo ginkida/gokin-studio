@@ -11,7 +11,6 @@ func TestDiffSettings_NoChangesReturnsEmpty(t *testing.T) {
 		DefaultProvider:       "glm",
 		DefaultModel:          "glm-5.1",
 		GLMKey:                "sk-x",
-		OllamaURL:             "http://localhost:11434",
 		DefaultThinkingMode:   "enabled",
 		DefaultThinkingBudget: 4096,
 		DefaultBudgetUSD:      5.0,
@@ -25,22 +24,23 @@ func TestDiffSettings_NoChangesReturnsEmpty(t *testing.T) {
 func TestDiffSettings_AllNonSecretFields(t *testing.T) {
 	oldS := Settings{}
 	newS := Settings{
-		Theme:                 "light",
-		DefaultProvider:       "kimi",
-		DefaultModel:          "kimi-for-coding",
-		OllamaURL:             "http://my-ollama:11434",
-		DefaultThinkingMode:   "enabled",
-		DefaultThinkingBudget: 8192,
-		DefaultBudgetUSD:      10.5,
-		AutoCleanupDisabled:   true,
+		Theme:                   "light",
+		DefaultProvider:         "kimi",
+		DefaultModel:            "kimi-for-coding",
+		DefaultThinkingMode:     "enabled",
+		DefaultThinkingBudget:   8192,
+		DefaultBudgetUSD:        10.5,
+		AutoCleanupDisabled:     true,
+		KeepAwakeEnabled:        true,
+		AutoUpdateCheckDisabled: true,
+		AutoArchivePRAfterClose: true,
 	}
 	diff := diffSettings(oldS, newS)
 	// Each field above should produce its own entry.
 	expectedFields := []string{
 		"theme", "defaultProvider", "defaultModel",
-		"ollamaUrl",
 		"defaultThinkingMode", "defaultThinkingBudget", "defaultBudgetUSD",
-		"autoCleanupDisabled",
+		"autoCleanupDisabled", "keepAwakeEnabled", "autoUpdateCheckDisabled", "autoArchivePRAfterClose",
 	}
 	if len(diff) != len(expectedFields) {
 		t.Fatalf("got %d diff entries, want %d: %+v", len(diff), len(expectedFields), diff)
@@ -115,27 +115,25 @@ func TestDiffSettings_APIKey_UnchangedNonEmptyNotLogged(t *testing.T) {
 	}
 }
 
-func TestDiffSettings_OllamaURL_LogsValue(t *testing.T) {
-	// Ollama URL is not secret — it's a local endpoint. Should log full value.
-	oldS := Settings{OllamaURL: "http://localhost:11434"}
-	newS := Settings{OllamaURL: "http://other-host:11434"}
-	diff := diffSettings(oldS, newS)
-	if len(diff) != 1 {
-		t.Fatalf("expected 1 diff entry, got %d", len(diff))
+func TestDiffSettings_GlobalInstructionsNeverLogsContent(t *testing.T) {
+	const secret = "private-client-codename"
+	diff := diffSettings(Settings{}, Settings{GlobalInstructions: secret})
+	if len(diff) != 1 || diff[0].Field != "globalInstructions" {
+		t.Fatalf("unexpected diff: %+v", diff)
 	}
-	if !strings.Contains(diff[0].Message, "other-host") {
-		t.Errorf("Ollama URL change should log the new value; got %q", diff[0].Message)
+	if strings.Contains(diff[0].Message, secret) || !strings.Contains(diff[0].Message, "content not logged") {
+		t.Fatalf("global instruction content leaked: %q", diff[0].Message)
 	}
 }
 
 func TestDiffSettings_NumericFields(t *testing.T) {
 	cases := []struct {
-		name      string
+		name       string
 		oldS, newS Settings
-		wantMsg   string
+		wantMsg    string
 	}{
 		{"thinking budget", Settings{DefaultThinkingBudget: 1024}, Settings{DefaultThinkingBudget: 4096}, "1024 → 4096"},
-		{"budget USD",      Settings{DefaultBudgetUSD: 1.0},      Settings{DefaultBudgetUSD: 5.50},      "$1.00 → $5.50"},
+		{"budget USD", Settings{DefaultBudgetUSD: 1.0}, Settings{DefaultBudgetUSD: 5.50}, "$1.00 → $5.50"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -161,6 +159,17 @@ func TestDiffSettings_AutoCleanupToggleHasReadableState(t *testing.T) {
 	}
 }
 
+func TestDiffSettings_AutomaticUpdateToggleHasReadableState(t *testing.T) {
+	diffOff := diffSettings(Settings{}, Settings{AutoUpdateCheckDisabled: true})
+	if len(diffOff) != 1 || diffOff[0].Field != "autoUpdateCheckDisabled" || !strings.Contains(diffOff[0].Message, "disabled") {
+		t.Errorf("opting out should log disabled; got %+v", diffOff)
+	}
+	diffOn := diffSettings(Settings{AutoUpdateCheckDisabled: true}, Settings{})
+	if len(diffOn) != 1 || !strings.Contains(diffOn[0].Message, "enabled") {
+		t.Errorf("opting back in should log enabled; got %+v", diffOn)
+	}
+}
+
 func TestUpdateSettings_LogsToEventLog(t *testing.T) {
 	_ = withTempHistoryDir(t)
 	s := NewStudio()
@@ -172,7 +181,6 @@ func TestUpdateSettings_LogsToEventLog(t *testing.T) {
 			Theme:                 "light",
 			DefaultProvider:       "kimi",
 			DefaultModel:          "kimi-for-coding",
-			OllamaURL:             "http://localhost:11434",
 			DefaultThinkingMode:   "",
 			DefaultThinkingBudget: 0,
 			DefaultBudgetUSD:      0,

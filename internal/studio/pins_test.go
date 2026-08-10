@@ -1,9 +1,11 @@
 package studio
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -50,6 +52,65 @@ func TestPinMessage_RoundTrip(t *testing.T) {
 	}
 	if pins[0].PinnedAt == 0 {
 		t.Error("PinnedAt should be set")
+	}
+}
+
+func TestPinMessage_ConcurrentUpdatesDoNotLosePins(t *testing.T) {
+	withTempPinsDir(t)
+	s := newStudioForTest(t)
+	pInfo := addTestProject(t, s, "Concurrent Pins")
+
+	const count = 32
+	var wg sync.WaitGroup
+	errs := make(chan error, count)
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := s.PinMessage(pInfo.ID, "default", "assistant", fmt.Sprintf("pin-%02d", i), "")
+			errs <- err
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent PinMessage: %v", err)
+		}
+	}
+	pins, err := s.ListPinnedMessages(pInfo.ID, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pins) != count {
+		t.Fatalf("concurrent updates preserved %d/%d pins", len(pins), count)
+	}
+}
+
+func TestLoadPinsFileRejectsExcessiveEntries(t *testing.T) {
+	withTempPinsDir(t)
+	pins := make([]PinnedMessage, maxPinnedMessages+1)
+	for i := range pins {
+		pins[i] = PinnedMessage{ID: fmt.Sprintf("p-%d", i), Role: "user", Content: "x"}
+	}
+	path := pinsPath("project", "default")
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("[")
+	for i, pin := range pins {
+		if i > 0 {
+			data = append(data, ',')
+		}
+		data = append(data, fmt.Sprintf(`{"id":%q,"role":%q,"content":%q}`, pin.ID, pin.Role, pin.Content)...)
+	}
+	data = []byte(strings.ReplaceAll(string(data), `\"`, `"`))
+	data = append(data, ']')
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadPinsFile("project", "default"); err == nil || !strings.Contains(err.Error(), "too many entries") {
+		t.Fatalf("expected entry limit error, got %v", err)
 	}
 }
 

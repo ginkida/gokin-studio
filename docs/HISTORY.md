@@ -7,6 +7,120 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## Release v2.0.0 (2026-08-10)
+
+The Claude Desktop / Cowork parity release, and the largest single release so far:
+172 modified files and 260 new ones (+38.5k lines). Major version because the
+**provider set is a breaking change** — the desktop runtime now accepts only GLM
+and Kimi (`internal/studio/provider_catalog.go`); MiniMax, DeepSeek, and Ollama
+configs are migrated to GLM on load and rejected at the RPC boundary.
+
+Headlines: MCP connectors (stdio + remote HTTP/OAuth, MCPB import, isolated MCP
+Apps host); Claude-compatible skills/plugins/commands/hooks/specialist agents;
+automatic per-chat Git worktree isolation; a persisted 2D split-pane workspace;
+diff review with inline comments and `submit_code_review`; session file pane and
+spot editing; artifacts plus native DOCX/XLSX/PPTX/PDF; live app preview,
+element selection, and isolated external Browser tabs; computer use; scheduled
+tasks; PR/CI monitoring with opt-in auto-archive; permission modes (Plan /
+Manual / Accept edits / Auto / Skip) with persistent per-project scopes; side
+chat, cross-session search, and `session_agent`; Quick Entry, macOS dictation,
+deep links, native menus, and notify-only update checks. The capability/boundary
+table lives in `docs/CLAUDE_DESKTOP_PARITY.md`.
+
+### Release-blocking fixes found by the pre-release review
+
+The multi-agent review of the uncommitted tree found defects that all compiled
+and passed the existing suite. Fixed before tagging:
+
+- **macOS Preview + external Browser never loaded.** Both served their bridge on
+  `gokin-<token>.localhost`; App Transport Security exempts only bare
+  `localhost` and loopback literals and rejected that host with `-1022`
+  (measured against real `.app` bundles — an ATS exception does not help, and
+  CFNetwork does not resolve those names either). Both now serve on
+  `127.0.0.1:<ephemeral port>`; the per-run port still gives each pane its own
+  web origin.
+- **SSRF bypass.** `isBlockedIP` covered neither `0.0.0.0/8` nor IPv6 `::`, which
+  the kernel routes to loopback — reaching the preview proxy, the OAuth callback
+  listener, and the user's dev servers. Both ranges are now blocked, with a
+  regression test.
+- **Scheduler deadlock.** `dispatchScheduledTask` held `s.mu.RLock` across
+  `startMessage`, which took `s.mu.RLock` again; Go blocks new readers once a
+  writer is pending, wedging the scheduler, the writer, `Shutdown`'s `wg.Wait`,
+  and the quit sheet permanently. Split into a `*Locked` claim that keeps the
+  original archive-exclusion guarantee; covered by a test that hangs on the old
+  code.
+- **Session could be pinned busy forever.** A worktree-registry early return in
+  `sendMessage` landed after `session.active = true` but before the defer that
+  clears it, so no later turn could ever start in that chat. Added an idempotent
+  teardown defer at the claim point; the dedicated execution client is now also
+  closed exactly once, from where it is created.
+- **Whole transcript could stop persisting.** `saveHistoryFull` aborted if any
+  inline blob failed the composer attachment allowlist — and `read` on an
+  `.svg`/`.bmp`/`.ico`/`.tiff` puts exactly such a MIME into history on Kimi. The
+  bad part stayed in memory, so every later save failed too and the conversation
+  was lost on restart. Unpersistable blobs are now dropped with a visible marker.
+- **Backups carried every Git worktree.** Session checkouts live under
+  `<configDir>/worktrees/`, which `writeConfigArchive` walked, so each export and
+  daily auto-backup included a full copy of every connected repository. Excluded.
+- **`env` leaked secure-storage secrets.** The tool merged Settings → Local
+  environment values (macOS Keychain / Windows DPAPI) into its output with no
+  approval gate and availability even in Plan mode. It now reports those names
+  with the value withheld.
+- **`git_branch action=switch force=true` was auto-approved** in the default Auto
+  mode, so `git checkout -f` could silently discard uncommitted work. Forced
+  switches now require exact review.
+- **`session_agent action=send` was ungated** even though it starts a full
+  tool-enabled turn in another chat under that chat's permission mode — strictly
+  more capable than the already-gated `ask_agent`. `send`/`rename`/`archive` are
+  now hard-gated; `list`/`read`/`suggest` stay promptless.
+- **External browser origin confusion.** Any cross-origin subresource answering
+  with an HTML content type reassigned `run.target`, repointing the tab at an
+  unapproved host while approval dialogs and model payloads still named the
+  approved origin. Re-pointing now requires an origin match.
+- **Loader-injection env gap.** Only two literal `DYLD_` names were reserved, so
+  `DYLD_FRAMEWORK_PATH`, `DYLD_FALLBACK_LIBRARY_PATH`, `LD_AUDIT` and friends were
+  accepted and injected into every sandboxed process. Whole `DYLD_*`/`LD_*`/
+  `BASH_FUNC_*` families are now rejected.
+- **Linux: an OAuth MCP connector could be added but never removed** — the
+  platform stub's delete error aborted `RemoveMCPServer` before it wrote the
+  pruned config. Delete is now a no-op where secure storage cannot store.
+- **Windows: path-form preview executables never ran** — the resolver tested
+  POSIX `0o111` bits, which `os.Stat` never sets on Windows. Extension-based
+  (PATHEXT-aware) check there.
+- **Quick Entry use-after-free on quit** — the run-loop thread freed the gesture
+  struct while `Stop()` was still dereferencing it. Teardown moved after the join.
+- **Upgrade-path damage:** a snippet library was rejected wholesale if any entry
+  used a name this release newly reserves (`/btw`, `/sessions`, …) — load is now
+  lenient and drops only the offending entry, while save stays strict; and a
+  `config.yaml` symlinked into a dotfiles repo is no longer renamed aside.
+- **Unbounded scheduler growth** — evicted run rows are the only link to the chat
+  and worktree they created, so interval schedules orphaned one of each per
+  firing. Eviction now reaps them in the background, retaining any run that is
+  still active or has a dirty worktree.
+- **Repo hygiene:** `.gokin/` (local paths, prompt previews, agent output) is now
+  gitignored instead of being committed.
+
+Docs corrected against the code: SECURITY.md no longer declares OS-level
+sandboxing out of scope while the README advertises fail-closed Seatbelt/
+bubblewrap, no longer mentions the removed Ollama provider, and now names the
+new execution surfaces; the parity table's `DYLD_*` claim matches the reject
+list; the README shortcut table said `Cmd/Ctrl+Shift+D` starts dictation when it
+toggles the Diff pane.
+
+Verified for release: `go build`/`go vet` clean; full Go suite green on macOS and
+in a Linux container matching CI; `-race` clean; `tsc` + `vite build` clean;
+frontend unit tests green; `wails build -platform darwin/universal` produces a
+working x86_64+arm64 bundle that launches. Version const, `wails.json`, README,
+About, and the MCP host handshake all read 2.0.0.
+
+## What's Done (2026-08-06 — Isolated external Browser tabs)
+
+- Added up to eight external HTTP(S) tabs per chat inside the existing Browser/Preview pane, with an address bar, tab lifecycle, response-link routing, and Cmd/Ctrl-click escape hatch to the default browser.
+- Every first/cross-origin navigation is backend-normalized and reviewed by exact `scheme://host[:port]`; users can allow once or persist the exact origin. Settings lists and revokes persistent permissions. Subdomains, ports, credentials, non-HTTP schemes, private/loopback/link-local/reserved IPs, and mixed public/private DNS answers never inherit trust.
+- External pages now traverse a per-tab secret `*.localhost` proxy instead of loading directly in the WebView. The transport repeats SSRF validation on every request, validates every DNS result, pins the connected IP, disables redirects, bounds bodies, strips framing/reporting headers and upstream cookies, owns an ephemeral cookie jar, rewrites common HTML/CSS/subresource/fetch URLs, and enforces a restrictive CSP. Cross-origin navigation rotates the local hostname so browser storage cannot cross public origins.
+- Browser listeners close with their tab/chat/project/app. Persistent domain trust is mode `0600`, fail-closed on corruption, excluded from manual/automatic archives, and ignored during import so a backup cannot grant network access on another device.
+- Added backend regression coverage for URL/origin normalization, localhost rejection, exact-origin persistence/revoke, secret proxy access, CSP/resource rewriting, cross-origin reapproval/local-origin rotation, archive omission, DNS-rebinding rejection, and IP pinning. Regenerated Wails bindings and kept the existing local dev/static preview path unchanged.
+
 ## Release v1.2.0 (2026-06-20)
 
 UI redesign toward the user's target mockup — a front-end-only refresh on top of v1.1.0 (no backend /

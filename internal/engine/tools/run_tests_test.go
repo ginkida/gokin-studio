@@ -129,6 +129,41 @@ func TestFoo(t *testing.T) {}
 	}
 }
 
+func TestRunTestsRejectsPathOutsideConnectedProject(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	tool := NewRunTestsTool(root)
+	for _, path := range []string{outside, filepath.Join("..", filepath.Base(outside))} {
+		result, err := tool.Execute(context.Background(), map[string]any{
+			"path": path, "framework": "go",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Success || !strings.Contains(result.Error, "inside the connected project") {
+			t.Errorf("run_tests path %q = %#v", path, result)
+		}
+	}
+}
+
+func TestRunTestsRejectsSymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	link := filepath.Join(root, "outside-link")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	result, err := NewRunTestsTool(root).Execute(context.Background(), map[string]any{
+		"path": "outside-link", "framework": "go",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Success || !strings.Contains(result.Error, "inside the connected project") {
+		t.Fatalf("symlink escape = %#v", result)
+	}
+}
+
 // TestParseGoTestResultsKeepsTrailingAssertion pins the head+tail fix: go-test
 // appends the assertion at the END of a test's output, so a test that logs >20
 // progress lines before failing must still show its got/want in the report

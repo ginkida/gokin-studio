@@ -15,7 +15,11 @@ func TestGetModelProfile_ExactMatch(t *testing.T) {
 		{"glm-5.2", "glm", 1000000, true},
 		{"glm-5.1", "glm", 200000, true},
 		{"glm-5", "glm", 200000, true},
+		{"glm-4.7", "glm", 200000, true},
 		{"kimi-for-coding", "kimi", 262144, true},
+		{"kimi-for-coding-highspeed", "kimi", 262144, true},
+		{"k3-256k", "kimi", 262144, true},
+		{"k3", "kimi", 1048576, true},
 		{"minimax-m2.5", "minimax", 204800, true},
 		{"deepseek-v4-pro", "deepseek", 1000000, true},
 		{"deepseek-v4-flash", "deepseek", 1000000, true},
@@ -114,7 +118,7 @@ func TestGetModelProfile_Unknown(t *testing.T) {
 func TestGetModelProfile_IsCoding(t *testing.T) {
 	codingModels := []string{
 		"qwen2.5-coder", "codellama", "starcoder2",
-		"glm-5.2", "glm-5", "glm-4.7", "kimi-for-coding",
+		"glm-5.2", "glm-5.1", "glm-5", "glm-4.7", "kimi-for-coding", "k3",
 		"minimax-m2.7", "minimax-m2.5",
 		"deepseek-v4-pro", "deepseek-v4-flash",
 		"claude-sonnet", "claude-opus",

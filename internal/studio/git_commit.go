@@ -24,10 +24,10 @@ type CommitResult struct {
 // pre-commit hook rejects). git's combined output is surfaced in the error so
 // the user can see exactly why it failed.
 func (s *Studio) CommitChanges(projectID, message string) (*CommitResult, error) {
-	message = strings.TrimSpace(message)
-	if message == "" {
-		return nil, fmt.Errorf("commit message is required")
+	if err := validateRPCText("commit message", message, CommitMessageMaxBytes, true); err != nil {
+		return nil, err
 	}
+	message = strings.TrimSpace(message)
 	s.mu.RLock()
 	p, ok := s.projects[projectID]
 	s.mu.RUnlock()
@@ -38,6 +38,32 @@ func (s *Studio) CommitChanges(projectID, message string) (*CommitResult, error)
 	dir := p.Directory
 	pName := p.Name
 	p.mu.RUnlock()
+	return s.commitChangesAt(dir, pName, message)
+}
+
+// CommitSessionChanges stages and commits only in the checkout owned by the
+// selected conversation. This prevents the context panel from accidentally
+// committing the shared project root while the agent is editing a worktree.
+func (s *Studio) CommitSessionChanges(projectID, sessionID, message string) (*CommitResult, error) {
+	if err := validateRPCText("commit message", message, CommitMessageMaxBytes, true); err != nil {
+		return nil, err
+	}
+	message = strings.TrimSpace(message)
+	p, session, err := s.projectSession(projectID, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	dir, err := sessionWorkingDirectory(p, session)
+	if err != nil {
+		return nil, err
+	}
+	p.mu.RLock()
+	pName := p.Name
+	p.mu.RUnlock()
+	return s.commitChangesAt(dir, pName, message)
+}
+
+func (s *Studio) commitChangesAt(dir, projectName, message string) (*CommitResult, error) {
 
 	if runGit(dir, "rev-parse", "--is-inside-work-tree") != "true" {
 		return nil, fmt.Errorf("not a git repository")
@@ -58,7 +84,7 @@ func (s *Studio) CommitChanges(projectID, message string) (*CommitResult, error)
 		Subject: firstLine(message),
 		Branch:  runGit(dir, "rev-parse", "--abbrev-ref", "HEAD"),
 	}
-	s.logf("info", "git", "committed in %q: %s (%s)", pName, res.Subject, res.Hash)
+	s.logf("info", "git", "committed in %q: %s (%s)", projectName, res.Subject, res.Hash)
 	return res, nil
 }
 
@@ -69,8 +95,16 @@ func runGitErr(dir string, timeout time.Duration, args ...string) (string, error
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	full := append([]string{"-C", dir}, args...)
-	out, err := exec.CommandContext(ctx, "git", full...).CombinedOutput()
-	return strings.TrimSpace(string(out)), err
+	cmd := exec.CommandContext(ctx, "git", full...)
+	cmd.WaitDelay = gitWaitDelay
+	output := &cappedCommandOutput{limit: maxGitOutputBytes}
+	// A shared writer preserves CombinedOutput's useful stdout+stderr behavior.
+	// os/exec serializes writes when both fields reference the same comparable
+	// writer, and cappedCommandOutput keeps noisy hooks memory-safe.
+	cmd.Stdout = output
+	cmd.Stderr = output
+	err := cmd.Run()
+	return strings.TrimSpace(output.String()), err
 }
 
 func gitErrText(out string, err error) string {

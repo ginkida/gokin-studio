@@ -162,7 +162,7 @@ var toolSetDefinitions = map[ToolSet][]string{
 	ToolSetCore: {
 		"read", "write", "edit", "bash", "glob", "grep",
 		"ask_user", "list_dir", "tree", "diff", "todo",
-		"tools_list", "request_tool",
+		"tools_list", "request_tool", "document_create", "scheduled_task",
 	},
 	ToolSetGit: {
 		"git_status", "git_diff", "git_add", "git_commit",
@@ -174,7 +174,7 @@ var toolSetDefinitions = map[ToolSet][]string{
 		"task", "task_output", "task_stop",
 	},
 	ToolSetAgent: {
-		"ask_agent", "coordinate", "shared_memory", "update_scratchpad",
+		"ask_agent", "coordinate", "shared_memory", "update_scratchpad", "session_agent", "search_session_transcripts",
 	},
 	ToolSetWeb: {
 		"web_fetch", "web_search",
@@ -246,6 +246,7 @@ func DefaultRegistry(workDir string) *Registry {
 	r.MustRegister(NewReadTool(workDir))
 	r.MustRegister(NewWriteTool(workDir))
 	r.MustRegister(NewEditTool(workDir))
+	r.MustRegister(NewDocumentCreateTool(workDir))
 	r.MustRegister(NewBashTool(workDir))
 	r.MustRegister(NewGlobTool(workDir))
 	r.MustRegister(NewGrepTool(workDir))
@@ -255,6 +256,7 @@ func DefaultRegistry(workDir string) *Registry {
 	r.MustRegister(NewTreeTool(workDir))
 	r.MustRegister(NewEnvTool())
 	r.MustRegister(NewAskUserTool())
+	r.MustRegister(NewScheduledTaskTool())
 	r.MustRegister(NewTaskOutputTool())
 	r.MustRegister(NewTaskStopTool())
 	r.MustRegister(NewWebFetchTool())
@@ -273,6 +275,8 @@ func DefaultRegistry(workDir string) *Registry {
 	r.MustRegister(NewToolsListTool(r))
 	r.MustRegister(NewRequestToolTool())
 	r.MustRegister(NewAskAgentTool())
+	r.MustRegister(NewSessionAgentTool())
+	r.MustRegister(NewSearchSessionTranscriptsTool())
 
 	// File operation tools
 	r.MustRegister(NewCopyTool(workDir))
@@ -503,6 +507,7 @@ func DefaultLazyRegistry(workDir string) *LazyRegistry {
 	r.RegisterFactory("read", func() Tool { return NewReadTool(workDir) }, nil)
 	r.RegisterFactory("write", func() Tool { return NewWriteTool(workDir) }, nil)
 	r.RegisterFactory("edit", func() Tool { return NewEditTool(workDir) }, nil)
+	r.RegisterFactory("document_create", func() Tool { return NewDocumentCreateTool(workDir) }, nil)
 
 	// Search tools
 	r.RegisterFactory("glob", func() Tool { return NewGlobTool(workDir) }, nil)
@@ -532,7 +537,10 @@ func DefaultLazyRegistry(workDir string) *LazyRegistry {
 	r.RegisterFactory("todo", func() Tool { return NewTodoTool() }, nil)
 	// User interaction
 	r.RegisterFactory("ask_user", func() Tool { return NewAskUserTool() }, nil)
+	r.RegisterFactory("scheduled_task", func() Tool { return NewScheduledTaskTool() }, nil)
 	r.RegisterFactory("ask_agent", func() Tool { return NewAskAgentTool() }, nil)
+	r.RegisterFactory("session_agent", func() Tool { return NewSessionAgentTool() }, nil)
+	r.RegisterFactory("search_session_transcripts", func() Tool { return NewSearchSessionTranscriptsTool() }, nil)
 
 	// Web tools
 	r.RegisterFactory("web_fetch", func() Tool { return NewWebFetchTool() }, nil)

@@ -30,6 +30,7 @@ func seedConfigDirForArchive(t *testing.T, dir string) {
 		// These should be skipped:
 		".gokin-write-probe": "ok",
 		"history/.DS_Store":  "junk",
+		permissionsFileName:  `{"version":1,"origins":["https://trusted.example"]}`,
 	}
 	for rel, content := range files {
 		full := filepath.Join(dir, rel)
@@ -104,6 +105,9 @@ func TestExportAllDataBase64_RoundTrip(t *testing.T) {
 	}
 	if _, ok := seen["history/.DS_Store"]; ok {
 		t.Error(".DS_Store was archived (should be skipped)")
+	}
+	if _, ok := seen[permissionsFileName]; ok {
+		t.Error("device-local browser permissions were archived")
 	}
 	// History/drafts/pins/etc. should be present.
 	for _, want := range []string{

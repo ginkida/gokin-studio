@@ -176,3 +176,32 @@ func TestListProjectFiles_EmptyDir(t *testing.T) {
 		t.Errorf("expected 0 files in empty dir, got %d: %v", len(got), got)
 	}
 }
+
+func TestListProjectFilesSkipsSymlinks(t *testing.T) {
+	s := newStudioForTest(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "real.txt"), []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, "outside-link.txt")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := os.Symlink("real.txt", filepath.Join(dir, "inside-link.txt")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	info, err := s.AddProject("links", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ListProjectFiles(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "real.txt" {
+		t.Fatalf("symlinks leaked into suggestions: %v", got)
+	}
+}

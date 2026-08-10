@@ -55,8 +55,10 @@ type mockClient struct {
 	sendMessageOverride *mockResp
 
 	// Captured args from the most recent SendFunctionResponse call.
-	lastFuncRespHistory []*genai.Content
-	lastFuncRespResults []*genai.FunctionResponse
+	lastFuncRespHistory  []*genai.Content
+	lastFuncRespResults  []*genai.FunctionResponse
+	sendHistoryCalls     [][]*genai.Content
+	funcRespHistoryCalls [][]*genai.Content
 
 	// Captured by SetSystemInstruction.
 	lastSystemInstruction string
@@ -66,6 +68,13 @@ type mockClient struct {
 	// the GLM cache-stability test to assert the cached prefix doesn't drift.
 	systemInstructionCalls []string
 	turnContextCalls       []string
+	lastTools              []*genai.Tool
+	closeCalls             int
+
+	// Optional one-shot barrier used by queue tests to keep the first provider
+	// call in flight while a follow-up is submitted through the Studio RPC.
+	sendEntered chan struct{}
+	sendRelease <-chan struct{}
 }
 
 func (m *mockClient) pop() mockResp {
@@ -124,13 +133,25 @@ func cancelIfNeeded(r mockResp) {
 	}
 }
 
-func (m *mockClient) SendMessageWithHistory(_ context.Context, _ []*genai.Content, _ string) (*client.StreamingResponse, error) {
+func (m *mockClient) SendMessageWithHistory(_ context.Context, history []*genai.Content, _ string) (*client.StreamingResponse, error) {
 	m.mu.Lock()
 	if m.shouldPanic {
 		m.mu.Unlock()
 		panic("intentional test panic in SendMessageWithHistory")
 	}
+	snapshot := append([]*genai.Content(nil), history...)
+	m.sendHistoryCalls = append(m.sendHistoryCalls, snapshot)
+	entered := m.sendEntered
+	release := m.sendRelease
+	m.sendEntered = nil
+	m.sendRelease = nil
 	m.mu.Unlock()
+	if entered != nil {
+		close(entered)
+		if release != nil {
+			<-release
+		}
+	}
 	r := m.pop()
 	cancelIfNeeded(r)
 	if r.err != nil {
@@ -142,10 +163,63 @@ func (m *mockClient) SendMessageWithHistory(_ context.Context, _ []*genai.Conten
 	return makeStream(r), nil
 }
 
+func TestAgentLoop_ContextOverflowCompactsAndRetries(t *testing.T) {
+	mc := &mockClient{responses: []mockResp{
+		{err: &client.HTTPError{StatusCode: 413, Message: "request entity too large"}},
+		{text: "recovered after compaction"},
+	}}
+	p, rec := newTestProject(t, mc, nil)
+	session := p.GetSession("default")
+	session.mu.Lock()
+	for i := 0; i < 8; i++ {
+		session.history = append(session.history,
+			genai.NewContentFromText(fmt.Sprintf("old request %d", i), genai.RoleUser),
+			genai.NewContentFromText(strings.Repeat("old answer ", 200), genai.RoleModel),
+		)
+	}
+	session.mu.Unlock()
+
+	runAgent(p, "current request must survive")
+
+	if errs := rec.find(EventChatError); len(errs) != 0 {
+		t.Fatalf("unexpected chat:error after recovery: %#v", errs)
+	}
+	if len(rec.find(EventChatRetry)) != 1 {
+		t.Fatalf("retry events = %d, want 1", len(rec.find(EventChatRetry)))
+	}
+	completes := rec.find(EventChatComplete)
+	if len(completes) != 1 || completes[0].data.(ChatCompleteEvent).Text != "recovered after compaction" {
+		t.Fatalf("completion = %#v", completes)
+	}
+
+	mc.mu.Lock()
+	calls := append([][]*genai.Content(nil), mc.sendHistoryCalls...)
+	callCount := mc.callCount
+	mc.mu.Unlock()
+	if callCount != 2 || len(calls) != 2 {
+		t.Fatalf("calls = %d, captured histories = %d", callCount, len(calls))
+	}
+	if len(calls[1]) >= len(calls[0]) {
+		t.Fatalf("recovery did not reduce history: before=%d after=%d", len(calls[0]), len(calls[1]))
+	}
+	foundCurrent := false
+	for _, content := range calls[1] {
+		for _, part := range content.Parts {
+			if strings.Contains(part.Text, "current request must survive") {
+				foundCurrent = true
+			}
+		}
+	}
+	if !foundCurrent {
+		t.Fatal("emergency compaction dropped the current user request")
+	}
+}
+
 func (m *mockClient) SendFunctionResponse(_ context.Context, history []*genai.Content, results []*genai.FunctionResponse) (*client.StreamingResponse, error) {
 	m.mu.Lock()
 	m.lastFuncRespHistory = history
 	m.lastFuncRespResults = results
+	m.funcRespHistoryCalls = append(m.funcRespHistoryCalls, append([]*genai.Content(nil), history...))
 	m.mu.Unlock()
 	r := m.pop()
 	cancelIfNeeded(r)
@@ -175,8 +249,12 @@ func (m *mockClient) SendMessage(_ context.Context, _ string) (*client.Streaming
 	}
 	return makeStream(*r), nil
 }
-func (m *mockClient) SetTools(_ []*genai.Tool) {}
-func (m *mockClient) SetRateLimiter(_ any)     {}
+func (m *mockClient) SetTools(value []*genai.Tool) {
+	m.mu.Lock()
+	m.lastTools = value
+	m.mu.Unlock()
+}
+func (m *mockClient) SetRateLimiter(_ any) {}
 func (m *mockClient) CountTokens(_ context.Context, _ []*genai.Content) (*genai.CountTokensResponse, error) {
 	return nil, nil
 }
@@ -197,7 +275,12 @@ func (m *mockClient) SetTurnContext(s string) {
 	m.mu.Unlock()
 }
 func (m *mockClient) SetThinkingBudget(_ int32) {}
-func (m *mockClient) Close() error              { return nil }
+func (m *mockClient) Close() error {
+	m.mu.Lock()
+	m.closeCalls++
+	m.mu.Unlock()
+	return nil
+}
 
 // ---------------------------------------------------------------------------
 // Mock tool
@@ -329,11 +412,15 @@ func newTestProject(t *testing.T, mc *mockClient, reg *tools.Registry) (*Project
 	}
 	rec := &recorder{}
 	p := &Project{
-		ID:                "tp",
-		Name:              "Test",
-		Directory:         t.TempDir(),
-		Provider:          "glm",
-		Model:             "glm-5.1",
+		ID:        "tp",
+		Name:      "Test",
+		Directory: t.TempDir(),
+		Provider:  "glm",
+		Model:     "glm-5.1",
+		// Most agent-loop tests exercise tool orchestration, not permission
+		// prompts. Make that fixture intent explicit now that the production
+		// zero value means reviewed Auto rather than the legacy bypass mode.
+		PermissionMode:    "skip",
 		sessions:          map[string]*ChatSession{"default": NewChatSession("Chat 1")},
 		client:            mc,
 		registry:          reg,
@@ -458,6 +545,46 @@ func TestAgentLoop_ToolCall(t *testing.T) {
 	}
 	if len(res) != 1 || res[0].Name != "echo" {
 		t.Errorf("expected 1 FunctionResponse for 'echo' in results, got %v", res)
+	}
+}
+
+func TestAgentLoop_ToolResponseContextOverflowCompactsAndRetries(t *testing.T) {
+	fc := &genai.FunctionCall{ID: "call-overflow", Name: "echo", Args: map[string]any{"input": "pong"}}
+	mc := &mockClient{responses: []mockResp{
+		{funcCalls: []*genai.FunctionCall{fc}},
+		{err: &client.HTTPError{StatusCode: 400, Message: "maximum context length exceeded"}},
+		{text: "tool round recovered"},
+	}}
+	reg := tools.NewRegistry()
+	reg.MustRegister(&echoTool{})
+	p, rec := newTestProject(t, mc, reg)
+	session := p.GetSession("default")
+	session.mu.Lock()
+	for i := 0; i < 6; i++ {
+		session.history = append(session.history,
+			genai.NewContentFromText(fmt.Sprintf("old-%d", i), genai.RoleUser),
+			genai.NewContentFromText(strings.Repeat("history ", 100), genai.RoleModel),
+		)
+	}
+	session.mu.Unlock()
+
+	runAgent(p, "use the tool")
+
+	if errs := rec.find(EventChatError); len(errs) != 0 {
+		t.Fatalf("unexpected errors: %#v", errs)
+	}
+	if retries := rec.find(EventChatRetry); len(retries) != 1 {
+		t.Fatalf("retry events = %d, want 1", len(retries))
+	}
+	mc.mu.Lock()
+	histories := append([][]*genai.Content(nil), mc.funcRespHistoryCalls...)
+	results := append([]*genai.FunctionResponse(nil), mc.lastFuncRespResults...)
+	mc.mu.Unlock()
+	if len(histories) != 2 || len(histories[1]) >= len(histories[0]) {
+		t.Fatalf("function-response recovery histories: first=%d second=%d", len(histories[0]), len(histories[1]))
+	}
+	if len(results) != 1 || results[0].ID != "call-overflow" {
+		t.Fatalf("tool results were not preserved across retry: %#v", results)
 	}
 }
 
@@ -1041,20 +1168,11 @@ func TestSendMessage_InitClientError(t *testing.T) {
 	}
 }
 
-// TestInitClient_FullPath verifies that initClient runs fully (past the NewClient
-// call) when using the Ollama provider, which doesn't require an API key. The
-// Ollama base URL is pointed at a non-listening port so that SendMessageWithHistory
-// fails fast (ECONNREFUSED) without blocking. This covers:
-//   - initClient lines 356-456 (tool setup, messenger wiring, system prompt)
-//   - initMemoryAndPlan lines 227-311 (memory/plan store creation)
-//
-// retryInitialDelay is set to 1ms so the three retry attempts complete in <10ms.
-func TestInitClient_FullPath(t *testing.T) {
+// TestInitClient_RejectsUnsupportedProvider guards the runtime boundary: even
+// a Project constructed outside config loading cannot initialize a legacy
+// provider client.
+func TestInitClient_RejectsUnsupportedProvider(t *testing.T) {
 	_ = withTempHistoryDir(t)
-	// withTempHistoryDir sets GOKIN_CONFIG_DIR; initMemoryAndPlan uses configDir() so
-	// memory stores land in the temp dir rather than ~/.config/gokin-studio.
-
-	rec := &recorder{}
 	s := newStudioForTest(t)
 	p := &Project{
 		ID:        "tp-init-full",
@@ -1062,33 +1180,13 @@ func TestInitClient_FullPath(t *testing.T) {
 		Directory: t.TempDir(),
 		Provider:  "ollama",
 		Model:     "llama3",
-		// client is intentionally nil — forces the full initClient path.
-		sessions:          map[string]*ChatSession{"default": NewChatSession("Chat 1")},
-		testEmitter:       rec.emit,
-		retryInitialDelay: time.Millisecond, // avoid 2s default; ECONNREFUSED retries finish in <10ms
-		studio:            s,
+		sessions:  map[string]*ChatSession{"default": NewChatSession("Chat 1")},
+		studio:    s,
 	}
 	s.projects[p.ID] = p
-
-	// Port 1 is not listening on any test host; the TCP connect fails immediately
-	// with ECONNREFUSED so the test doesn't block waiting for Ollama.
-	p.SendMessage(context.Background(), "hello", Settings{
-		DefaultProvider: "ollama",
-		DefaultModel:    "llama3",
-		OllamaURL:       "http://127.0.0.1:1",
-	})
-
-	// After initClient succeeds and the agent loop exhausts retries, a chat:error
-	// or the idle project:status event must be emitted.
-	if len(rec.find(EventChatError)) == 0 && len(rec.find(EventProjectStatus)) == 0 {
-		t.Error("expected chat:error or project:status after initClient+retry exhaustion, got neither")
-	}
-	// initClient must have set p.client (Ollama HTTP client, no API key needed).
-	p.mu.RLock()
-	c := p.client
-	p.mu.RUnlock()
-	if c == nil {
-		t.Error("expected p.client to be set after initClient success, got nil")
+	err := p.initClient(Settings{DefaultProvider: defaultStudioProvider, DefaultModel: defaultStudioModel})
+	if err == nil || !strings.Contains(err.Error(), "supports only GLM and Kimi") {
+		t.Fatalf("initClient error = %v, want GLM/Kimi-only rejection", err)
 	}
 }
 
@@ -1199,17 +1297,11 @@ func TestInitClient_ThinkingModeEnabled(t *testing.T) {
 	}
 }
 
-// TestInitClient_MinimaxProvider verifies that the "minimax" provider case sets
-// cfg.API.MiniMaxKey inside initClient (line 383-384).
-func TestInitClient_MinimaxProvider(t *testing.T) {
+// TestInitClient_RejectsRemovedMiniMaxProvider locks the product boundary for a
+// provider that older Studio builds supported. Constructing a Project directly
+// must not bypass the GLM/Kimi-only runtime validation.
+func TestInitClient_RejectsRemovedMiniMaxProvider(t *testing.T) {
 	_ = withTempHistoryDir(t)
-	prevKey := os.Getenv("MINIMAX_API_KEY")
-	_ = os.Unsetenv("MINIMAX_API_KEY")
-	t.Cleanup(func() {
-		if prevKey != "" {
-			_ = os.Setenv("MINIMAX_API_KEY", prevKey)
-		}
-	})
 
 	rec := &recorder{}
 	p := &Project{
@@ -1224,11 +1316,15 @@ func TestInitClient_MinimaxProvider(t *testing.T) {
 	p.SendMessage(context.Background(), "hello", Settings{
 		DefaultProvider: "minimax",
 		DefaultModel:    "minimax-text",
-		// MiniMaxKey intentionally empty — initClient fails after minimax branch
 	})
 
-	if len(rec.find(EventChatError)) == 0 {
-		t.Error("expected chat:error after minimax initClient + missing key, got none")
+	errs := rec.find(EventChatError)
+	if len(errs) == 0 {
+		t.Fatal("expected chat:error for removed MiniMax provider")
+	}
+	text := errs[0].data.(ChatTextEvent).Text
+	if !strings.Contains(text, "supports only GLM and Kimi") {
+		t.Fatalf("chat:error = %q, want GLM/Kimi-only rejection", text)
 	}
 }
 

@@ -73,6 +73,7 @@ func TestSaveUserSnippet_Validation(t *testing.T) {
 		{"clear", "body", "built-in command"},
 		{"HELP", "body", "built-in command"}, // case-insensitive reservation check
 		{"export", "body", "built-in command"},
+		{"btw", "body", "built-in command"},
 		{"valid-name_2", "body", ""}, // alphanumeric + dash + underscore allowed
 	}
 	for _, c := range cases {

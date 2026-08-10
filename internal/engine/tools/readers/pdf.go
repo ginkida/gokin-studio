@@ -8,6 +8,13 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
+)
+
+const (
+	pdfReaderMaxInputBytes  = 50 << 20
+	pdfReaderMaxOutputBytes = 4 << 20
+	pdfReaderMaxMatches     = 50_000
 )
 
 // PDFReader reads PDF files and extracts text content.
@@ -22,9 +29,24 @@ func NewPDFReader() *PDFReader {
 // This is a basic PDF text extractor that handles simple PDFs.
 // For complex PDFs with embedded fonts or scanned content, results may vary.
 func (r *PDFReader) Read(filePath string) (string, error) {
-	data, err := os.ReadFile(filePath)
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to stat PDF: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > pdfReaderMaxInputBytes {
+		return "", fmt.Errorf("PDF must be a regular file between 1 byte and %d MiB", pdfReaderMaxInputBytes>>20)
+	}
+	file, err := os.Open(filePath)
 	if err != nil {
 		return "", fmt.Errorf("failed to read PDF: %w", err)
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, pdfReaderMaxInputBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("failed to read PDF: %w", err)
+	}
+	if len(data) > pdfReaderMaxInputBytes {
+		return "", fmt.Errorf("PDF exceeds the %d MiB limit", pdfReaderMaxInputBytes>>20)
 	}
 
 	return r.extractText(data)
@@ -55,7 +77,7 @@ func (r *PDFReader) extractText(data []byte) (string, error) {
 		}
 	}
 
-	return sb.String(), nil
+	return pdfTextPrefix(sb.String(), pdfReaderMaxOutputBytes), nil
 }
 
 // extractStreams extracts text from PDF stream objects.
@@ -100,10 +122,13 @@ func (r *PDFReader) extractStreams(data []byte) string {
 					result.WriteString("\n")
 				}
 				result.WriteString(fmt.Sprintf("## Page %d\n\n", pageNum))
-				result.WriteString(text)
+				pdfAppend(&result, text)
 				result.WriteString("\n")
 				pageNum++
 			}
+		}
+		if result.Len() >= pdfReaderMaxOutputBytes {
+			break
 		}
 
 		pos = end + len(streamEnd)
@@ -133,39 +158,42 @@ func (r *PDFReader) extractTextOperators(content string) string {
 
 	// Pattern for text in parentheses: (text) Tj or (text) '
 	parenPattern := regexp.MustCompile(`\(([^)]*)\)\s*(?:Tj|TJ|'|")`)
-	matches := parenPattern.FindAllStringSubmatch(content, -1)
+	matches := parenPattern.FindAllStringSubmatch(content, pdfReaderMaxMatches)
 	for _, match := range matches {
 		if len(match) > 1 {
 			text := r.decodeString(match[1])
 			if text != "" {
-				result.WriteString(text)
-				result.WriteString(" ")
+				if !pdfAppend(&result, text+" ") {
+					return strings.TrimSpace(result.String())
+				}
 			}
 		}
 	}
 
 	// Pattern for text arrays: [(text) -10 (more)] TJ
 	arrayPattern := regexp.MustCompile(`\[([^\]]+)\]\s*TJ`)
-	arrayMatches := arrayPattern.FindAllStringSubmatch(content, -1)
+	arrayMatches := arrayPattern.FindAllStringSubmatch(content, pdfReaderMaxMatches)
 	for _, match := range arrayMatches {
 		if len(match) > 1 {
 			text := r.extractFromArray(match[1])
 			if text != "" {
-				result.WriteString(text)
-				result.WriteString(" ")
+				if !pdfAppend(&result, text+" ") {
+					return strings.TrimSpace(result.String())
+				}
 			}
 		}
 	}
 
 	// Pattern for hex strings: <hex> Tj
 	hexPattern := regexp.MustCompile(`<([0-9A-Fa-f]+)>\s*(?:Tj|TJ|'|")`)
-	hexMatches := hexPattern.FindAllStringSubmatch(content, -1)
+	hexMatches := hexPattern.FindAllStringSubmatch(content, pdfReaderMaxMatches)
 	for _, match := range hexMatches {
 		if len(match) > 1 {
 			text := r.decodeHexString(match[1])
 			if text != "" {
-				result.WriteString(text)
-				result.WriteString(" ")
+				if !pdfAppend(&result, text+" ") {
+					return strings.TrimSpace(result.String())
+				}
 			}
 		}
 	}
@@ -179,21 +207,25 @@ func (r *PDFReader) extractFromArray(content string) string {
 
 	// Find all parenthesized strings in the array
 	parenPattern := regexp.MustCompile(`\(([^)]*)\)`)
-	matches := parenPattern.FindAllStringSubmatch(content, -1)
+	matches := parenPattern.FindAllStringSubmatch(content, pdfReaderMaxMatches)
 	for _, match := range matches {
 		if len(match) > 1 {
 			text := r.decodeString(match[1])
-			result.WriteString(text)
+			if !pdfAppend(&result, text) {
+				return result.String()
+			}
 		}
 	}
 
 	// Find all hex strings in the array
 	hexPattern := regexp.MustCompile(`<([0-9A-Fa-f]+)>`)
-	hexMatches := hexPattern.FindAllStringSubmatch(content, -1)
+	hexMatches := hexPattern.FindAllStringSubmatch(content, pdfReaderMaxMatches)
 	for _, match := range hexMatches {
 		if len(match) > 1 {
 			text := r.decodeHexString(match[1])
-			result.WriteString(text)
+			if !pdfAppend(&result, text) {
+				return result.String()
+			}
 		}
 	}
 
@@ -261,6 +293,9 @@ func (r *PDFReader) decodeString(s string) string {
 		} else {
 			result.WriteRune(ch)
 		}
+		if result.Len() >= pdfReaderMaxOutputBytes {
+			break
+		}
 	}
 
 	return result.String()
@@ -284,6 +319,9 @@ func (r *PDFReader) decodeHexString(s string) string {
 		val, err := strconv.ParseInt(s[i:i+2], 16, 32)
 		if err == nil && val >= 32 && val < 127 {
 			result.WriteRune(rune(val))
+		}
+		if result.Len() >= pdfReaderMaxOutputBytes {
+			break
 		}
 	}
 
@@ -310,6 +348,17 @@ func (r *PDFReader) extractPlainText(data []byte) string {
 			}
 			current.Reset()
 		}
+		if result.Len() >= pdfReaderMaxOutputBytes {
+			break
+		}
+		if current.Len() >= pdfReaderMaxOutputBytes {
+			word := current.String()
+			if r.isReadableWord(word) {
+				pdfAppend(&result, word)
+			}
+			current.Reset()
+			break
+		}
 	}
 
 	// Don't forget the last word
@@ -322,6 +371,33 @@ func (r *PDFReader) extractPlainText(data []byte) string {
 	}
 
 	return result.String()
+}
+
+func pdfAppend(output *strings.Builder, text string) bool {
+	remaining := pdfReaderMaxOutputBytes - output.Len()
+	if remaining <= 0 {
+		return false
+	}
+	if len(text) <= remaining {
+		output.WriteString(text)
+		return true
+	}
+	output.WriteString(pdfTextPrefix(text, remaining))
+	return false
+}
+
+func pdfTextPrefix(value string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(value) <= maxBytes {
+		return value
+	}
+	end := maxBytes
+	for end > 0 && !utf8.ValidString(value[:end]) {
+		end--
+	}
+	return value[:end]
 }
 
 // isReadableWord checks if a string looks like readable text.

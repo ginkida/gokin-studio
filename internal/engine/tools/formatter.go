@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ginkida/gokin-studio/internal/engine/logging"
+	"github.com/ginkida/gokin-studio/internal/engine/security"
 )
 
 // Formatter runs language-specific formatters on files after write/edit operations.
@@ -64,7 +65,34 @@ func (f *Formatter) Format(ctx context.Context, filePath string) error {
 	ctx, cancel := context.WithTimeout(ctx, f.timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, parts[0], append(parts[1:], filePath)...)
+	absoluteFile, err := filepath.Abs(filePath)
+	if err != nil {
+		logging.Warn("auto-format skipped: could not resolve file", "file", filePath, "error", err)
+		return nil
+	}
+	isolation := security.DetectWorkspaceIsolation()
+	if !isolation.Available {
+		logging.Warn("auto-format skipped: workspace isolation unavailable",
+			"file", filePath,
+			"formatter", cmdTemplate,
+			"detail", isolation.Detail)
+		return nil
+	}
+	isolated, err := security.NewSandboxedCommandArgs(
+		ctx,
+		filepath.Dir(absoluteFile),
+		parts[0],
+		append(parts[1:], absoluteFile),
+		security.DefaultSandboxConfig(),
+	)
+	if err != nil {
+		logging.Warn("auto-format skipped: could not create workspace sandbox",
+			"file", filePath,
+			"formatter", cmdTemplate,
+			"error", err)
+		return nil
+	}
+	cmd := isolated.Command()
 	if output, err := cmd.CombinedOutput(); err != nil {
 		logging.Warn("auto-format failed",
 			"file", filePath,

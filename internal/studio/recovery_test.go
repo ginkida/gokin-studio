@@ -182,15 +182,15 @@ func TestGetRecoveryEvents_LoadReplayError(t *testing.T) {
 func TestApplyDefaultToProjects(t *testing.T) {
 	s := newStudioForTest(t)
 
-	// Create two projects with different providers.
+	// Create two projects with different supported models.
 	pA := addTestProject(t, s, "Alpha")
 	pB := addTestProject(t, s, "Beta")
 
 	// Give them an initial provider so we can confirm it changes.
-	if err := s.SetProjectProvider(pA.ID, "ollama", "llama3"); err != nil {
+	if err := s.SetProjectProvider(pA.ID, "glm", "glm-4.7"); err != nil {
 		t.Fatalf("SetProjectProvider A: %v", err)
 	}
-	if err := s.SetProjectProvider(pB.ID, "minimax", "minimax-text"); err != nil {
+	if err := s.SetProjectProvider(pB.ID, "glm", "glm-5"); err != nil {
 		t.Fatalf("SetProjectProvider B: %v", err)
 	}
 

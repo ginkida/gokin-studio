@@ -41,6 +41,7 @@ func NewIPValidator() *IPValidator {
 	// Define blocked CIDR ranges
 	blockedCIDRs := []string{
 		// IPv4 private ranges
+		"0.0.0.0/8",          // "This network" — the OS routes 0.0.0.0 to loopback
 		"10.0.0.0/8",         // Class A private
 		"172.16.0.0/12",      // Class B private
 		"192.168.0.0/16",     // Class C private
@@ -58,6 +59,7 @@ func NewIPValidator() *IPValidator {
 		"255.255.255.255/32", // Broadcast
 
 		// IPv6 private/special ranges
+		"::/128",        // Unspecified — reaches loopback like 0.0.0.0
 		"::1/128",       // Loopback
 		"fe80::/10",     // Link-local
 		"fc00::/7",      // Unique local address
@@ -202,21 +204,23 @@ func (v *IPValidator) isBlockedIP(ip net.IP) bool {
 		return true // Nil IP is blocked
 	}
 
-	// Check against all blocked networks
-	for _, network := range v.blockedNetworks {
-		if network.Contains(ip) {
-			return true
-		}
-	}
-
-	// Additional check for IPv4-mapped IPv6 addresses
-	// These are in the form ::ffff:192.168.1.1
+	// net.ParseIP and DNS often represent an IPv4 address as a 16-byte
+	// IPv4-mapped value. Normalize it before CIDR checks; otherwise the broad
+	// ::ffff:0:0/96 defense range also matches every ordinary public IPv4
+	// address. Mapped private addresses remain blocked by their IPv4 CIDRs.
 	if ip4 := ip.To4(); ip4 != nil {
-		// Re-check as IPv4
 		for _, network := range v.blockedNetworks {
-			if network.Contains(ip4) {
+			if len(network.Mask) == net.IPv4len && network.Contains(ip4) {
 				return true
 			}
+		}
+		return false
+	}
+
+	// Native IPv6 must only be compared against IPv6 ranges.
+	for _, network := range v.blockedNetworks {
+		if len(network.Mask) == net.IPv6len && network.Contains(ip) {
+			return true
 		}
 	}
 

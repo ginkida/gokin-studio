@@ -38,7 +38,7 @@ func TestToConfig_NoRaceWithSetProjectProvider(t *testing.T) {
 			model := "glm-5.2"
 			if i%2 == 1 {
 				provider = "kimi"
-				model = "kimi-for-coding"
+				model = "k3"
 			}
 			_ = s.SetProjectProvider(info.ID, provider, model)
 		}
@@ -71,7 +71,7 @@ func TestToConfig_NoRaceWithSetProjectProvider(t *testing.T) {
 					return
 				}
 			case "kimi":
-				if model != "" && model != "kimi-for-coding" {
+				if model != "" && model != "k3" {
 					t.Errorf("torn read: provider=kimi but model=%q", model)
 					return
 				}

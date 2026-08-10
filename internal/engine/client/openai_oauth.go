@@ -43,6 +43,7 @@ type OpenAIOAuthClient struct {
 
 	statusCallback    StatusCallback
 	systemInstruction string
+	turnContext       string
 	thinkingBudget    int32
 	reasoningEffort   string // none/low/medium/high/xhigh — overrides thinkingBudget mapping
 
@@ -125,8 +126,11 @@ func (c *OpenAIOAuthClient) SetSystemInstruction(instruction string) {
 	c.systemInstruction = instruction
 }
 
-// SetTurnContext is a no-op for OpenAIOAuthClient (turn context not supported on this provider).
-func (c *OpenAIOAuthClient) SetTurnContext(_ string) {}
+func (c *OpenAIOAuthClient) SetTurnContext(turnContext string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.turnContext = turnContext
+}
 
 // SetThinkingBudget configures the thinking/reasoning budget.
 func (c *OpenAIOAuthClient) SetThinkingBudget(budget int32) {
@@ -251,6 +255,7 @@ func (c *OpenAIOAuthClient) WithModel(modelName string) Client {
 		streamIdleTimeout: c.streamIdleTimeout,
 		statusCallback:    c.statusCallback,
 		systemInstruction: c.systemInstruction,
+		turnContext:       c.turnContext,
 		thinkingBudget:    c.thinkingBudget,
 		reasoningEffort:   c.reasoningEffort,
 		refreshGroup:      c.refreshGroup, // shared across clones
@@ -488,6 +493,7 @@ func (c *OpenAIOAuthClient) buildRequest(contents []*genai.Content) map[string]a
 	c.mu.RLock()
 	model := c.model
 	sysInstruction := c.systemInstruction
+	turnContext := c.turnContext
 	toolsSnap := c.tools
 	thinkingBudget := c.thinkingBudget
 	cfgEffort := c.reasoningEffort
@@ -499,7 +505,7 @@ func (c *OpenAIOAuthClient) buildRequest(contents []*genai.Content) map[string]a
 	}
 
 	// Convert contents to OpenAI Responses API input format
-	input := c.convertContentsToInput(contents)
+	input := c.convertContentsToInput(appendTurnContextToContents(contents, turnContext))
 	if len(input) > 0 {
 		reqBody["input"] = input
 	}

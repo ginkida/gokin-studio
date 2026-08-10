@@ -88,6 +88,15 @@ func (s *Studio) auditProjectAdded(name, directory string) {
 	s.logf("info", "project", "added project %q at %s", name, directory)
 }
 
+// auditProjectDirectory logs an explicit user-driven workspace relink. Paths
+// are already user-visible project metadata and are never provider secrets.
+func (s *Studio) auditProjectDirectory(name, oldDirectory, newDirectory string) {
+	if oldDirectory == newDirectory {
+		return
+	}
+	s.logf("info", "project", "%s: folder %s → %s", name, oldDirectory, newDirectory)
+}
+
 // auditProjectRemoved logs deletion.
 func (s *Studio) auditProjectRemoved(name string) {
 	s.logf("info", "project", "removed project %q", name)
@@ -100,4 +109,3 @@ func (s *Studio) auditProjectRenamed(oldName, newName string) {
 	}
 	s.logf("info", "project", "renamed %q → %q", oldName, newName)
 }
-

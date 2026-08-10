@@ -27,28 +27,26 @@ var planModeReadOnlyTools = map[string]bool{
 	"tools_list": true,
 
 	// Read-only git
-	"git_status":     true,
-	"git_diff":       true,
-	"git_log":        true,
-	"git_blame":      true,
-	"git_branch":     true,
-	"review_changes": true,
+	"git_status":         true,
+	"git_diff":           true,
+	"git_log":            true,
+	"git_blame":          true,
+	"review_changes":     true,
+	"submit_code_review": true,
 
-	// User interaction / observation (surface, don't mutate disk)
+	// User interaction / observation (surface, don't mutate disk). Plan status
+	// is observational; enter/update/exit are deliberately excluded so only the
+	// user-facing session control can approve a transition to execution.
 	"ask_user":        true,
-	"todo":            true,
 	"task_output":     true,
 	"get_plan_status": true,
 
-	// Memory reads (writes like `memorize` are intentionally absent)
-	"memory":         true,
-	"history_search": true,
-	"pin_context":    true,
-
-	// Plan lifecycle itself — how the model exits plan mode
-	"enter_plan_mode":      true,
-	"exit_plan_mode":       true,
-	"update_plan_progress": true,
+	// Read-only session/plugin context. The multi-action `memory` and
+	// `pin_context` tools are intentionally absent because their schemas also
+	// expose write/forget operations that cannot be removed per declaration.
+	"history_search":             true,
+	"plugin_resource":            true,
+	"search_session_transcripts": true,
 }
 
 // IsReadOnlyForPlanMode reports whether a tool can run while the agent is in

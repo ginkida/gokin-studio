@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ginkida/gokin-studio/internal/engine/security"
 )
 
 // SafeEnvVars is the whitelist of environment variables passed to task commands.
@@ -217,6 +219,12 @@ type Task struct {
 	// Program and Args allow exec without shell interpretation (prevents injection).
 	Program string
 	Args    []string
+	// Sandboxed requires a real workspace filesystem sandbox. If the backend
+	// cannot be created, Start fails instead of silently executing on the host.
+	Sandboxed bool
+	// AllowNetwork is set only after an exact-action approval for this task.
+	// The sandbox otherwise blocks external/LAN access by default.
+	AllowNetwork bool
 
 	cmd            *exec.Cmd
 	cancelFunc     context.CancelFunc
@@ -265,7 +273,23 @@ func (t *Task) Start(ctx context.Context) error {
 
 	// Create command - use Program/Args if set (no shell interpretation),
 	// otherwise fall back to shell execution
-	if t.Program != "" {
+	if t.Sandboxed {
+		config := security.DefaultSandboxConfig()
+		config.AllowNetwork = t.AllowNetwork
+		var isolated *security.SandboxedCommand
+		var err error
+		if t.Program != "" {
+			isolated, err = security.NewSandboxedCommandArgs(execCtx, t.WorkDir, t.Program, t.Args, config)
+		} else {
+			isolated, err = security.NewSandboxedCommand(execCtx, t.WorkDir, t.Command, config)
+		}
+		if err != nil {
+			cancel()
+			t.mu.Unlock()
+			return fmt.Errorf("create workspace sandbox: %w", err)
+		}
+		t.cmd = isolated.Command()
+	} else if t.Program != "" {
 		t.cmd = exec.CommandContext(execCtx, t.Program, t.Args...)
 	} else {
 		t.cmd = exec.CommandContext(execCtx, "sh", "-c", t.Command)
@@ -282,7 +306,15 @@ func (t *Task) Start(ctx context.Context) error {
 	}
 
 	// Use sanitized environment to prevent leaking sensitive env vars
-	t.cmd.Env = buildSafeEnv()
+	if !t.Sandboxed {
+		env, err := security.WorkspaceSafeEnvironment(t.WorkDir)
+		if err != nil {
+			cancel()
+			t.mu.Unlock()
+			return fmt.Errorf("create isolated task environment: %w", err)
+		}
+		t.cmd.Env = env
+	}
 
 	// Set up process group for proper cleanup of child processes
 	setProcAttr(t.cmd)

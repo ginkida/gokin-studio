@@ -1,6 +1,7 @@
 package studio
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -16,7 +17,7 @@ import (
 // historyFile (so we can read either) but adds a version + exportedAt
 // envelope to make future format changes detectable.
 
-const sessionExportVersion = 1
+const sessionExportVersion = 2
 
 // SessionExportEnvelope is the canonical JSON shape produced by
 // ExportSessionJSON and consumed by ImportSessionJSON.
@@ -29,10 +30,9 @@ type SessionExportEnvelope struct {
 	Entries    []HistoryEntry `json:"entries"`
 }
 
-// ExportSessionJSON returns a JSON dump of the session's full state.
-// The format is stable across restarts and can be re-imported via
-// ImportSessionJSON. Thinking/tool turns are stripped (they're not in
-// the persisted format anyway).
+// ExportSessionJSON returns a portable JSON dump of the session's full state.
+// Text, image, and native-document attachments round-trip; thinking/tool
+// turns are stripped.
 func (s *Studio) ExportSessionJSON(projectID, sessionID string) (string, error) {
 	if projectID == "" {
 		return "", fmt.Errorf("projectID cannot be empty")
@@ -66,25 +66,9 @@ func (s *Studio) ExportSessionJSON(projectID, sessionID string) (string, error) 
 	copy(historySnap, sess.history)
 	sess.mu.RUnlock()
 
-	// Convert to text-only entries, matching the on-disk save format.
-	entries := make([]HistoryEntry, 0, len(historySnap))
-	for _, c := range historySnap {
-		text := ""
-		for _, p := range c.Parts {
-			if p.Thought {
-				continue
-			}
-			if p.Text != "" {
-				text += p.Text
-			}
-		}
-		if text == "" {
-			continue
-		}
-		entries = append(entries, HistoryEntry{
-			Role: c.Role,
-			Text: text,
-		})
+	entries, err := historyEntriesForExport(historySnap)
+	if err != nil {
+		return "", err
 	}
 
 	env := SessionExportEnvelope{
@@ -98,6 +82,9 @@ func (s *Studio) ExportSessionJSON(projectID, sessionID string) (string, error) 
 	out, err := json.MarshalIndent(env, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("marshal session export: %w", err)
+	}
+	if len(out) > ImportPayloadMaxBytes {
+		return "", fmt.Errorf("session export exceeds the %d MiB portable-export limit", ImportPayloadMaxBytes>>20)
 	}
 	return string(out), nil
 }
@@ -128,6 +115,9 @@ func (s *Studio) ImportSessionJSON(projectID, jsonBlob string) (*ChatSessionInfo
 	if env.Version > sessionExportVersion {
 		return nil, fmt.Errorf("session export version %d is newer than this build supports (max %d)", env.Version, sessionExportVersion)
 	}
+	if len(env.Entries) > MaxHistoryEntries {
+		return nil, fmt.Errorf("session has too many entries (%d, maximum %d)", len(env.Entries), MaxHistoryEntries)
+	}
 	// The version field is the only schema check; missing or zero version
 	// is treated as version 1 (forward-friendly default).
 
@@ -137,19 +127,15 @@ func (s *Studio) ImportSessionJSON(projectID, jsonBlob string) (*ChatSessionInfo
 	if !ok {
 		return nil, fmt.Errorf("project not found: %s", projectID)
 	}
+	p.metadataMu.Lock()
+	defer p.metadataMu.Unlock()
 
 	// Build the in-memory history from the exported entries. We use
 	// genai.NewPartFromText for each entry so the structure matches what
 	// the agent loop expects on subsequent turns.
-	history := make([]*genai.Content, 0, len(env.Entries))
-	for _, e := range env.Entries {
-		if e.Role == "" || e.Text == "" {
-			continue
-		}
-		history = append(history, &genai.Content{
-			Role:  e.Role,
-			Parts: []*genai.Part{genai.NewPartFromText(e.Text)},
-		})
+	history, err := historyEntriesFromExport(env.Entries)
+	if err != nil {
+		return nil, err
 	}
 
 	name := strings.TrimSpace(env.Name)
@@ -165,6 +151,14 @@ func (s *Studio) ImportSessionJSON(projectID, jsonBlob string) (*ChatSessionInfo
 
 	// Generate a fresh session ID — never collide with the source's.
 	newSID := uuid.New().String()[:8]
+	p.mu.RLock()
+	for {
+		if _, exists := p.sessions[newSID]; !exists {
+			break
+		}
+		newSID = uuid.New().String()[:8]
+	}
+	p.mu.RUnlock()
 	now := time.Now()
 
 	sess := &ChatSession{
@@ -178,16 +172,114 @@ func (s *Studio) ImportSessionJSON(projectID, jsonBlob string) (*ChatSessionInfo
 	// most-recently-touched thing.
 	sess.lastUsedAt = now.UnixMilli()
 
+	// Persist immediately so the imported session survives restart even
+	// before the user runs an agent in it. Fork-style: explicit metadata
+	// (no parent — see comment above), no usage (fresh start).
+	if err := SaveNewHistoryWithMetadata(projectSessionStorageKey(projectID, newSID), name, "", history); err != nil {
+		return nil, fmt.Errorf("persist imported session: %w", err)
+	}
 	p.mu.Lock()
 	p.sessions[newSID] = sess
 	p.mu.Unlock()
 
-	// Persist immediately so the imported session survives restart even
-	// before the user runs an agent in it. Fork-style: explicit metadata
-	// (no parent — see comment above), no usage (fresh start).
-	if err := SaveHistoryWithMetadata(projectID+"_"+newSID, name, "", history); err != nil {
-		return nil, fmt.Errorf("persist imported session: %w", err)
-	}
-
 	return sess.Info(), nil
+}
+
+func historyEntriesForExport(history []*genai.Content) ([]HistoryEntry, error) {
+	entries := make([]HistoryEntry, 0, len(history))
+	totalMedia := 0
+	for _, content := range history {
+		text := ""
+		var attachments []PersistedHistoryAttachment
+		for _, part := range content.Parts {
+			if part == nil || part.Thought {
+				continue
+			}
+			if part.Text != "" {
+				text += part.Text
+			}
+			if part.InlineData != nil && len(part.InlineData.Data) > 0 {
+				mimeType := normalizeAttachmentMIME(part.InlineData.MIMEType)
+				_, isImage := supportedImageMIMEs[mimeType]
+				_, isDocument := supportedDocumentMIMEs[mimeType]
+				if !isImage && !isDocument {
+					return nil, fmt.Errorf("cannot export unsupported attachment type %q", part.InlineData.MIMEType)
+				}
+				maxBytes := MessageAttachmentMaxBytes
+				if isImage {
+					maxBytes = MessageImageAttachmentMaxBytes
+				}
+				if len(part.InlineData.Data) > maxBytes {
+					return nil, fmt.Errorf("cannot export attachment larger than %d MiB", maxBytes>>20)
+				}
+				totalMedia += len(part.InlineData.Data)
+				if totalMedia > MessageAttachmentsTotalMaxBytes {
+					return nil, fmt.Errorf("session media exceeds the %d MiB portable-export limit", MessageAttachmentsTotalMaxBytes>>20)
+				}
+				attachments = append(attachments, PersistedHistoryAttachment{
+					Name:     attachmentDisplayName(len(attachments), part.InlineData),
+					MIMEType: mimeType,
+					Size:     len(part.InlineData.Data),
+					Data:     base64.StdEncoding.EncodeToString(part.InlineData.Data),
+				})
+			}
+		}
+		if text == "" && len(attachments) == 0 {
+			continue
+		}
+		entries = append(entries, HistoryEntry{Role: content.Role, Text: text, Attachments: attachments})
+	}
+	return entries, nil
+}
+
+func historyEntriesFromExport(entries []HistoryEntry) ([]*genai.Content, error) {
+	history := make([]*genai.Content, 0, len(entries))
+	totalMedia := 0
+	for i, entry := range entries {
+		role := entry.Role
+		if role == "assistant" {
+			role = "model"
+		}
+		if role != "user" && role != "model" {
+			return nil, fmt.Errorf("invalid session entry role %q", entry.Role)
+		}
+		parts := make([]*genai.Part, 0, 1+len(entry.Attachments))
+		if entry.Text != "" {
+			parts = append(parts, genai.NewPartFromText(entry.Text))
+		}
+		for j, attachment := range entry.Attachments {
+			if attachment.Data == "" || attachment.Blob != "" {
+				return nil, fmt.Errorf("invalid portable attachment at entry %d attachment %d", i, j)
+			}
+			decoded, err := decodeMessageAttachments("kimi", "k3", []MessageAttachment{{
+				Name:     attachment.Name,
+				MIMEType: attachment.MIMEType,
+				Data:     attachment.Data,
+			}})
+			if err != nil {
+				return nil, fmt.Errorf("invalid portable attachment at entry %d attachment %d: %w", i, j, err)
+			}
+			blobPart := decoded[len(decoded)-1]
+			if blobPart.InlineData == nil || attachment.Size != len(blobPart.InlineData.Data) {
+				return nil, fmt.Errorf("portable attachment size mismatch at entry %d attachment %d", i, j)
+			}
+			totalMedia += attachment.Size
+			if totalMedia > MessageAttachmentsTotalMaxBytes {
+				return nil, fmt.Errorf("session media exceeds the %d MiB portable-import limit", MessageAttachmentsTotalMaxBytes>>20)
+			}
+			// Normal exports already contain the bounded extraction context.
+			// Reconstruct it for older or externally-authored portable sessions
+			// so a validated document never becomes a silent, unusable blob.
+			if _, isDocument := supportedDocumentMIMEs[normalizeAttachmentMIME(attachment.MIMEType)]; isDocument &&
+				!strings.Contains(entry.Text, "<<<GOKIN_DOCUMENT_CONTEXT:") {
+				parts = append(parts, decoded[:len(decoded)-1]...)
+			}
+			parts = append(parts, blobPart)
+		}
+		if len(parts) == 0 {
+			return nil, fmt.Errorf("empty session entry at index %d", i)
+		}
+		history = append(history, &genai.Content{Role: role, Parts: parts})
+	}
+	return history, nil
 }

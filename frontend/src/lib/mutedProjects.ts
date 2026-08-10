@@ -1,3 +1,5 @@
+import { forgetWorkspaceProject } from './workspaceContinuity'
+
 // Per-project notification mute (iter 580+) — frontend-only setting that
 // silences unread-badge bumps and completion toasts for specific projects.
 // Useful when a user has many projects and only wants notifications from a
@@ -127,6 +129,7 @@ export function clearProjectLocalStorage(projectID: string): void {
   for (const k of keys) {
     try { localStorage.removeItem(k) } catch { /* unavailable */ }
   }
+  forgetWorkspaceProject(projectID)
 }
 
 // resetAllPreferences (iter 630+) wipes every frontend-only preference key
@@ -140,6 +143,8 @@ export function clearProjectLocalStorage(projectID: string): void {
 //       gokin:muted-projects (full list)
 //   - Per-project keys (enumerated by prefix scan):
 //       gokin:quietmode:<pid>, gokin:budget-alerts-<pid>
+//   - Workspace continuity:
+//       active project, session, and Files/Artifacts/Settings location
 //
 // Important: backend-persisted state (project config, sessions, history)
 // is NOT touched — this is purely frontend preferences. After clearing,
@@ -171,6 +176,7 @@ export function resetAllPreferences(): number {
     'gokin:toasts-toggled',
     'gokin:sound-toggled',
     'gokin:muted-changed',
+    'gokin:layout-reset',
   ]
   for (const ev of events) {
     try { window.dispatchEvent(new CustomEvent(ev)) } catch { /* unavailable */ }

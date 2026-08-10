@@ -110,7 +110,6 @@ settings:
   default_provider: ""
   default_model: ""
   theme: ""
-  ollama_url: ""
   glm_key: sk-abc
 `)
 	cfg := LoadConfig()
@@ -124,12 +123,50 @@ settings:
 	if cfg.Settings.Theme != defaults.Settings.Theme {
 		t.Errorf("Theme = %q, want %q", cfg.Settings.Theme, defaults.Settings.Theme)
 	}
-	if cfg.Settings.OllamaURL != defaults.Settings.OllamaURL {
-		t.Errorf("OllamaURL = %q, want %q", cfg.Settings.OllamaURL, defaults.Settings.OllamaURL)
-	}
 	// The key must be preserved even though other fields were defaulted.
 	if cfg.Settings.GLMKey != "sk-abc" {
 		t.Errorf("GLMKey = %q, want 'sk-abc'", cfg.Settings.GLMKey)
+	}
+}
+
+func TestLoadConfig_NormalizesQuickEntryAndVoiceShortcuts(t *testing.T) {
+	withTempConfigDir(t)
+	writeConfigYAML(t, `
+settings:
+  theme: dark
+  default_provider: glm
+  default_model: glm-5.2
+  quick_entry_enabled: true
+  quick_entry_shortcut: double option
+  voice_shortcut_enabled: true
+  voice_shortcut: capslock
+`)
+	cfg := LoadConfig()
+	if cfg.Settings.QuickEntryShortcut != quickEntryDoubleOption {
+		t.Fatalf("QuickEntryShortcut = %q, want %q", cfg.Settings.QuickEntryShortcut, quickEntryDoubleOption)
+	}
+	if cfg.Settings.VoiceShortcut != quickEntryCapsLock {
+		t.Fatalf("VoiceShortcut = %q, want %q", cfg.Settings.VoiceShortcut, quickEntryCapsLock)
+	}
+	if !cfg.Settings.QuickEntryEnabled || !cfg.Settings.VoiceShortcutEnabled {
+		t.Fatalf("shortcut enablement was not preserved: %#v", cfg.Settings)
+	}
+}
+
+func TestLoadConfig_InvalidDesktopShortcutsFallBackToDefaults(t *testing.T) {
+	withTempConfigDir(t)
+	writeConfigYAML(t, `
+settings:
+  theme: dark
+  default_provider: glm
+  default_model: glm-5.2
+  quick_entry_shortcut: Space
+  voice_shortcut: Double-tap Option
+`)
+	cfg := LoadConfig()
+	defaults := defaultConfig().Settings
+	if cfg.Settings.QuickEntryShortcut != defaults.QuickEntryShortcut || cfg.Settings.VoiceShortcut != defaults.VoiceShortcut {
+		t.Fatalf("invalid shortcuts loaded as quick=%q voice=%q; want defaults %q / %q", cfg.Settings.QuickEntryShortcut, cfg.Settings.VoiceShortcut, defaults.QuickEntryShortcut, defaults.VoiceShortcut)
 	}
 }
 
@@ -153,13 +190,10 @@ settings:
 }
 
 // TestLoadConfig_RemovedProviderMigration verifies that providers that are
-// no longer supported (anthropic, gemini) are migrated to glm/glm-5.2 so
-// the app starts cleanly on an old config. iter 940+ note: DeepSeek used
-// to be on the removed list but came BACK with V4 — see TestLoadConfig_
-// DeepSeekRevived below.
+// outside the GLM/Kimi product contract are migrated to glm/glm-5.2.
 func TestLoadConfig_RemovedProviderMigration(t *testing.T) {
 	withTempConfigDir(t)
-	for _, removed := range []string{"anthropic", "gemini"} {
+	for _, removed := range []string{"anthropic", "gemini", "deepseek", "minimax", "ollama", "unknown"} {
 		writeConfigYAML(t, `
 settings:
   default_provider: `+removed+`
@@ -177,49 +211,20 @@ settings:
 	}
 }
 
-// TestLoadConfig_DeepSeekRevived verifies that iter 940+ brought DeepSeek
-// back as a supported provider AND auto-migrates the deprecated legacy
-// model names (deepseek-chat / deepseek-reasoner) to V4. Closes the loop
-// for users on old configs from when DeepSeek was removed (then re-added).
-func TestLoadConfig_DeepSeekRevived(t *testing.T) {
+// TestLoadConfig_KimiModels verifies that every supported Kimi Code model
+// survives config loading without being rewritten to GLM.
+func TestLoadConfig_KimiModels(t *testing.T) {
 	withTempConfigDir(t)
-
-	// Case 1: DefaultProvider=deepseek should SURVIVE (not migrated to glm).
-	writeConfigYAML(t, `
+	for _, model := range []string{"kimi-for-coding", "kimi-for-coding-highspeed", "k3-256k", "k3"} {
+		writeConfigYAML(t, `
 settings:
-  default_provider: deepseek
-  default_model: deepseek-v4-pro
+  default_provider: kimi
+  default_model: `+model+`
 `)
-	cfg := LoadConfig()
-	if cfg.Settings.DefaultProvider != "deepseek" {
-		t.Errorf("deepseek provider should survive (re-enabled in iter 940+); got %q", cfg.Settings.DefaultProvider)
-	}
-	if cfg.Settings.DefaultModel != "deepseek-v4-pro" {
-		t.Errorf("deepseek-v4-pro should be preserved; got %q", cfg.Settings.DefaultModel)
-	}
-
-	// Case 2: legacy deepseek-chat → deepseek-v4-flash (non-thinking).
-	withTempConfigDir(t)
-	writeConfigYAML(t, `
-settings:
-  default_provider: deepseek
-  default_model: deepseek-chat
-`)
-	cfg = LoadConfig()
-	if cfg.Settings.DefaultModel != "deepseek-v4-flash" {
-		t.Errorf("legacy deepseek-chat should migrate to deepseek-v4-flash; got %q", cfg.Settings.DefaultModel)
-	}
-
-	// Case 3: legacy deepseek-reasoner → deepseek-v4-pro (thinking).
-	withTempConfigDir(t)
-	writeConfigYAML(t, `
-settings:
-  default_provider: deepseek
-  default_model: deepseek-reasoner
-`)
-	cfg = LoadConfig()
-	if cfg.Settings.DefaultModel != "deepseek-v4-pro" {
-		t.Errorf("legacy deepseek-reasoner should migrate to deepseek-v4-pro; got %q", cfg.Settings.DefaultModel)
+		cfg := LoadConfig()
+		if cfg.Settings.DefaultProvider != "kimi" || cfg.Settings.DefaultModel != model {
+			t.Errorf("Kimi model %q changed to %q/%q", model, cfg.Settings.DefaultProvider, cfg.Settings.DefaultModel)
+		}
 	}
 }
 
@@ -331,13 +336,13 @@ func TestSave_RoundTrip(t *testing.T) {
 	cfg := &StudioConfig{
 		Settings: Settings{
 			Theme:           "light",
-			DefaultProvider: "minimax",
-			DefaultModel:    "minimax-text",
+			DefaultProvider: "kimi",
+			DefaultModel:    "k3-256k",
 			GLMKey:          "sk-glm",
 			KimiKey:         "sk-kimi",
 		},
 		Projects: []ProjectConfig{
-			{ID: "p-rt", Name: "RoundTrip", Directory: "/tmp/rt", Provider: "minimax", Model: "minimax-text"},
+			{ID: "p-rt", Name: "RoundTrip", Directory: "/tmp/rt", Provider: "kimi", Model: "k3-256k"},
 		},
 	}
 
@@ -349,8 +354,8 @@ func TestSave_RoundTrip(t *testing.T) {
 	if loaded.Settings.Theme != "light" {
 		t.Errorf("Theme = %q, want 'light'", loaded.Settings.Theme)
 	}
-	if loaded.Settings.DefaultProvider != "minimax" {
-		t.Errorf("DefaultProvider = %q, want 'minimax'", loaded.Settings.DefaultProvider)
+	if loaded.Settings.DefaultProvider != "kimi" {
+		t.Errorf("DefaultProvider = %q, want 'kimi'", loaded.Settings.DefaultProvider)
 	}
 	if loaded.Settings.GLMKey != "sk-glm" {
 		t.Errorf("GLMKey = %q, want 'sk-glm'", loaded.Settings.GLMKey)

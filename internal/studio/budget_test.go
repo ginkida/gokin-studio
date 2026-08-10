@@ -103,3 +103,34 @@ func TestSetProjectBudget_PersistsToConfig(t *testing.T) {
 		t.Errorf("NewProject.BudgetUSD = %.2f, want 42.75 (lost on round-trip)", p2.BudgetUSD)
 	}
 }
+
+func TestConfigureProjectBudget_UpdatesCapAndEnforcementAtomically(t *testing.T) {
+	s := newStudioForTest(t)
+	info := addTestProject(t, s, "AtomicBudget")
+
+	got, err := s.ConfigureProjectBudget(info.ID, 37.25, true)
+	if err != nil {
+		t.Fatalf("ConfigureProjectBudget: %v", err)
+	}
+	if got.BudgetUSD != 37.25 || !got.EnforceBudget {
+		t.Fatalf("snapshot = budget %.2f enforce %v, want 37.25 true", got.BudgetUSD, got.EnforceBudget)
+	}
+
+	s.mu.RLock()
+	cfg := s.projects[info.ID].ToConfig()
+	s.mu.RUnlock()
+	if cfg.BudgetUSD != 37.25 || !cfg.EnforceBudget {
+		t.Fatalf("config = budget %.2f enforce %v, want 37.25 true", cfg.BudgetUSD, cfg.EnforceBudget)
+	}
+
+	got, err = s.ConfigureProjectBudget(info.ID, 0, true)
+	if err != nil {
+		t.Fatalf("ConfigureProjectBudget(clear): %v", err)
+	}
+	if got.BudgetUSD != 0 || got.EnforceBudget {
+		t.Fatalf("cleared snapshot = budget %.2f enforce %v, want 0 false", got.BudgetUSD, got.EnforceBudget)
+	}
+	if _, err := s.ConfigureProjectBudget(info.ID, 100001, false); err == nil {
+		t.Fatal("expected over-limit budget to be rejected")
+	}
+}

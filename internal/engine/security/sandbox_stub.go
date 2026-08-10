@@ -1,17 +1,21 @@
-//go:build !linux && unix
+//go:build !linux && !darwin && unix
 
 package security
 
 import (
-	"syscall"
+	"fmt"
 )
 
-// applySandbox applies basic process isolation for non-Linux Unix platforms (macOS, BSD)
+// applySandbox refuses to mislabel process-group isolation as a filesystem
+// sandbox on Unix platforms without a supported containment backend.
 func (sc *SandboxedCommand) applySandbox(workDir string) error {
-	// For non-Linux Unix systems, we provide basic process group isolation
-	sc.cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
-	}
+	return fmt.Errorf("workspace filesystem isolation is unavailable on this Unix platform")
+}
 
-	return nil
+func DetectWorkspaceIsolation() WorkspaceIsolationStatus {
+	return WorkspaceIsolationStatus{
+		Available: false,
+		Mode:      "host",
+		Detail:    "No supported workspace filesystem sandbox is available; commands require explicit host-execution approval.",
+	}
 }

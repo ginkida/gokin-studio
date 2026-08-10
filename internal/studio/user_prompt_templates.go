@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -41,17 +43,21 @@ type UserPromptTemplate struct {
 // matches that for the prompt body and applies tighter caps to the
 // metadata fields.
 const (
-	UserPromptNameMaxBytes        = 80
-	UserPromptDescriptionMaxBytes = 200
-	UserPromptPromptMaxBytes      = 20 * 1024 // 20 KB matches frontend textarea cap
+	UserPromptNameMaxBytes          = 80
+	UserPromptDescriptionMaxBytes   = 200
+	UserPromptPromptMaxBytes        = 20 * 1024 // 20 KB matches frontend textarea cap
+	UserPromptTemplatesMaxCount     = 100
+	UserPromptTemplatesFileMaxBytes = 3 << 20
 )
+
+var userPromptTemplatesMu sync.Mutex
 
 func userPromptTemplatesPath() string {
 	return filepath.Join(configDir(), "user_prompt_templates.json")
 }
 
 func loadUserPromptTemplates() ([]UserPromptTemplate, error) {
-	data, err := os.ReadFile(userPromptTemplatesPath())
+	data, err := readRegularFileLimited(userPromptTemplatesPath(), UserPromptTemplatesFileMaxBytes)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -65,7 +71,37 @@ func loadUserPromptTemplates() ([]UserPromptTemplate, error) {
 	if err := json.Unmarshal(data, &tmpls); err != nil {
 		return nil, fmt.Errorf("corrupt user_prompt_templates.json: %w", err)
 	}
+	if err := validateUserPromptTemplates(tmpls); err != nil {
+		return nil, err
+	}
 	return tmpls, nil
+}
+
+func validateUserPromptTemplates(tmpls []UserPromptTemplate) error {
+	if len(tmpls) > UserPromptTemplatesMaxCount {
+		return fmt.Errorf("too many user prompt templates (%d, maximum %d)", len(tmpls), UserPromptTemplatesMaxCount)
+	}
+	ids := make(map[string]struct{}, len(tmpls))
+	names := make(map[string]struct{}, len(tmpls))
+	for i, tmpl := range tmpls {
+		if tmpl.ID == "" || len(tmpl.ID) > 128 || !utf8.ValidString(tmpl.ID) ||
+			strings.TrimSpace(tmpl.Name) == "" || len(tmpl.Name) > UserPromptNameMaxBytes || !utf8.ValidString(tmpl.Name) ||
+			len(tmpl.Description) > UserPromptDescriptionMaxBytes || !utf8.ValidString(tmpl.Description) ||
+			strings.TrimSpace(tmpl.Prompt) == "" || len(tmpl.Prompt) > UserPromptPromptMaxBytes || !utf8.ValidString(tmpl.Prompt) ||
+			tmpl.UpdatedAt < 0 {
+			return fmt.Errorf("corrupt user_prompt_templates.json: invalid template at index %d", i)
+		}
+		lname := strings.ToLower(tmpl.Name)
+		if _, duplicate := ids[tmpl.ID]; duplicate {
+			return fmt.Errorf("corrupt user_prompt_templates.json: duplicate ID %q", tmpl.ID)
+		}
+		if _, duplicate := names[lname]; duplicate {
+			return fmt.Errorf("corrupt user_prompt_templates.json: duplicate name %q", tmpl.Name)
+		}
+		ids[tmpl.ID] = struct{}{}
+		names[lname] = struct{}{}
+	}
+	return nil
 }
 
 func saveUserPromptTemplates(tmpls []UserPromptTemplate) error {
@@ -83,6 +119,9 @@ func saveUserPromptTemplates(tmpls []UserPromptTemplate) error {
 	if err != nil {
 		return err
 	}
+	if len(data) > UserPromptTemplatesFileMaxBytes {
+		return fmt.Errorf("user prompt templates file would exceed %d bytes", UserPromptTemplatesFileMaxBytes)
+	}
 	return atomicWriteFile(userPromptTemplatesPath(), data, 0o600)
 }
 
@@ -97,6 +136,9 @@ func saveUserPromptTemplates(tmpls []UserPromptTemplate) error {
 //   - Prompt required, capped at UserPromptPromptMaxBytes
 //   - Description optional, capped at UserPromptDescriptionMaxBytes
 func (s *Studio) SaveUserPromptTemplate(name, description, prompt string) (string, error) {
+	if !utf8.ValidString(name) || !utf8.ValidString(description) || !utf8.ValidString(prompt) {
+		return "", fmt.Errorf("template fields must be valid UTF-8")
+	}
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return "", fmt.Errorf("name cannot be empty")
@@ -109,13 +151,15 @@ func (s *Studio) SaveUserPromptTemplate(name, description, prompt string) (strin
 		return "", fmt.Errorf("prompt cannot be empty")
 	}
 	if len(prompt) > UserPromptPromptMaxBytes {
-		prompt = prompt[:UserPromptPromptMaxBytes]
+		prompt = truncateUTF8(prompt, UserPromptPromptMaxBytes)
 	}
 	description = strings.TrimSpace(description)
 	if len(description) > UserPromptDescriptionMaxBytes {
-		description = description[:UserPromptDescriptionMaxBytes]
+		description = truncateUTF8(description, UserPromptDescriptionMaxBytes)
 	}
 
+	userPromptTemplatesMu.Lock()
+	defer userPromptTemplatesMu.Unlock()
 	tmpls, err := loadUserPromptTemplates()
 	if err != nil {
 		return "", err
@@ -139,6 +183,9 @@ func (s *Studio) SaveUserPromptTemplate(name, description, prompt string) (strin
 	}
 
 	// New template.
+	if len(tmpls) >= UserPromptTemplatesMaxCount {
+		return "", fmt.Errorf("user prompt template limit reached (%d)", UserPromptTemplatesMaxCount)
+	}
 	newT := UserPromptTemplate{
 		ID:          uuid.New().String()[:12],
 		Name:        name,
@@ -159,6 +206,8 @@ func (s *Studio) DeleteUserPromptTemplate(id string) error {
 	if id == "" {
 		return fmt.Errorf("id cannot be empty")
 	}
+	userPromptTemplatesMu.Lock()
+	defer userPromptTemplatesMu.Unlock()
 	tmpls, err := loadUserPromptTemplates()
 	if err != nil {
 		return err
@@ -181,6 +230,8 @@ func (s *Studio) DeleteUserPromptTemplate(id string) error {
 // set so the frontend picker can mix them into a single list with category
 // "Yours" — no separate code path needed.
 func (s *Studio) ListUserPromptTemplates() ([]PromptTemplate, error) {
+	userPromptTemplatesMu.Lock()
+	defer userPromptTemplatesMu.Unlock()
 	tmpls, err := loadUserPromptTemplates()
 	if err != nil {
 		return nil, err

@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/creack/pty"
+	"github.com/ginkida/gokin-studio/internal/engine/security"
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
@@ -43,7 +44,7 @@ func newTerminalWithLogger(wailsCtx context.Context, projectDir, projectID, term
 
 	cmd := exec.Command(shell)
 	cmd.Dir = projectDir
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	cmd.Env = security.MergeWorkspaceEnvironment(append(os.Environ(), "TERM=xterm-256color"))
 
 	ptmx, err := pty.Start(cmd)
 	if err != nil {

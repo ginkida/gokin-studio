@@ -8,21 +8,17 @@ import "testing"
 func TestStudioGetModelPricing_KnownModel(t *testing.T) {
 	s := &Studio{}
 	got := s.GetModelPricing("glm", "glm-5.1")
-	want := ModelPricing{InputPerMTok: 0.55, OutputPerMTok: 2.19, CacheReadPerMTok: 0.11, CacheWritePerMTok: 0.69}
+	want := ModelPricing{InputPerMTok: 1.40, OutputPerMTok: 4.40, CacheReadPerMTok: 0.26, CacheWritePerMTok: 1.40}
 	if got != want {
 		t.Errorf("GetModelPricing glm/glm-5.1 = %+v, want %+v", got, want)
 	}
 }
 
-// TestStudioGetModelPricing_OllamaIsZero: local provider Ollama returns
-// all-zero pricing. The frontend treats all-zero as "no cost preview"
-// and hides the chip — matching the iter 290+ behavior for completed
-// turns.
-func TestStudioGetModelPricing_OllamaIsZero(t *testing.T) {
+func TestStudioGetModelPricing_RemovedProviderIsZero(t *testing.T) {
 	s := &Studio{}
 	got := s.GetModelPricing("ollama", "qwen3")
 	if got != (ModelPricing{}) {
-		t.Errorf("Ollama pricing should be all zero, got %+v", got)
+		t.Errorf("removed provider pricing should be all zero, got %+v", got)
 	}
 }
 
@@ -38,14 +34,19 @@ func TestStudioGetModelPricing_UnknownIsZero(t *testing.T) {
 	}
 }
 
-// TestStudioGetModelPricing_PrefixMatchKeepsFlagshipRates: an unknown
-// variant of GLM-5.1 (e.g. "glm-5.1-experimental") resolves to the
-// flagship pricing — verifies the longest-prefix-wins lookup in
-// LookupPricing still applies through the Wails binding.
-func TestStudioGetModelPricing_PrefixMatchKeepsFlagshipRates(t *testing.T) {
+func TestStudioGetModelPricing_RejectsUnlistedVariant(t *testing.T) {
 	s := &Studio{}
 	got := s.GetModelPricing("glm", "glm-5.1-experimental")
-	if got.InputPerMTok != 0.55 {
-		t.Errorf("expected glm-5.1 input rate via prefix match, got %f", got.InputPerMTok)
+	if got != (ModelPricing{}) {
+		t.Errorf("unlisted GLM variant should be rejected at Wails boundary, got %+v", got)
+	}
+}
+
+func TestStudioGetModelPricing_KimiK3(t *testing.T) {
+	s := &Studio{}
+	got := s.GetModelPricing("kimi", "k3")
+	want := ModelPricing{InputPerMTok: 3, OutputPerMTok: 15, CacheReadPerMTok: 0.3, CacheWritePerMTok: 3}
+	if got != want {
+		t.Errorf("GetModelPricing kimi/k3 = %+v, want %+v", got, want)
 	}
 }

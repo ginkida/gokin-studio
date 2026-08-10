@@ -4,9 +4,9 @@ import "strings"
 
 // ModelPricing is the per-million-token cost in USD for a given model.
 // Cache-read pricing is typically 75–90% off the input rate; cache-write is
-// usually 25% above the input rate. Ollama (local) is free across the board.
+// usually 25% above the input rate.
 //
-// These rates are *approximate* and reflect public pricing as of late 2025.
+// These rates are *approximate* and reflect public pricing as of July 2026.
 // Treat the displayed cost as a guideline, not a billing source of truth —
 // the user's actual bill depends on each provider's billing rounding rules,
 // promotional credits, and tier discounts. The frontend labels the figure
@@ -23,67 +23,51 @@ type ModelPricing struct {
 // model like "glm-5.1-experimental" still resolves to the GLM-5.1 tier.
 //
 // Sources (approximate, periodically drifts):
-// - GLM (Zhipu): bigmodel.cn pricing page
-// - MiniMax (abab models): minimax.io pricing page
-// - Kimi (kimi.com/coding): coding-platform pricing
-// - Ollama: 0 (runs locally)
+//   - GLM: docs.z.ai/guides/overview/pricing
+//   - Kimi K3: kimi.com K3 API pricing; Kimi Code subscription use is shown as
+//     an API-equivalent estimate because membership credits are not denominated
+//     in dollars per token.
 //
 // All values are USD per million tokens.
 var modelPricing = map[string]ModelPricing{
-	// GLM family — bigmodel.cn published rates, USD-equivalent.
-	// glm-5.2 is the current flagship (1M context); glm-5.1 / glm-5 are the
-	// previous flagship coding/reasoning models — all share the Max tier rate.
-	"glm-5.2":     {InputPerMTok: 0.55, OutputPerMTok: 2.19, CacheReadPerMTok: 0.11, CacheWritePerMTok: 0.69},
-	"glm-5.1":     {InputPerMTok: 0.55, OutputPerMTok: 2.19, CacheReadPerMTok: 0.11, CacheWritePerMTok: 0.69},
-	"glm-5":       {InputPerMTok: 0.55, OutputPerMTok: 2.19, CacheReadPerMTok: 0.11, CacheWritePerMTok: 0.69},
-	"glm-5-turbo": {InputPerMTok: 0.30, OutputPerMTok: 1.20, CacheReadPerMTok: 0.06, CacheWritePerMTok: 0.38},
-	"glm-4.7":     {InputPerMTok: 0.55, OutputPerMTok: 2.19, CacheReadPerMTok: 0.11, CacheWritePerMTok: 0.69},
-	"glm-4.6":     {InputPerMTok: 0.55, OutputPerMTok: 2.19, CacheReadPerMTok: 0.11, CacheWritePerMTok: 0.69},
-	"glm-4.5":     {InputPerMTok: 0.55, OutputPerMTok: 2.19, CacheReadPerMTok: 0.11, CacheWritePerMTok: 0.69},
-	"glm-4.5-air": {InputPerMTok: 0.20, OutputPerMTok: 1.10, CacheReadPerMTok: 0.04, CacheWritePerMTok: 0.25},
-	"glm-4":       {InputPerMTok: 0.55, OutputPerMTok: 2.19, CacheReadPerMTok: 0.11, CacheWritePerMTok: 0.69},
+	// GLM family — official Z.AI prices. Cache creation is conservatively
+	// charged at the uncached-input rate; cache storage is currently free.
+	"glm-5.2":     {InputPerMTok: 1.40, OutputPerMTok: 4.40, CacheReadPerMTok: 0.26, CacheWritePerMTok: 1.40},
+	"glm-5.1":     {InputPerMTok: 1.40, OutputPerMTok: 4.40, CacheReadPerMTok: 0.26, CacheWritePerMTok: 1.40},
+	"glm-5":       {InputPerMTok: 1.00, OutputPerMTok: 3.20, CacheReadPerMTok: 0.20, CacheWritePerMTok: 1.00},
+	"glm-5-turbo": {InputPerMTok: 1.20, OutputPerMTok: 4.00, CacheReadPerMTok: 0.24, CacheWritePerMTok: 1.20},
+	"glm-4.7":     {InputPerMTok: 0.60, OutputPerMTok: 2.20, CacheReadPerMTok: 0.11, CacheWritePerMTok: 0.60},
 
-	// MiniMax — M2.x is the current lineup (minimax.io pay-as-you-go rates).
-	// Keys are lowercased to match LookupPricing's ToLower; "minimax" is the
-	// catch-all so any future MiniMax model still resolves to a sane figure.
-	"minimax-m2.7":           {InputPerMTok: 0.30, OutputPerMTok: 1.20},
-	"minimax-m2.7-highspeed": {InputPerMTok: 0.60, OutputPerMTok: 2.40},
-	"minimax-m2.5":           {InputPerMTok: 0.30, OutputPerMTok: 1.20},
-	"minimax-m2.5-highspeed": {InputPerMTok: 0.60, OutputPerMTok: 2.40},
-	"minimax":                {InputPerMTok: 0.30, OutputPerMTok: 1.20},
-	// Legacy MiniMax abab series (kept for back-compat with saved projects).
-	"abab7-chat-pro":  {InputPerMTok: 1.00, OutputPerMTok: 2.00},
-	"abab6.5-chat":    {InputPerMTok: 0.85, OutputPerMTok: 1.70},
-	"abab6.5s-chat":   {InputPerMTok: 0.30, OutputPerMTok: 0.60},
-	"abab6-chat":      {InputPerMTok: 0.50, OutputPerMTok: 1.00},
-	"minimax-m1":      {InputPerMTok: 1.00, OutputPerMTok: 2.00},
-	"minimax-text-01": {InputPerMTok: 0.85, OutputPerMTok: 1.70},
-
-	// Kimi (Moonshot) — kimi.com coding-platform pricing for the k2.6 model.
-	"kimi-for-coding": {InputPerMTok: 0.60, OutputPerMTok: 2.50, CacheReadPerMTok: 0.06, CacheWritePerMTok: 0.75},
-	"kimi-k2.6":       {InputPerMTok: 0.60, OutputPerMTok: 2.50, CacheReadPerMTok: 0.06, CacheWritePerMTok: 0.75},
-	"kimi-k2.5":       {InputPerMTok: 0.60, OutputPerMTok: 2.50, CacheReadPerMTok: 0.06, CacheWritePerMTok: 0.75},
-	"kimi-k2":         {InputPerMTok: 0.60, OutputPerMTok: 2.50, CacheReadPerMTok: 0.06, CacheWritePerMTok: 0.75},
-
-	// DeepSeek V4 — both V4 variants share cache pricing; only base in/out
-	// rates differ. Pro is the flagship with thinking; flash is the
-	// economical non-thinking variant. Cache pricing is the DeepSeek
-	// "cache hit" rate published with the V4 release.
-	"deepseek-v4-pro":   {InputPerMTok: 0.55, OutputPerMTok: 2.19, CacheReadPerMTok: 0.07, CacheWritePerMTok: 0.55},
-	"deepseek-v4-flash": {InputPerMTok: 0.27, OutputPerMTok: 1.10, CacheReadPerMTok: 0.03, CacheWritePerMTok: 0.27},
+	// Kimi K3 Open Platform equivalent: $3 cache miss, $0.30 cache hit,
+	// $15 output per million tokens. K3-256k is the same model at a smaller
+	// membership context/quota tier.
+	"k3":                        {InputPerMTok: 3.00, OutputPerMTok: 15.00, CacheReadPerMTok: 0.30, CacheWritePerMTok: 3.00},
+	"k3-256k":                   {InputPerMTok: 3.00, OutputPerMTok: 15.00, CacheReadPerMTok: 0.30, CacheWritePerMTok: 3.00},
+	"kimi-for-coding":           {InputPerMTok: 0.60, OutputPerMTok: 2.50, CacheReadPerMTok: 0.06, CacheWritePerMTok: 0.75},
+	"kimi-for-coding-highspeed": {InputPerMTok: 0.60, OutputPerMTok: 2.50, CacheReadPerMTok: 0.06, CacheWritePerMTok: 0.75},
 }
 
-// LookupPricing returns the pricing tier for a model. Falls back to a
-// zero-cost tier for Ollama (local) and any unknown model — better to show
-// "≈$0.00" than a wrong number. The frontend can also use the zero return
-// to suppress the cost chip entirely.
+// LookupPricing returns the pricing tier for a GLM or Kimi model. Any other
+// provider is deliberately rejected at this shared layer as well as at the
+// Wails boundary so legacy callers cannot resurrect removed providers.
 func LookupPricing(provider, model string) ModelPricing {
-	if provider == "ollama" {
-		return ModelPricing{} // local inference — no per-token cost
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if providerDefinition(provider) == nil {
+		return ModelPricing{}
 	}
 	m := strings.ToLower(strings.TrimSpace(model))
 	if m == "" {
 		return ModelPricing{}
+	}
+	switch provider {
+	case "glm":
+		if !strings.HasPrefix(m, "glm-") {
+			return ModelPricing{}
+		}
+	case "kimi":
+		if m != "k3" && m != "k3-256k" && !strings.HasPrefix(m, "kimi-for-coding") {
+			return ModelPricing{}
+		}
 	}
 	if p, ok := modelPricing[m]; ok {
 		return p
@@ -103,7 +87,7 @@ func LookupPricing(provider, model string) ModelPricing {
 }
 
 // EstimateCost computes a USD figure for one turn given the token counts
-// reported by the provider. Returns 0 for unknown models / Ollama / zero
+// reported by the provider. Returns 0 for unsupported/unknown models or zero
 // usage so the caller can suppress the display.
 func EstimateCost(provider, model string, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens int) float64 {
 	p := LookupPricing(provider, model)
@@ -134,6 +118,9 @@ func EstimateCost(provider, model string, inputTokens, outputTokens, cacheReadTo
 // drifts; keeping a single source of truth in Go means a release that
 // updates rates ships once.
 func (s *Studio) EstimateCost(provider, model string, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens int) float64 {
+	if s.validateAvailableStudioProviderModel(provider, model) != nil {
+		return 0
+	}
 	return EstimateCost(provider, model, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens)
 }
 
@@ -144,10 +131,13 @@ func (s *Studio) EstimateCost(provider, model string, inputTokens, outputTokens,
 // then multiplies cached rates by the running token estimate locally so
 // every keystroke doesn't cross the Wails bridge.
 //
-// Returns a zero ModelPricing struct (all fields 0) for unknown models or
-// local providers like Ollama. The frontend treats all-zero as "no cost
+// Returns a zero ModelPricing struct (all fields 0) for unsupported models.
+// The frontend treats all-zero as "no cost
 // preview" and hides the chip — which matches the desired behavior
 // (showing "≈$0.0000" on every keystroke is just noise).
 func (s *Studio) GetModelPricing(provider, model string) ModelPricing {
+	if s.validateAvailableStudioProviderModel(provider, model) != nil {
+		return ModelPricing{}
+	}
 	return LookupPricing(provider, model)
 }

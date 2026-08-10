@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -47,11 +48,50 @@ func NewWebFetchTool() *WebFetchTool {
 		}
 		return nil
 	}
+	if transport, ok := secureClient.Transport.(*http.Transport); ok {
+		dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+		transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			pinned, err := ssrfSafeDialAddress(ctx, address, net.DefaultResolver.LookupIPAddr)
+			if err != nil {
+				return nil, err
+			}
+			return dialer.DialContext(ctx, network, pinned)
+		}
+	}
 
 	return &WebFetchTool{
 		client:  secureClient,
 		maxSize: 1024 * 1024, // 1MB max
 	}
+}
+
+type lookupIPAddrFunc func(context.Context, string) ([]net.IPAddr, error)
+
+func ssrfSafeDialAddress(ctx context.Context, address string, lookup lookupIPAddrFunc) (string, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", fmt.Errorf("SSRF protection: invalid dial address: %w", err)
+	}
+	var addresses []net.IPAddr
+	if parsed := net.ParseIP(host); parsed != nil {
+		addresses = []net.IPAddr{{IP: parsed}}
+	} else {
+		addresses, err = lookup(ctx, host)
+		if err != nil {
+			return "", fmt.Errorf("SSRF protection: DNS resolution failed: %w", err)
+		}
+	}
+	if len(addresses) == 0 {
+		return "", fmt.Errorf("SSRF protection: hostname resolved to no IP addresses")
+	}
+	for _, address := range addresses {
+		if result := security.DefaultIPValidator.ValidateIP(address.IP); !result.Valid {
+			return "", fmt.Errorf("SSRF protection: %s", result.Reason)
+		}
+	}
+	// Pin the connection to the exact address just validated. TLS still uses
+	// the request hostname for SNI/certificate verification.
+	return net.JoinHostPort(addresses[0].IP.String(), port), nil
 }
 
 func (t *WebFetchTool) Name() string {

@@ -1,7 +1,6 @@
 package git
 
 import (
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -52,8 +51,7 @@ func (s *StatusCache) Refresh() error {
 	defer s.mu.Unlock()
 
 	// Run git status
-	cmd := exec.Command("git", "status", "--porcelain", "-uall")
-	cmd.Dir = s.workDir
+	cmd := newCommand(s.workDir, "status", "--porcelain", "-uall")
 	output, err := cmd.Output()
 	if err != nil {
 		// Not a git repo or git not installed
@@ -138,8 +136,7 @@ func (s *StatusCache) EnsureFresh() error {
 
 // IsGitRepo checks if the working directory is a git repository.
 func IsGitRepo(workDir string) bool {
-	cmd := exec.Command("git", "rev-parse", "--git-dir")
-	cmd.Dir = workDir
+	cmd := newCommand(workDir, "rev-parse", "--git-dir")
 	err := cmd.Run()
 	return err == nil
 }
@@ -147,8 +144,7 @@ func IsGitRepo(workDir string) bool {
 // GetCurrentBranch returns the current git branch name.
 // Returns empty string if not in a git repo or on error.
 func GetCurrentBranch(workDir string) string {
-	cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
-	cmd.Dir = workDir
+	cmd := newCommand(workDir, "rev-parse", "--abbrev-ref", "HEAD")
 	output, err := cmd.Output()
 	if err != nil {
 		return ""

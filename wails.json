@@ -12,8 +12,15 @@
   },
   "info": {
     "productName": "Gokin Studio",
-    "productVersion": "1.2.0",
+    "productVersion": "2.0.0",
     "copyright": "Copyright © 2026",
-    "comments": "Multi-provider LLM agent desktop IDE"
+    "comments": "Multi-provider LLM agent desktop IDE",
+    "protocols": [
+      {
+        "scheme": "gokin",
+        "description": "Open Gokin Studio",
+        "role": "Viewer"
+      }
+    ]
   }
 }

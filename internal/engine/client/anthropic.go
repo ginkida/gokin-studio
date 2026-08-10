@@ -159,6 +159,7 @@ func (c *AnthropicClient) SendMessageWithHistory(ctx context.Context, history []
 	turnContext := c.turnContext
 	enableThinking := c.config.EnableThinking
 	thinkingBudget := c.config.ThinkingBudget
+	provider := c.config.Provider
 	model := c.config.Model
 	maxTokens := c.config.MaxTokens
 	temperature := c.config.Temperature
@@ -190,17 +191,7 @@ func (c *AnthropicClient) SendMessageWithHistory(ctx context.Context, history []
 		requestBody["system"] = systemPrompt
 	}
 
-	// Extended Thinking support
-	if enableThinking && thinkingBudget > 0 {
-		requestBody["thinking"] = map[string]interface{}{
-			"type":          "enabled",
-			"budget_tokens": clampThinkingBudgetBelowMax(thinkingBudget, maxTokens),
-		}
-		// Extended thinking requires temperature=1 (Anthropic requirement)
-		requestBody["temperature"] = 1.0
-	} else if temperature > 0 {
-		requestBody["temperature"] = temperature
-	}
+	applyAnthropicThinking(requestBody, provider, model, enableThinking, thinkingBudget, maxTokens, temperature)
 
 	if len(tools) > 0 {
 		// Convert tools to Anthropic format (uses snapshot)
@@ -216,12 +207,24 @@ func (c *AnthropicClient) SendMessageWithHistory(ctx context.Context, history []
 
 // SendFunctionResponse sends function call results back to the model.
 func (c *AnthropicClient) SendFunctionResponse(ctx context.Context, history []*genai.Content, results []*genai.FunctionResponse) (*StreamingResponse, error) {
+	return c.sendFunctionResponse(ctx, history, results, nil)
+}
+
+// SendFunctionResponseParts preserves images returned by tools. Parts must be
+// ordered as FunctionResponse followed by its InlineData blocks, matching
+// buildUserMessage's multimodal tool_result representation.
+func (c *AnthropicClient) SendFunctionResponseParts(ctx context.Context, history []*genai.Content, parts []*genai.Part) (*StreamingResponse, error) {
+	return c.sendFunctionResponse(ctx, history, nil, parts)
+}
+
+func (c *AnthropicClient) sendFunctionResponse(ctx context.Context, history []*genai.Content, results []*genai.FunctionResponse, parts []*genai.Part) (*StreamingResponse, error) {
 	// Snapshot mutable fields under read lock
 	c.mu.RLock()
 	sysInstruction := c.systemInstruction
 	turnContext := c.turnContext
 	enableThinking := c.config.EnableThinking
 	thinkingBudget := c.config.ThinkingBudget
+	provider := c.config.Provider
 	model := c.config.Model
 	maxTokens := c.config.MaxTokens
 	temperature := c.config.Temperature
@@ -230,6 +233,12 @@ func (c *AnthropicClient) SendFunctionResponse(ctx context.Context, history []*g
 
 	var messages []map[string]interface{}
 	var systemPrompt string
+	if len(parts) > 0 {
+		history = append(append([]*genai.Content(nil), history...), &genai.Content{
+			Role:  genai.RoleUser,
+			Parts: parts,
+		})
+	}
 	if sysInstruction != "" {
 		systemPrompt = sysInstruction
 		messages = c.convertHistoryWithResults(history, results)
@@ -250,16 +259,7 @@ func (c *AnthropicClient) SendFunctionResponse(ctx context.Context, history []*g
 		requestBody["system"] = systemPrompt
 	}
 
-	// Extended Thinking support
-	if enableThinking && thinkingBudget > 0 {
-		requestBody["thinking"] = map[string]interface{}{
-			"type":          "enabled",
-			"budget_tokens": clampThinkingBudgetBelowMax(thinkingBudget, maxTokens),
-		}
-		requestBody["temperature"] = 1.0
-	} else if temperature > 0 {
-		requestBody["temperature"] = temperature
-	}
+	applyAnthropicThinking(requestBody, provider, model, enableThinking, thinkingBudget, maxTokens, temperature)
 
 	if len(tools) > 0 {
 		requestBody["tools"] = c.convertToolsToAnthropicFrom(tools)
@@ -422,6 +422,88 @@ func clampThinkingBudgetBelowMax(budget, maxTokens int32) int32 {
 		return maxTokens - 1024
 	}
 	return budget
+}
+
+func isKimiNativeEffortModel(provider, model string) bool {
+	if !strings.EqualFold(strings.TrimSpace(provider), "kimi") {
+		return false
+	}
+	return supportsKimiNativeReasoningEffort(model)
+}
+
+func isGLMNativeEffortModel(provider, model string) bool {
+	return strings.EqualFold(strings.TrimSpace(provider), "glm") &&
+		supportsGLMNativeReasoningEffort(model)
+}
+
+func isGLMModel(provider string) bool {
+	return strings.EqualFold(strings.TrimSpace(provider), "glm")
+}
+
+// kimiK3ReasoningEffort maps the desktop's backwards-compatible numeric
+// thinking control onto K3's native low/high/max protocol. Existing saved
+// values therefore keep working while new UI labels expose their real meaning.
+func kimiK3ReasoningEffort(budget int32) string {
+	switch {
+	case budget <= 4096:
+		return "low"
+	case budget <= 16384:
+		return "high"
+	default:
+		return "max"
+	}
+}
+
+// GLM's native-effort flagship protocol exposes high/max (not Kimi's
+// low/high/max). Max is the default, while high is the lower-latency option.
+func glm52ReasoningEffort(budget int32) string {
+	if budget <= 16384 {
+		return "high"
+	}
+	return "max"
+}
+
+func applyAnthropicThinking(
+	requestBody map[string]interface{},
+	provider, model string,
+	enableThinking bool,
+	thinkingBudget, maxTokens int32,
+	temperature float32,
+) {
+	if isKimiNativeEffortModel(provider, model) {
+		if enableThinking && thinkingBudget > 0 {
+			requestBody["reasoning_effort"] = kimiK3ReasoningEffort(thinkingBudget)
+		} else {
+			// Kimi documents K3 as always-thinking: disabling thinking routes
+			// the request to K2.6. Keep the selected model authoritative by
+			// interpreting the legacy Off state as K3's minimum effort.
+			requestBody["reasoning_effort"] = "low"
+		}
+		if temperature > 0 {
+			requestBody["temperature"] = temperature
+		}
+		return
+	}
+
+	if enableThinking && thinkingBudget > 0 {
+		requestBody["thinking"] = map[string]interface{}{
+			"type":          "enabled",
+			"budget_tokens": clampThinkingBudgetBelowMax(thinkingBudget, maxTokens),
+		}
+		if isGLMNativeEffortModel(provider, model) {
+			requestBody["reasoning_effort"] = glm52ReasoningEffort(thinkingBudget)
+		}
+		requestBody["temperature"] = 1.0
+	} else if isGLMModel(provider) {
+		// GLM 4.7+ enables thinking by default. Omitting the field therefore
+		// does not implement the user's Off choice; send the explicit switch.
+		requestBody["thinking"] = map[string]interface{}{"type": "disabled"}
+		if temperature > 0 {
+			requestBody["temperature"] = temperature
+		}
+	} else if temperature > 0 {
+		requestBody["temperature"] = temperature
+	}
 }
 
 // SetThinkingBudget configures the thinking/reasoning budget.
@@ -611,34 +693,18 @@ func (c *AnthropicClient) SetModel(modelName string) {
 // WithModel returns a new client configured for the specified model.
 func (c *AnthropicClient) WithModel(modelName string) Client {
 	c.mu.RLock()
-	newConfig := c.config
-	tools := c.tools
-	rl := c.rateLimiter
-	sc := c.statusCallback
-	si := c.systemInstruction
-	tc := c.turnContext
+	clone := &AnthropicClient{
+		config:            c.config,
+		httpClient:        c.httpClient,
+		tools:             append([]*genai.Tool(nil), c.tools...),
+		rateLimiter:       c.rateLimiter,
+		statusCallback:    c.statusCallback,
+		systemInstruction: c.systemInstruction,
+		turnContext:       c.turnContext,
+	}
 	c.mu.RUnlock()
-
-	newConfig.Model = modelName
-	newClient, err := NewAnthropicClient(newConfig)
-	if err != nil {
-		logging.Error("failed to create client with new model", "model", modelName, "error", err)
-		return c // Return original client on error
-	}
-	newClient.SetTools(tools)
-	if rl != nil {
-		newClient.SetRateLimiter(rl)
-	}
-	if sc != nil {
-		newClient.SetStatusCallback(sc)
-	}
-	if si != "" {
-		newClient.SetSystemInstruction(si)
-	}
-	if tc != "" {
-		newClient.SetTurnContext(tc)
-	}
-	return newClient
+	clone.config.Model = modelName
+	return clone
 }
 
 // Close closes the client connection and releases resources.
@@ -933,6 +999,47 @@ func classifyGLMErrorCode(code, message string) (retryable bool, keyword, descri
 		return false, "", message
 	}
 	return false, "", "GLM error " + code
+}
+
+// classifyCompatibleStreamError handles non-GLM Anthropic-compatible SSE
+// errors (currently Kimi in the desktop product). Providers often return an
+// HTTP 200 stream and put rate-limit/quota/auth failures in the event body, so
+// HTTP status-based retry logic cannot help here. Preserve provider identity
+// and keep permanent quota/auth failures out of the retry loop.
+func classifyCompatibleStreamError(provider, code, errorType, message string) (retryable bool, description string) {
+	label := strings.ToUpper(strings.TrimSpace(provider))
+	if strings.EqualFold(provider, "kimi") {
+		label = "Kimi"
+	}
+	if label == "" {
+		label = "Provider"
+	}
+	detail := strings.TrimSpace(message)
+	if detail == "" {
+		detail = strings.TrimSpace(errorType)
+	}
+	if detail == "" {
+		detail = "unknown stream error"
+	}
+	low := strings.ToLower(strings.Join([]string{code, errorType, message}, " "))
+	switch {
+	case strings.Contains(low, "insufficient_quota"), strings.Contains(low, "quota exceeded"),
+		strings.Contains(low, "balance exhausted"), strings.Contains(low, "insufficient balance"),
+		strings.Contains(low, "payment required"), strings.Contains(low, "billing"):
+		return false, fmt.Sprintf("%s usage quota or account balance exhausted: %s", label, detail)
+	case strings.Contains(low, "authentication"), strings.Contains(low, "unauthorized"),
+		strings.Contains(low, "invalid_api_key"), strings.Contains(low, "invalid api key"):
+		return false, fmt.Sprintf("%s authentication failed: %s", label, detail)
+	case code == "429", strings.Contains(low, "rate_limit"), strings.Contains(low, "rate limit"),
+		strings.Contains(low, "too many requests"):
+		return true, fmt.Sprintf("%s rate limit: %s", label, detail)
+	case code == "500", code == "502", code == "503", code == "504",
+		strings.Contains(low, "overloaded"), strings.Contains(low, "temporarily unavailable"),
+		strings.Contains(low, "internal server"):
+		return true, fmt.Sprintf("%s temporarily unavailable: %s", label, detail)
+	default:
+		return false, fmt.Sprintf("%s API error: %s", label, detail)
+	}
 }
 
 // doStreamRequest performs a single streaming request attempt.
@@ -1331,16 +1438,26 @@ func (c *AnthropicClient) doStreamRequest(ctx context.Context, requestBody map[s
 						continue waitLoop
 					}
 
-					// Handle Z.AI/GLM error format.
-					// GLM returns structured errors inside HTTP 200 SSE events.
-					// classifyGLMErrorCode embeds a keyword ("overloaded", "rate limit")
-					// so isRetryableError can pick it up, enabling auto-retry.
+					// Handle structured errors inside HTTP-200 SSE events. GLM and
+					// Kimi share the Anthropic transport, but their error namespaces
+					// are not interchangeable.
 					if errObj, ok := event["error"].(map[string]interface{}); ok {
 						errCode := stringFromMap(errObj, "code")
+						errType := stringFromMap(errObj, "type")
 						errMsg := stringFromMap(errObj, "message")
-						retryable, keyword, description := classifyGLMErrorCode(errCode, errMsg)
-						logging.Error("Z.AI API error", "code", errCode, "message", errMsg, "retryable", retryable)
-						errText := fmt.Sprintf("%s (%s)", description, errCode)
+						retryable := false
+						description := ""
+						keyword := ""
+						if providerSnap == "glm" {
+							retryable, keyword, description = classifyGLMErrorCode(errCode, errMsg)
+						} else {
+							retryable, description = classifyCompatibleStreamError(providerSnap, errCode, errType, errMsg)
+						}
+						logging.Error("provider SSE error", "provider", providerSnap, "code", errCode, "type", errType, "message", errMsg, "retryable", retryable)
+						errText := description
+						if errCode != "" {
+							errText = fmt.Sprintf("%s (%s)", description, errCode)
+						}
 						if keyword != "" {
 							errText = fmt.Sprintf("%s [%s] (%s): %s", description, keyword, errCode, errMsg)
 						}

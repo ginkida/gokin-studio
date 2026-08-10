@@ -166,6 +166,19 @@ button, input, select, textarea, a {
   transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
+/* System accessibility contract. Programmatic scrolling uses the same query
+   through lib/motion.ts; this block owns CSS transitions and animations. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+  }
+}
+
 /* Prevent text selection on buttons / labels */
 button {
   -webkit-user-select: none;

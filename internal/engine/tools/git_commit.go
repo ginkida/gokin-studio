@@ -3,7 +3,6 @@ package tools
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"strings"
 
 	"google.golang.org/genai"
@@ -105,8 +104,7 @@ func (t *GitCommitTool) Execute(ctx context.Context, args map[string]any) (ToolR
 
 	cmdArgs = append(cmdArgs, "-m", message)
 
-	cmd := exec.CommandContext(ctx, "git", cmdArgs...)
-	cmd.Dir = t.workDir
+	cmd := newGitCommand(ctx, t.workDir, cmdArgs...)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -130,8 +128,7 @@ func (t *GitCommitTool) Execute(ctx context.Context, args map[string]any) (ToolR
 	result := strings.TrimSpace(string(output))
 
 	// Get the commit hash for the response
-	hashCmd := exec.CommandContext(ctx, "git", "rev-parse", "--short", "HEAD")
-	hashCmd.Dir = t.workDir
+	hashCmd := newGitCommand(ctx, t.workDir, "rev-parse", "--short", "HEAD")
 	if hashOutput, err := hashCmd.Output(); err == nil {
 		hash := strings.TrimSpace(string(hashOutput))
 		if amend {
@@ -152,8 +149,7 @@ func (t *GitCommitTool) generateCommitMessage(ctx context.Context, includeUnstag
 		diffArgs = []string{"diff", "HEAD", "--stat"}
 	}
 
-	diffCmd := exec.CommandContext(ctx, "git", diffArgs...)
-	diffCmd.Dir = t.workDir
+	diffCmd := newGitCommand(ctx, t.workDir, diffArgs...)
 	statOutput, err := diffCmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("git diff --stat failed: %w", err)
@@ -170,8 +166,7 @@ func (t *GitCommitTool) generateCommitMessage(ctx context.Context, includeUnstag
 		detailArgs = []string{"diff", "HEAD"}
 	}
 
-	detailCmd := exec.CommandContext(ctx, "git", detailArgs...)
-	detailCmd.Dir = t.workDir
+	detailCmd := newGitCommand(ctx, t.workDir, detailArgs...)
 	detailOutput, err := detailCmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("git diff failed: %w", err)

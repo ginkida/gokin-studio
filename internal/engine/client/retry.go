@@ -212,21 +212,22 @@ func AdaptiveStreamRetryPolicy(provider string) StreamRetryPolicy {
 	// mid-stream (a bit of data, then a pause that trips the stream-idle timeout
 	// "after partial response"). Give healthy/new sessions one extra cold retry
 	// and one extra partial retry so a transient stall doesn't surface to the
-	// user immediately.
-	if streamStallProneProvider(provider) && h.Score >= 0 {
+	// user immediately. Keep this as a provider capability floor rather than a
+	// health-score conditional: health is process-global and a temporary outage
+	// must not permanently remove the tolerance these endpoints require. The
+	// adaptive branch above can still increase delays for an unhealthy endpoint.
+	if streamStallProneProvider(provider) {
 		if base.MaxRetries < 3 {
 			base.MaxRetries = 3
 		}
 		if base.MaxPartialRetries < 2 {
 			base.MaxPartialRetries = 2
 		}
-		if h.Score < 5 {
-			if base.BaseDelay < 3*time.Second {
-				base.BaseDelay = 3 * time.Second
-			}
-			if base.MaxDelay < 45*time.Second {
-				base.MaxDelay = 45 * time.Second
-			}
+		if base.BaseDelay < 3*time.Second {
+			base.BaseDelay = 3 * time.Second
+		}
+		if base.MaxDelay < 45*time.Second {
+			base.MaxDelay = 45 * time.Second
 		}
 	}
 

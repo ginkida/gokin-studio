@@ -142,8 +142,7 @@ func (t *GitPRTool) createPR(ctx context.Context, args map[string]any) (ToolResu
 	}
 
 	// Ensure branch is pushed
-	pushCmd := exec.CommandContext(ctx, "git", "push", "-u", "origin", "HEAD")
-	pushCmd.Dir = t.workDir
+	pushCmd := newGitCommand(ctx, t.workDir, "push", "-u", "origin", "HEAD")
 	pushOutput, err := pushCmd.CombinedOutput()
 	if err != nil {
 		outStr := string(pushOutput)
@@ -245,8 +244,7 @@ func (t *GitPRTool) generatePRDescription(ctx context.Context, base string) (str
 	}
 
 	// Get commits since base
-	logCmd := exec.CommandContext(ctx, "git", "log", base+"..HEAD", "--oneline", "--no-decorate")
-	logCmd.Dir = t.workDir
+	logCmd := newGitCommand(ctx, t.workDir, "log", base+"..HEAD", "--oneline", "--no-decorate")
 	logOutput, err := logCmd.Output()
 	if err != nil {
 		return "Update", ""
@@ -288,8 +286,7 @@ func (t *GitPRTool) generatePRDescription(ctx context.Context, base string) (str
 	body.WriteString("## Summary\n\n")
 
 	// Get diff stats
-	statCmd := exec.CommandContext(ctx, "git", "diff", "--stat", base+"..HEAD")
-	statCmd.Dir = t.workDir
+	statCmd := newGitCommand(ctx, t.workDir, "diff", "--stat", base+"..HEAD")
 	statOutput, _ := statCmd.Output()
 
 	// List commits as bullet points
@@ -314,8 +311,7 @@ func (t *GitPRTool) generatePRDescription(ctx context.Context, base string) (str
 // detectDefaultBranch finds the default branch name (main or master).
 func (t *GitPRTool) detectDefaultBranch(ctx context.Context) string {
 	// Try to detect from remote
-	cmd := exec.CommandContext(ctx, "git", "symbolic-ref", "refs/remotes/origin/HEAD", "--short")
-	cmd.Dir = t.workDir
+	cmd := newGitCommand(ctx, t.workDir, "symbolic-ref", "refs/remotes/origin/HEAD", "--short")
 	output, err := cmd.Output()
 	if err == nil {
 		branch := strings.TrimSpace(string(output))
@@ -328,8 +324,7 @@ func (t *GitPRTool) detectDefaultBranch(ctx context.Context) string {
 
 	// Fallback: check if main or master exists
 	for _, name := range []string{"main", "master"} {
-		checkCmd := exec.CommandContext(ctx, "git", "rev-parse", "--verify", name)
-		checkCmd.Dir = t.workDir
+		checkCmd := newGitCommand(ctx, t.workDir, "rev-parse", "--verify", name)
 		if err := checkCmd.Run(); err == nil {
 			return name
 		}

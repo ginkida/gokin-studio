@@ -7,12 +7,14 @@ export interface ChatMessage {
   toolName?: string
   toolArgs?: Record<string, unknown>
   toolSuccess?: boolean
+  consumed?: boolean
   // iter 1030+: streamingOutput is the accumulated live stdout for a still-
   // running tool (currently only bash). Appended to on every chat:tool_progress
   // event. Rendered inline during isPending so users see a live preview of
   // a long build instead of just a spinner. Untouched once the tool resolves —
   // the authoritative content field replaces this view in the rendered card.
   streamingOutput?: string
+  mcpApp?: MCPAppPayload
   dispatchTarget?: string
   dispatchSuccess?: boolean
   durationMs?: number
@@ -22,7 +24,38 @@ export interface ChatMessage {
   // been switching providers mid-conversation.
   model?: string
   provider?: string
+  attachments?: ChatAttachment[]
   timestamp: number
+}
+
+export interface MCPAppPayload {
+  instanceID?: string
+  resourceURI: string
+  html: string
+  csp?: {
+    connectDomains?: string[]
+    resourceDomains?: string[]
+    frameDomains?: string[]
+    baseUriDomains?: string[]
+  }
+  prefersBorder?: boolean
+  toolName: string
+  toolArgs?: Record<string, unknown>
+  toolResult?: Record<string, unknown>
+}
+
+export interface ChatAttachment {
+  name?: string
+  mimeType: string
+  data: string
+  size?: number
+}
+
+export interface QueuedTurn {
+  id: string
+  content: string
+  attachments?: ChatAttachment[]
+  queuedAt: number
 }
 
 export interface RetryStatus {
@@ -44,6 +77,10 @@ export interface AskUserQuestion {
   question: string
   options: string[]
   default: string
+  kind?: 'tool_approval'
+  tool?: string
+  scope?: 'current_turn' | 'current_turn_or_project_tool' | 'single_action'
+  details?: Array<{ label: string; value: string }>
   askedAt: number
 }
 
@@ -59,9 +96,9 @@ export interface TokenUsage {
   lastCacheReadTokens: number
   lastCacheWriteTokens: number
   // Approximate USD cost for the entire turn, computed server-side from the
-  // pricing table in `pricing.go`. 0 means the model is unknown to the table
-  // or the provider is local (Ollama). Frontend renders with a "≈" prefix
-  // since these are approximations, not authoritative billing.
+  // pricing table in `pricing.go`. 0 means the model is unknown to the table.
+  // Frontend renders with a "≈" prefix since these are approximations, not
+  // authoritative billing.
   estimatedCostUSD?: number
 }
 
@@ -76,6 +113,7 @@ interface ChatState {
   currentUsage: Record<string, TokenUsage | null>  // chatKey → live usage for the in-progress turn
   lastTurnUsage: Record<string, TokenUsage | null>  // chatKey → usage from the most recently completed turn
   askUser: Record<string, AskUserQuestion | null>   // chatKey → pending ask_user question (one at a time)
+  queuedTurns: Record<string, QueuedTurn[]> // chatKey → backend-owned follow-ups waiting to start
   activeSession: Record<string, string>    // projectID → current active sessionID
   // Per-tab unread counter. Bumped when a session finishes a turn or errors
   // while the user isn't currently viewing it. Cleared when the user switches
@@ -91,14 +129,14 @@ interface ChatState {
 interface ChatStore extends ChatState {
   setActiveSession: (projectId: string, sessionId: string) => void
   setMessages: (chatKey: string, messages: ChatMessage[]) => void
-  addUserMessage: (chatKey: string, content: string) => void
+  addUserMessage: (chatKey: string, content: string, attachments?: ChatAttachment[]) => void
   appendStreamText: (chatKey: string, text: string) => void
   appendThinkingStream: (chatKey: string, text: string) => void
   addThinking: (chatKey: string, text: string) => void
   finalizeAssistant: (chatKey: string, text: string) => void
   addToolCall: (chatKey: string, tool: string, args: Record<string, unknown>) => void
   addToolProgress: (chatKey: string, tool: string, text: string) => void
-  addToolResult: (chatKey: string, tool: string, success: boolean, content: string) => void
+  addToolResult: (chatKey: string, tool: string, success: boolean, content: string, mcpApp?: MCPAppPayload) => void
   addDispatchResult: (chatKey: string, target: string, success: boolean, content: string) => void
   setSessionActive: (chatKey: string, active: boolean) => void
   setRetrying: (chatKey: string, status: RetryStatus | null) => void
@@ -107,6 +145,10 @@ interface ChatStore extends ChatState {
   setCurrentUsage: (chatKey: string, usage: TokenUsage | null) => void
   finalizeUsage: (chatKey: string, usage: TokenUsage | null) => void
   setAskUser: (chatKey: string, q: AskUserQuestion | null) => void
+  enqueueTurn: (chatKey: string, turn: QueuedTurn) => void
+  removeQueuedTurn: (chatKey: string, id: string) => void
+  startQueuedTurn: (chatKey: string, id: string) => void
+  clearQueuedTurns: (chatKey: string, ids?: string[]) => void
   bumpUnread: (chatKey: string) => void
   clearUnread: (chatKey: string) => void
   // Drop every unread entry whose key starts with `${projectID}_`. Used by
@@ -140,6 +182,7 @@ export const useChatStore = create<ChatStore>((set) => ({
   currentUsage: {},
   lastTurnUsage: {},
   askUser: {},
+  queuedTurns: {},
   activeSession: {},
   unread: {},
   scrollPositions: {},
@@ -213,18 +256,77 @@ export const useChatStore = create<ChatStore>((set) => ({
       askUser: { ...s.askUser, [chatKey]: q },
     })),
 
+  enqueueTurn: (chatKey, turn) =>
+    set((s) => {
+      const current = s.queuedTurns[chatKey] || []
+      if (current.some((item) => item.id === turn.id)) return s
+      return {
+        queuedTurns: {
+          ...s.queuedTurns,
+          [chatKey]: [...current, turn],
+        },
+      }
+    }),
+
+  removeQueuedTurn: (chatKey, id) =>
+    set((s) => ({
+      queuedTurns: {
+        ...s.queuedTurns,
+        [chatKey]: (s.queuedTurns[chatKey] || []).filter((turn) => turn.id !== id),
+      },
+    })),
+
+  startQueuedTurn: (chatKey, id) =>
+    set((s) => {
+      const queued = s.queuedTurns[chatKey] || []
+      const turn = queued.find((item) => item.id === id)
+      const remaining = queued.filter((item) => item.id !== id)
+      if (!turn) {
+        return { queuedTurns: { ...s.queuedTurns, [chatKey]: remaining } }
+      }
+      return {
+        queuedTurns: { ...s.queuedTurns, [chatKey]: remaining },
+        messages: {
+          ...s.messages,
+          [chatKey]: [
+            ...(s.messages[chatKey] || []),
+            {
+              id: genId(),
+              role: 'user',
+              content: turn.content,
+              attachments: turn.attachments,
+              timestamp: Date.now(),
+            },
+          ],
+        },
+        streaming: { ...s.streaming, [chatKey]: '' },
+        thinkingStream: { ...s.thinkingStream, [chatKey]: '' },
+        currentUsage: { ...s.currentUsage, [chatKey]: null },
+        sessionActive: { ...s.sessionActive, [chatKey]: true },
+      }
+    }),
+
+  clearQueuedTurns: (chatKey, ids) =>
+    set((s) => {
+      const current = s.queuedTurns[chatKey] || []
+      const next = ids?.length
+        ? current.filter((turn) => !ids.includes(turn.id))
+        : []
+      return { queuedTurns: { ...s.queuedTurns, [chatKey]: next } }
+    }),
+
   setMessages: (projectId, messages) =>
     set((s) => ({
       messages: { ...s.messages, [projectId]: messages },
     })),
 
-  addUserMessage: (projectId, content) =>
+  addUserMessage: (projectId, content, attachments) =>
     set((s) => ({
       messages: {
         ...s.messages,
         [projectId]: [
           ...(s.messages[projectId] || []),
-          { id: genId(), role: 'user', content, timestamp: Date.now() },
+          { id: genId(), role: 'user', content, attachments, timestamp: Date.now() },
         ],
       },
       streaming: { ...s.streaming, [projectId]: '' },
@@ -328,7 +430,7 @@ export const useChatStore = create<ChatStore>((set) => ({
       return { messages: { ...s.messages, [projectId]: msgs } }
     }),
 
-  addToolResult: (projectId, tool, success, content) =>
+  addToolResult: (projectId, tool, success, content, mcpApp) =>
     set((s) => {
       const msgs = [...(s.messages[projectId] || [])]
       // Update last PENDING tool call for this tool (toolSuccess is undefined until resolved).
@@ -336,7 +438,7 @@ export const useChatStore = create<ChatStore>((set) => ({
         if (msgs[i].toolName === tool && msgs[i].role === 'tool' && msgs[i].toolSuccess === undefined) {
           // iter 1030+: drop streamingOutput once authoritative content lands.
           // The rendered tool card switches to the regular bash-output view.
-          msgs[i] = { ...msgs[i], content, toolSuccess: success, streamingOutput: undefined }
+          msgs[i] = { ...msgs[i], content, toolSuccess: success, streamingOutput: undefined, mcpApp }
           break
         }
       }
@@ -376,6 +478,7 @@ export const useChatStore = create<ChatStore>((set) => ({
         streaming: { ...s.streaming, [projectId]: '' },
         thinkingStream: { ...s.thinkingStream, [projectId]: '' },
         askUser: { ...s.askUser, [projectId]: null },
+        queuedTurns: { ...s.queuedTurns, [projectId]: [] },
         currentUsage: { ...s.currentUsage, [projectId]: null },
         lastTurnUsage: { ...s.lastTurnUsage, [projectId]: null },
         retrying: { ...s.retrying, [projectId]: null },
@@ -401,6 +504,7 @@ export const useChatStore = create<ChatStore>((set) => ({
         currentUsage: del(s.currentUsage),
         lastTurnUsage: del(s.lastTurnUsage),
         askUser: del(s.askUser),
+        queuedTurns: del(s.queuedTurns),
         unread: del(s.unread),
         scrollPositions: del(s.scrollPositions),
       }
@@ -434,6 +538,7 @@ export const useChatStore = create<ChatStore>((set) => ({
         currentUsage: drop(s.currentUsage),
         lastTurnUsage: drop(s.lastTurnUsage),
         askUser: drop(s.askUser),
+        queuedTurns: drop(s.queuedTurns),
         unread: drop(s.unread),
         scrollPositions: drop(s.scrollPositions),
         activeSession: dropExact(s.activeSession),

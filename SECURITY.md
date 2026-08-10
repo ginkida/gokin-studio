@@ -54,13 +54,74 @@ report it.
   matches `.gokin-studio.pre-import-*`, `.gokin-studio.pre-restore-*`,
   or `auto-backup-*.tar.gz` with no path separators or `..` segments.
 
+### Remembered tool permissions
+
+- Manual-mode `Always allow` rules are scoped to one project and contain only
+  an allowlisted tool name plus a creation timestamp. Arguments, shell
+  commands, environment values, file content, connector payloads, and secrets
+  are never stored in a rule.
+- The runtime classifies every concrete call before consulting a remembered
+  rule. Destructive variants, external/network operations, plugin force-ask,
+  and execution without an enforced workspace sandbox cannot inherit a grant.
+- Shell, delete, SSH, MCP/connectors, Browser/computer use, schedules, PR
+  writes, delegation, and unknown tools are not eligible. All remembered
+  rules and their project scope are visible and revocable in Context.
+
 ### Network calls
 
-- All external endpoints are HTTPS. The only HTTP endpoints in the
-  codebase are `http://localhost:11434` (Ollama default) and OAuth
-  callback URLs (also localhost).
+- Provider and update endpoints are HTTPS. Explicitly reviewed external
+  Browser tabs may fetch a user-entered public HTTP(S) origin through a local
+  per-tab proxy; loopback is also used for OAuth callbacks, previews, and that
+  proxy.
 - Provider connection probes use a 5-second `context.WithTimeout` so a
   hung provider cannot block the UI.
+
+### External Browser isolation
+
+- Navigation approves an exact public origin; schemes, ports, and subdomains
+  do not inherit approval. DNS results are checked for private/reserved ranges
+  and the validated public IP is pinned for the connection.
+- Upstream redirects, links, forms, resources, cookies, headers, and body sizes
+  are mediated by the per-tab proxy. Resource URLs are HMAC-bound to one exact
+  target; changing the encoded target invalidates the signature, and using a
+  signed resource URL as a document re-enters the origin review flow.
+- macOS permits first-party page scripts only after installing a native
+  `WKNavigationDelegate` policy. The main Wails document may initially load a
+  reviewed loopback frame, while code inside a child frame is confined to its
+  exact local scheme, hostname, and port. Direct public/private navigation,
+  `_top`, new windows, embedded frames, and refresh/link headers fail closed.
+  Platforms without that native boundary use the nonce-only script-disabled
+  mode. In both modes, subresources still pass the SSRF-validating transport.
+- Model inspection and coordinate actions route only to the visible active tab.
+  Each non-list call receives a fresh exact-action confirmation, then rechecks
+  the project/session/tab, bridge token, origin, and latest public URL. Returned
+  DOM data and optional PNGs are schema- and size-bounded; external page text is
+  untrusted content, never instructions.
+
+### Desktop links
+
+- `gokin://` accepts only documented `studio/new`, `studio/chat/<id>`, and
+  `studio/project/<id>` routes with a bounded, single-valued parameter set.
+  Unknown routes, fragments, userinfo, ports, duplicate parameters, invalid
+  identifiers, and oversized URLs/prompts are rejected.
+- A `q=` value is placed into an editable composer draft. A desktop link can
+  never send the prompt, start an agent, invoke a tool, or approve an action.
+- Raw links and prompt contents are not written to diagnostics. Short-lived
+  duplicate detection stores only a SHA-256 digest of the URL.
+
+### Desktop update checks
+
+- Automatic release checks are notify-only, can be disabled in Settings, and
+  run at most once per 24 hours against the fixed
+  `api.github.com/repos/ginkida/gokin-studio/releases/latest` endpoint. Studio
+  sends no project, prompt, credential, or machine identifier.
+- Responses are size-bounded and must contain a stable canonical
+  `vMAJOR.MINOR.PATCH` tag. Release-page URLs are constructed locally for the
+  fixed repository instead of trusting a remote URL field.
+- Studio does not download or install update artifacts in the background while
+  the project uses self-signed/community builds. Releases include
+  `SHA256SUMS.txt`, and the release workflow fails if the Git tag does not
+  match the version embedded in the binary.
 
 ### Tool execution
 
@@ -69,6 +130,16 @@ report it.
   feature, not a vulnerability. Use only with trusted projects.
 - Path validation in `internal/engine/security/path_validator.go` keeps
   file-read/write tools inside the active project directory.
+- Where a workspace-isolation backend is available, shell, test, and
+  formatter commands run inside it: a macOS Seatbelt profile
+  (`internal/engine/security/sandbox_darwin.go`) or a Linux bubblewrap
+  namespace. Both fail closed — if the backend is unavailable the command
+  is refused rather than run unconfined. An escape from that confinement
+  IS in scope; see below.
+- This release adds further local execution surfaces, all of which are in
+  scope: repository plugin hooks, MCP stdio server launch, MCPB extension
+  install, computer-use synthetic input, and dev-server launch from
+  `.claude/launch.json`.
 
 ## Out of scope
 
@@ -77,5 +148,9 @@ report it.
 - API key values typed by the user into a chat message are stored in
   the session history (and any backups). This is accepted behaviour —
   the user is the one who put the key there.
-- macOS/Windows OS-level sandboxing: this app does not enforce
-  sandbox restrictions; that is the OS's job.
+- Hardening the host OS itself (System Integrity Protection, Gatekeeper,
+  Windows integrity levels) is the operating system's job, not this app's.
+  Note that this does NOT put the app's own workspace isolation out of
+  scope: a way to escape the Seatbelt/bubblewrap confinement described
+  under "Tool execution", or to make it silently run unconfined, is a
+  reportable vulnerability.

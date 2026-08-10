@@ -1,7 +1,6 @@
 package git
 
 import (
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -23,11 +22,11 @@ func DetectWorktree(workDir string) *WorktreeInfo {
 	gitPath := filepath.Join(workDir, ".git")
 
 	// Get the real git common dir (shared between main repo and worktrees)
-	commonDir, err := exec.Command("git", "-C", workDir, "rev-parse", "--git-common-dir").Output()
+	commonDir, err := newCommand(workDir, "rev-parse", "--git-common-dir").Output()
 	if err != nil {
 		return nil
 	}
-	gitDir, err := exec.Command("git", "-C", workDir, "rev-parse", "--git-dir").Output()
+	gitDir, err := newCommand(workDir, "rev-parse", "--git-dir").Output()
 	if err != nil {
 		return nil
 	}
@@ -57,7 +56,7 @@ func DetectWorktree(workDir string) *WorktreeInfo {
 
 // ListWorktrees returns all worktrees in the repository.
 func ListWorktrees(workDir string) []WorktreeInfo {
-	out, err := exec.Command("git", "-C", workDir, "worktree", "list", "--porcelain").Output()
+	out, err := newCommand(workDir, "worktree", "list", "--porcelain").Output()
 	if err != nil {
 		return nil
 	}
@@ -113,7 +112,7 @@ func ListWorktrees(workDir string) []WorktreeInfo {
 // GetMainWorktreeRoot returns the root of the main repository (not the worktree).
 // Returns workDir if not in a worktree or if detection fails.
 func GetMainWorktreeRoot(workDir string) string {
-	out, err := exec.Command("git", "-C", workDir, "rev-parse", "--git-common-dir").Output()
+	out, err := newCommand(workDir, "rev-parse", "--git-common-dir").Output()
 	if err != nil {
 		return workDir
 	}
@@ -134,7 +133,7 @@ func GetMainWorktreeRoot(workDir string) string {
 }
 
 func getHead(workDir string) string {
-	out, err := exec.Command("git", "-C", workDir, "rev-parse", "--short", "HEAD").Output()
+	out, err := newCommand(workDir, "rev-parse", "--short", "HEAD").Output()
 	if err != nil {
 		return ""
 	}

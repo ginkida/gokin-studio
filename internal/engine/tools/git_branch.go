@@ -3,7 +3,6 @@ package tools
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"strings"
 
 	"google.golang.org/genai"
@@ -107,16 +106,14 @@ func (t *GitBranchTool) listBranches(ctx context.Context, args map[string]any) (
 		cmdArgs = append(cmdArgs, "-a")
 	}
 
-	cmd := exec.CommandContext(ctx, "git", cmdArgs...)
-	cmd.Dir = t.workDir
+	cmd := newGitCommand(ctx, t.workDir, cmdArgs...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return NewErrorResult(fmt.Sprintf("git branch list failed: %s\n%s", err, string(output))), nil
 	}
 
 	// Get current branch
-	currentCmd := exec.CommandContext(ctx, "git", "branch", "--show-current")
-	currentCmd.Dir = t.workDir
+	currentCmd := newGitCommand(ctx, t.workDir, "branch", "--show-current")
 	currentOutput, _ := currentCmd.Output()
 	current := strings.TrimSpace(string(currentOutput))
 
@@ -160,8 +157,7 @@ func (t *GitBranchTool) createBranch(ctx context.Context, args map[string]any) (
 		cmdArgs = append(cmdArgs, from)
 	}
 
-	cmd := exec.CommandContext(ctx, "git", cmdArgs...)
-	cmd.Dir = t.workDir
+	cmd := newGitCommand(ctx, t.workDir, cmdArgs...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return NewErrorResult(fmt.Sprintf("failed to create branch: %s\n%s", err, string(output))), nil
@@ -183,8 +179,7 @@ func (t *GitBranchTool) deleteBranch(ctx context.Context, args map[string]any) (
 		flag = "-D"
 	}
 
-	cmd := exec.CommandContext(ctx, "git", "branch", flag, name)
-	cmd.Dir = t.workDir
+	cmd := newGitCommand(ctx, t.workDir, "branch", flag, name)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		outStr := string(output)
@@ -210,8 +205,7 @@ func (t *GitBranchTool) switchBranch(ctx context.Context, args map[string]any) (
 		cmdArgs = []string{"checkout", "-f", name}
 	}
 
-	cmd := exec.CommandContext(ctx, "git", cmdArgs...)
-	cmd.Dir = t.workDir
+	cmd := newGitCommand(ctx, t.workDir, cmdArgs...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		outStr := string(output)
@@ -231,16 +225,14 @@ func (t *GitBranchTool) mergeBranch(ctx context.Context, args map[string]any) (T
 		return NewErrorResult("invalid branch name: must not start with '-'"), nil
 	}
 
-	cmd := exec.CommandContext(ctx, "git", "merge", name)
-	cmd.Dir = t.workDir
+	cmd := newGitCommand(ctx, t.workDir, "merge", name)
 	output, err := cmd.CombinedOutput()
 	outStr := strings.TrimSpace(string(output))
 
 	if err != nil {
 		if strings.Contains(outStr, "CONFLICT") {
 			// Get conflict details
-			conflictCmd := exec.CommandContext(ctx, "git", "diff", "--name-only", "--diff-filter=U")
-			conflictCmd.Dir = t.workDir
+			conflictCmd := newGitCommand(ctx, t.workDir, "diff", "--name-only", "--diff-filter=U")
 			conflictOutput, _ := conflictCmd.Output()
 
 			return NewErrorResult(fmt.Sprintf("Merge conflict when merging '%s'.\n\nConflicting files:\n%s\nResolve conflicts and commit, or run 'git merge --abort' to cancel.",
@@ -253,13 +245,11 @@ func (t *GitBranchTool) mergeBranch(ctx context.Context, args map[string]any) (T
 }
 
 func (t *GitBranchTool) currentBranch(ctx context.Context) (ToolResult, error) {
-	cmd := exec.CommandContext(ctx, "git", "branch", "--show-current")
-	cmd.Dir = t.workDir
+	cmd := newGitCommand(ctx, t.workDir, "branch", "--show-current")
 	output, err := cmd.Output()
 	if err != nil {
 		// Might be in detached HEAD
-		hashCmd := exec.CommandContext(ctx, "git", "rev-parse", "--short", "HEAD")
-		hashCmd.Dir = t.workDir
+		hashCmd := newGitCommand(ctx, t.workDir, "rev-parse", "--short", "HEAD")
 		hashOutput, hashErr := hashCmd.Output()
 		if hashErr != nil {
 			return NewErrorResult("not in a git repository"), nil
@@ -270,8 +260,7 @@ func (t *GitBranchTool) currentBranch(ctx context.Context) (ToolResult, error) {
 	branch := strings.TrimSpace(string(output))
 
 	// Also get upstream info
-	upstreamCmd := exec.CommandContext(ctx, "git", "rev-parse", "--abbrev-ref", branch+"@{upstream}")
-	upstreamCmd.Dir = t.workDir
+	upstreamCmd := newGitCommand(ctx, t.workDir, "rev-parse", "--abbrev-ref", branch+"@{upstream}")
 	upstreamOutput, upstreamErr := upstreamCmd.Output()
 
 	result := fmt.Sprintf("Current branch: %s", branch)
@@ -280,8 +269,7 @@ func (t *GitBranchTool) currentBranch(ctx context.Context) (ToolResult, error) {
 		result += fmt.Sprintf("\nTracking: %s", upstream)
 
 		// Check ahead/behind
-		abCmd := exec.CommandContext(ctx, "git", "rev-list", "--left-right", "--count", branch+"..."+upstream)
-		abCmd.Dir = t.workDir
+		abCmd := newGitCommand(ctx, t.workDir, "rev-list", "--left-right", "--count", branch+"..."+upstream)
 		abOutput, abErr := abCmd.Output()
 		if abErr == nil {
 			parts := strings.Fields(strings.TrimSpace(string(abOutput)))

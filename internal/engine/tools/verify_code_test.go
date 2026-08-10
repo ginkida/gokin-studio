@@ -79,3 +79,46 @@ func TestVerifyCodeFailureCapsOutput(t *testing.T) {
 		t.Fatalf("tail of failure output dropped by the trim, post-marker tail:\n%s", tail)
 	}
 }
+
+func TestVerifyCodeRejectsPathOutsideConnectedProject(t *testing.T) {
+	project := t.TempDir()
+	outside := t.TempDir()
+	writeGoMod(t, project)
+	writeGoMod(t, outside)
+
+	result, err := NewVerifyCodeTool(project).Execute(context.Background(), map[string]any{
+		"path": outside,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Success {
+		t.Fatalf("outside verification path unexpectedly succeeded: %s", result.Content)
+	}
+	if !strings.Contains(strings.ToLower(result.Error), "inside the connected project") {
+		t.Fatalf("unexpected boundary error: %q", result.Error)
+	}
+}
+
+func TestVerifyCodeRejectsSymlinkEscape(t *testing.T) {
+	project := t.TempDir()
+	outside := t.TempDir()
+	writeGoMod(t, outside)
+	link := filepath.Join(project, "external")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	result, err := NewVerifyCodeTool(project).Execute(context.Background(), map[string]any{
+		"path": link,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Success {
+		t.Fatalf("symlink escape unexpectedly succeeded: %s", result.Content)
+	}
+	if !strings.Contains(strings.ToLower(result.Error), "inside the connected project") {
+		t.Fatalf("unexpected symlink boundary error: %q", result.Error)
+	}
+}

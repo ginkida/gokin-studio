@@ -1,6 +1,7 @@
 package studio
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -97,5 +98,39 @@ func TestCommitChanges_Success(t *testing.T) {
 	}
 	if files := runGit(dir, "show", "--name-only", "--pretty=format:", "HEAD"); !strings.Contains(files, "fresh.txt") {
 		t.Errorf("untracked fresh.txt not included in commit: %q", files)
+	}
+}
+
+func TestCommitSessionChangesCommitsOnlySelectedWorktree(t *testing.T) {
+	s := newStudioForTest(t)
+	repo := prepareSessionWorktreeRepo(t)
+	info, err := s.AddProject("session-commit", repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := s.projects[info.ID].sessions["default"].Info()
+	if err := writeFile(filepath.Join(session.WorktreePath, "tracked.txt"), "worktree-only\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFile(filepath.Join(repo, "root-only.txt"), "leave me uncommitted\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := s.CommitSessionChanges(info.ID, "default", "commit isolated review")
+	if err != nil {
+		t.Fatalf("CommitSessionChanges: %v", err)
+	}
+	if result.Branch != session.WorktreeBranch || result.Hash == "" {
+		t.Fatalf("commit result = %+v", result)
+	}
+	if status := runGit(session.WorktreePath, "status", "--porcelain"); status != "" {
+		t.Fatalf("session checkout remains dirty: %q", status)
+	}
+	if rootStatus := runGit(repo, "status", "--porcelain"); !strings.Contains(rootStatus, "root-only.txt") {
+		t.Fatalf("project root change was unexpectedly committed: %q", rootStatus)
+	}
+	rootTracked, err := os.ReadFile(filepath.Join(repo, "tracked.txt"))
+	if err != nil || string(rootTracked) != "root-v1\n" {
+		t.Fatalf("session commit changed project root: %q, %v", rootTracked, err)
 	}
 }

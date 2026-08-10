@@ -28,8 +28,8 @@ func seedPreRestore(t *testing.T, parent, suffix string, age time.Duration) stri
 
 func TestHasSnapshotPrefix(t *testing.T) {
 	cases := map[string]string{
-		preImportPrefix + "20250516":  preImportPrefix,
-		preRestorePrefix + "20250516": preRestorePrefix,
+		preImportPrefix + "20250516":     preImportPrefix,
+		preRestorePrefix + "20250516":    preRestorePrefix,
 		".gokin-studio.import-staging-x": "", // staging is NOT a snapshot prefix
 		"randomdir":                      "",
 		"":                               "",

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { ChevronRight, File, Folder, FolderOpen, Search, X } from 'lucide-react'
-import { ListDirectory } from '../../../wailsjs/go/studio/Studio'
+import { ListSessionDirectory } from '../../../wailsjs/go/studio/Studio'
 
 interface Entry {
   name: string
@@ -18,10 +18,12 @@ type DirState = {
 
 export function FilePicker({
   projectId,
+  sessionId,
   onPick,
   onClose,
 }: {
   projectId: string
+  sessionId: string
   onPick: (path: string) => void
   onClose: () => void
 }) {
@@ -32,12 +34,12 @@ export function FilePicker({
   useEffect(() => {
     inputRef.current?.focus()
     // Load root directory immediately
-    ListDirectory(projectId, '').then((entries) => {
+    ListSessionDirectory(projectId, sessionId, '').then((entries) => {
       setDirs((d) => ({ ...d, '': { loaded: true, entries: (entries || []) as Entry[], expanded: true } }))
     }).catch((err) => {
       setDirs((d) => ({ ...d, '': { loaded: true, entries: [], expanded: true, error: String(err?.message || err) } }))
     })
-  }, [projectId])
+  }, [projectId, sessionId])
 
   const toggle = (path: string) => {
     setDirs((d) => {
@@ -48,7 +50,7 @@ export function FilePicker({
         // Use the current state (dd) at resolve-time, not the captured `next`,
         // so rapid double-clicks can't overwrite an intermediate expand/collapse.
         // Also retry when a previous attempt left an error (cur.error set).
-        ListDirectory(projectId, path).then((entries) => {
+        ListSessionDirectory(projectId, sessionId, path).then((entries) => {
           setDirs((dd) => ({ ...dd, [path]: { ...dd[path], loaded: true, entries: (entries || []) as Entry[], error: undefined } }))
         }).catch((err) => {
           setDirs((dd) => ({ ...dd, [path]: { ...dd[path], loaded: true, entries: [], error: String(err?.message || err) } }))
@@ -147,6 +149,7 @@ export function FilePicker({
         onMouseDown={(e) => e.stopPropagation()}
         onKeyDown={onKey}
         role="dialog"
+        aria-modal="true"
         aria-label="Browse project files"
       >
         <div className="fp-input-wrap">
@@ -159,7 +162,7 @@ export function FilePicker({
             onChange={(e) => setQuery(e.target.value)}
             maxLength={500}
           />
-          <button className="icon-btn" onClick={onClose}><X size={12} /></button>
+          <button className="icon-btn" onClick={onClose} title="Close" aria-label="Close file picker"><X size={12} /></button>
         </div>
         <div className="fp-body">
           {visibleFiltered ? (

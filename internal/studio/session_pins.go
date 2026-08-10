@@ -17,7 +17,7 @@ import (
 // sessionPinsPath returns ~/.config/gokin-studio/session-pins/<projectID>.json.
 // One file per project; mirrors the per-project drafts/pins layout.
 func sessionPinsPath(projectID string) string {
-	return filepath.Join(configDir(), "session-pins", projectID+".json")
+	return filepath.Join(configDir(), "session-pins", safeStorageKey(projectID)+".json")
 }
 
 // loadPinnedSessions reads the on-disk pinned-session set for a project.
@@ -28,7 +28,7 @@ func loadPinnedSessions(projectID string) (map[string]bool, error) {
 	if projectID == "" {
 		return map[string]bool{}, nil
 	}
-	data, err := os.ReadFile(sessionPinsPath(projectID))
+	data, err := readRegularFileLimited(sessionPinsPath(projectID), 256<<10)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return map[string]bool{}, nil

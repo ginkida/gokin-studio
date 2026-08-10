@@ -496,36 +496,19 @@ func (c *OllamaClient) SetModel(modelName string) {
 
 // WithModel returns a new client configured for the specified model.
 func (c *OllamaClient) WithModel(modelName string) Client {
-	// Snapshot all mutable fields under lock before creating new client
 	c.mu.RLock()
-	newConfig := c.config
-	tools := c.tools
-	rl := c.rateLimiter
-	sc := c.statusCallback
-	si := c.systemInstruction
-	tc := c.turnContext
+	clone := &OllamaClient{
+		client:            c.client,
+		config:            c.config,
+		tools:             append([]*genai.Tool(nil), c.tools...),
+		rateLimiter:       c.rateLimiter,
+		statusCallback:    c.statusCallback,
+		systemInstruction: c.systemInstruction,
+		turnContext:       c.turnContext,
+	}
 	c.mu.RUnlock()
-
-	newConfig.Model = modelName
-	newClient, err := NewOllamaClient(newConfig)
-	if err != nil {
-		logging.Error("failed to create Ollama client with new model", "model", modelName, "error", err)
-		return c
-	}
-	newClient.SetTools(tools)
-	if rl != nil {
-		newClient.SetRateLimiter(rl)
-	}
-	if sc != nil {
-		newClient.SetStatusCallback(sc)
-	}
-	if si != "" {
-		newClient.SetSystemInstruction(si)
-	}
-	if tc != "" {
-		newClient.SetTurnContext(tc)
-	}
-	return newClient
+	clone.config.Model = modelName
+	return clone
 }
 
 // GetRawClient returns the underlying Ollama client.

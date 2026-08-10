@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ginkida/gokin-studio/internal/engine/security"
 	"google.golang.org/genai"
 )
 
@@ -24,6 +25,10 @@ type RunTestsTool struct {
 // NewRunTestsTool creates a new RunTestsTool instance.
 func NewRunTestsTool(workDir string) *RunTestsTool {
 	return &RunTestsTool{workDir: workDir}
+}
+
+func (t *RunTestsTool) WorkspaceIsolationStatus() security.WorkspaceIsolationStatus {
+	return security.DetectWorkspaceIsolation()
 }
 
 func (t *RunTestsTool) Name() string { return "run_tests" }
@@ -60,6 +65,11 @@ func (t *RunTestsTool) Declaration() *genai.FunctionDeclaration {
 					Description: "Force specific framework: 'go', 'pytest', 'jest', 'cargo', 'auto' (default: auto-detect)",
 					Enum:        []string{"auto", "go", "pytest", "jest", "cargo"},
 				},
+				"network_access": {
+					Type: genai.TypeBoolean,
+					Description: "Request host network access while running tests. Default false; " +
+						"enabling it always requires a fresh exact-action approval.",
+				},
 			},
 		},
 	}
@@ -73,22 +83,38 @@ func (t *RunTestsTool) Execute(ctx context.Context, args map[string]any) (ToolRe
 	verbose := GetBoolDefault(args, "verbose", false)
 	coverage := GetBoolDefault(args, "coverage", false)
 	framework := GetStringDefault(args, "framework", "auto")
+	allowNetwork := GetBoolDefault(args, "network_access", false)
 
-	workDir := t.workDir
+	projectRoot := t.workDir
+	if resolvedRoot, rootErr := filepath.EvalSymlinks(t.workDir); rootErr == nil {
+		projectRoot = resolvedRoot
+	}
+	workDir := projectRoot
 	if testPath != "" {
+		candidate := testPath
 		if filepath.IsAbs(testPath) {
-			workDir = testPath
+			candidate = testPath
 		} else {
-			workDir = filepath.Join(t.workDir, testPath)
+			candidate = filepath.Join(projectRoot, testPath)
 		}
-		if info, err := os.Stat(workDir); err == nil && !info.IsDir() {
-			workDir = filepath.Dir(workDir)
+		validator := security.NewPathValidator([]string{projectRoot}, true)
+		resolved, pathErr := validator.Validate(candidate)
+		if pathErr != nil {
+			return NewErrorResult("test path must stay inside the connected project: " + pathErr.Error()), nil
+		}
+		info, statErr := os.Stat(resolved)
+		if statErr != nil {
+			return NewErrorResult("cannot access test path: " + statErr.Error()), nil
+		}
+		workDir = resolved
+		if !info.IsDir() {
+			workDir = filepath.Dir(resolved)
 		}
 	}
 
 	// Auto-detect framework
 	if framework == "auto" {
-		framework = detectTestFramework(workDir)
+		framework = detectTestFrameworkWithin(workDir, projectRoot, 10)
 		if framework == "" {
 			return NewErrorResult("could not detect test framework. Specify 'framework' parameter."), nil
 		}
@@ -101,8 +127,25 @@ func (t *RunTestsTool) Execute(ctx context.Context, args map[string]any) (ToolRe
 	testCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
-	cmd := exec.CommandContext(testCtx, cmdName, cmdArgs...)
-	cmd.Dir = workDir
+	var cmd *exec.Cmd
+	isolation := security.DetectWorkspaceIsolation()
+	if isolation.Available {
+		config := security.DefaultSandboxConfig()
+		config.AllowNetwork = allowNetwork
+		isolated, sandboxErr := security.NewSandboxedCommandArgs(testCtx, workDir, cmdName, cmdArgs, config)
+		if sandboxErr != nil {
+			return NewErrorResult("failed to create workspace sandbox for tests: " + sandboxErr.Error()), nil
+		}
+		cmd = isolated.Command()
+	} else {
+		cmd = exec.CommandContext(testCtx, cmdName, cmdArgs...)
+		cmd.Dir = workDir
+		env, envErr := security.WorkspaceSafeEnvironment(workDir)
+		if envErr != nil {
+			return NewErrorResult("failed to create isolated test environment: " + envErr.Error()), nil
+		}
+		cmd.Env = env
+	}
 
 	start := time.Now()
 	output, err := cmd.CombinedOutput()
@@ -129,6 +172,10 @@ func detectTestFramework(dir string) string {
 }
 
 func detectTestFrameworkBounded(dir string, depth int) string {
+	return detectTestFrameworkWithin(dir, "", depth)
+}
+
+func detectTestFrameworkWithin(dir, stopDir string, depth int) string {
 	if depth <= 0 {
 		return ""
 	}
@@ -153,8 +200,8 @@ func detectTestFrameworkBounded(dir string, depth int) string {
 	}
 
 	parent := filepath.Dir(dir)
-	if parent != dir {
-		return detectTestFrameworkBounded(parent, depth-1)
+	if parent != dir && (stopDir == "" || filepath.Clean(dir) != filepath.Clean(stopDir)) {
+		return detectTestFrameworkWithin(parent, stopDir, depth-1)
 	}
 
 	return ""

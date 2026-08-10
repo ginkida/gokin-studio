@@ -18,6 +18,11 @@ func TestSupportsKimiThinking(t *testing.T) {
 		{"Kimi-for-Coding", true},  // case-insensitive
 		{"kimi-k2.6", true},        // future K2.x variant
 		{"kimi-k2-thinking", true}, // future K2 variant
+		{"k3", true},
+		{"k4", true}, // account-advertised future K family
+		{"k4-256k", true},
+		{"kimi-k4.1", true},
+		{"kappa", false},
 		{"glm-5.1", false},
 		{"glm-4.7", false},
 		{"llama3.2", false},
@@ -317,7 +322,7 @@ func newGLMTestConfig() *config.Config {
 			GLMKey: "glm-test-key-for-unit-test-12345",
 		},
 		Model: config.ModelConfig{
-			Name:            "glm-5.2",
+			Name:            "glm-5.1",
 			MaxOutputTokens: 8192,
 		},
 	}
@@ -328,12 +333,11 @@ func newGLMTestConfig() *config.Config {
 // reasoning behavior for most users — keep the cases explicit.
 func TestSupportsGLMThinking(t *testing.T) {
 	cases := map[string]bool{
-		"glm-5.2":         true,
 		"glm-5.1":         true,
 		"glm-5":           true,
 		"glm-5-turbo":     true,
 		"glm-4.7":         true,
-		"GLM-5.2":         true, // case-insensitive
+		"GLM-5.1":         true, // case-insensitive
 		"glm-4.5":         false,
 		"glm-4-plus":      false,
 		"kimi-for-coding": false,
@@ -347,11 +351,11 @@ func TestSupportsGLMThinking(t *testing.T) {
 }
 
 // TestNewGLMClient_AutoEnablesThinking confirms the factory flips thinking on
-// for glm-5.2 when the user hasn't configured it. GLM is the default provider,
+// for glm-5.1 when the user hasn't configured it. GLM is the default provider,
 // so this is the most-exercised auto-enable path.
 func TestNewGLMClient_AutoEnablesThinking(t *testing.T) {
 	cfg := newGLMTestConfig()
-	c, err := newGLMClient(cfg, "glm-5.2")
+	c, err := newGLMClient(cfg, "glm-5.1")
 	if err != nil {
 		t.Fatalf("newGLMClient: %v", err)
 	}
@@ -360,7 +364,7 @@ func TestNewGLMClient_AutoEnablesThinking(t *testing.T) {
 		t.Fatalf("expected *AnthropicClient, got %T", c)
 	}
 	if !ac.config.EnableThinking {
-		t.Error("EnableThinking should auto-flip to true for glm-5.2 when user hasn't configured it")
+		t.Error("EnableThinking should auto-flip to true for glm-5.1 when user hasn't configured it")
 	}
 	if ac.config.ThinkingBudget != defaultGLMThinkingBudget {
 		t.Errorf("ThinkingBudget = %d, want %d (auto-default)", ac.config.ThinkingBudget, defaultGLMThinkingBudget)
@@ -375,7 +379,7 @@ func TestNewGLMClient_RespectsExplicitDisable(t *testing.T) {
 	cfg := newGLMTestConfig()
 	cfg.Model.EnableThinking = false
 	cfg.Model.ThinkingBudget = ThinkingDisabledSentinel
-	c, err := newGLMClient(cfg, "glm-5.2")
+	c, err := newGLMClient(cfg, "glm-5.1")
 	if err != nil {
 		t.Fatalf("newGLMClient: %v", err)
 	}
@@ -424,7 +428,7 @@ func TestNewGLMClient_ExplicitEnableUsesUserBudget(t *testing.T) {
 	cfg := newGLMTestConfig()
 	cfg.Model.EnableThinking = true
 	cfg.Model.ThinkingBudget = 16384
-	c, err := newGLMClient(cfg, "glm-5.2")
+	c, err := newGLMClient(cfg, "glm-5.1")
 	if err != nil {
 		t.Fatalf("newGLMClient: %v", err)
 	}
@@ -437,13 +441,12 @@ func TestNewGLMClient_ExplicitEnableUsesUserBudget(t *testing.T) {
 	}
 }
 
-// TestDefaultThinkingBudget pins the application-layer explicit-enable default:
-// GLM gets its 8192 canon (so auto→enabled doesn't halve the budget), every
-// other provider gets 4096.
+// TestDefaultThinkingBudget pins the application-layer explicit-enable default.
+// GLM and Kimi both use 8192; for K3 that maps to recommended high effort.
 func TestDefaultThinkingBudget(t *testing.T) {
 	cases := map[string]int32{
-		"glm":      defaultGLMThinkingBudget, // 8192
-		"kimi":     4096,
+		"glm":      defaultGLMThinkingBudget,  // 8192
+		"kimi":     defaultKimiThinkingBudget, // 8192
 		"deepseek": 4096,
 		"minimax":  4096,
 		"ollama":   4096,
@@ -453,5 +456,20 @@ func TestDefaultThinkingBudget(t *testing.T) {
 		if got := DefaultThinkingBudget(provider); got != want {
 			t.Errorf("DefaultThinkingBudget(%q) = %d, want %d", provider, got, want)
 		}
+	}
+}
+
+func TestDefaultThinkingBudgetForCurrentFlagships(t *testing.T) {
+	if got := DefaultThinkingBudgetForModel("glm", "glm-5.2"); got != 32768 {
+		t.Errorf("GLM-5.2 default effort budget = %d, want 32768 (max)", got)
+	}
+	if got := DefaultThinkingBudgetForModel("glm", "glm-5.1"); got != 8192 {
+		t.Errorf("GLM-5.1 default budget = %d, want 8192", got)
+	}
+	if got := DefaultThinkingBudgetForModel("glm", "glm-5.3"); got != 32768 {
+		t.Errorf("future GLM native-effort default = %d, want 32768 (max)", got)
+	}
+	if got := DefaultThinkingBudgetForModel("kimi", "k3"); got != 8192 {
+		t.Errorf("Kimi K3 default effort budget = %d, want 8192 (high)", got)
 	}
 }

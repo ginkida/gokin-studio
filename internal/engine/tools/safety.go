@@ -218,6 +218,44 @@ func (v *DefaultSafetyValidator) initMetadata() {
 		AllowRetry:           true,
 	}
 
+	// Scheduled routines persist prompts and may start future agent runs. The
+	// studio permission policy makes list read-only and hard-gates every
+	// mutation with an exact-action confirmation.
+	v.metadata["scheduled_task"] = &ToolMetadata{
+		Name:                 "scheduled_task",
+		SafetyLevel:          SafetyLevelCaution,
+		Category:             "automation",
+		RiskFactors:          []string{"persistent-automation", "future-execution"},
+		Impact:               "Lists or explicitly manages project-scoped local routines",
+		Example:              `scheduled_task(action="list")`,
+		MaxExecTime:          10 * time.Second,
+		RequiresConfirmation: true,
+		AllowRetry:           false,
+	}
+
+	v.metadata["session_agent"] = &ToolMetadata{
+		Name:                 "session_agent",
+		SafetyLevel:          SafetyLevelCaution,
+		Category:             "coordination",
+		RiskFactors:          []string{"cross-session-context", "provider-usage", "session-catalog-change"},
+		Impact:               "Reads bounded local session context, coordinates with another Studio session, or archives it after approval",
+		Example:              `session_agent(action="list")`,
+		MaxExecTime:          10 * time.Second,
+		RequiresConfirmation: true,
+		AllowRetry:           false,
+	}
+	v.metadata["search_session_transcripts"] = &ToolMetadata{
+		Name:                 "search_session_transcripts",
+		SafetyLevel:          SafetyLevelSafe,
+		Category:             "coordination",
+		RiskFactors:          []string{"bounded-cross-session-context"},
+		Impact:               "Reads bounded visible excerpts from other local Studio transcripts",
+		Example:              `search_session_transcripts(query="invoice schema")`,
+		MaxExecTime:          10 * time.Second,
+		RequiresConfirmation: false,
+		AllowRetry:           true,
+	}
+
 	// Git tools - caution
 	for _, tool := range []string{"git_log", "git_diff", "git_blame"} {
 		v.metadata[tool] = &ToolMetadata{

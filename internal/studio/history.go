@@ -2,14 +2,24 @@ package studio
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"google.golang.org/genai"
+)
+
+const (
+	MaxHistoryFileBytes  = 32 << 20
+	MaxHistoryEntries    = 50_000
+	MaxHistoryMediaBytes = 256 << 20
 )
 
 // historyDir returns the directory for storing chat history files.
@@ -26,10 +36,10 @@ func historyDir() string {
 // first). The atomic write (atomicWriteFile) keeps any single file valid, but
 // only this lock makes the load+write a single critical section.
 //
-// It is a LEAF lock: held only across the load + marshal + atomic write of one
-// file, never while holding session.mu / p.mu / s.mu, so it cannot take part
-// in a lock-order cycle even when a caller (e.g. RemoveProject) holds s.mu
-// across DeleteHistory.
+// Lock order is session.mu -> history-file lock. History helpers never acquire
+// session/project/studio locks themselves, so snapshot+disk commits may safely
+// remain linearizable with session rename/edit while holding session.mu. Code
+// must never acquire session.mu after taking a history-file lock.
 var (
 	historyFileLocksMu sync.Mutex
 	historyFileLocks   = map[string]*sync.Mutex{}
@@ -97,7 +107,7 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 
 // historyPath returns the file path for a project's chat history.
 func historyPath(projectID string) string {
-	return filepath.Join(historyDir(), projectID+".json")
+	return filepath.Join(historyDir(), safeStorageKey(projectID)+".json")
 }
 
 // quarantineCorruptHistory renames an unreadable history file aside (to a
@@ -120,8 +130,22 @@ func quarantineCorruptHistory(projectID string) string {
 
 // HistoryEntry is a JSON-serializable representation of a single chat turn.
 type HistoryEntry struct {
-	Role string `json:"role"`
-	Text string `json:"text,omitempty"`
+	Role        string                       `json:"role"`
+	Text        string                       `json:"text,omitempty"`
+	Attachments []PersistedHistoryAttachment `json:"attachments,omitempty"`
+}
+
+// PersistedHistoryAttachment references a content-addressed binary stored
+// beside the session JSON. This keeps media out of the JSON document while
+// preserving it across restarts and session forks.
+type PersistedHistoryAttachment struct {
+	Name     string `json:"name,omitempty"`
+	MIMEType string `json:"mimeType"`
+	Blob     string `json:"blob,omitempty"`
+	Size     int    `json:"size"`
+	// Data is used only by portable session/project exports. On-disk history
+	// always stores Blob references so JSON remains small.
+	Data string `json:"data,omitempty"`
 }
 
 // SessionUsage is per-session aggregated billing data: total cost +
@@ -163,7 +187,7 @@ type historyFile struct {
 // without session name — preserves any previously saved name).
 func SaveHistory(projectID string, history []*genai.Content) error {
 	prevName := ""
-	if data, err := os.ReadFile(historyPath(projectID)); err == nil {
+	if data, err := readRegularFileLimited(historyPath(projectID), MaxHistoryFileBytes); err == nil {
 		var hf historyFile
 		if json.Unmarshal(data, &hf) == nil {
 			prevName = hf.Name
@@ -199,6 +223,21 @@ func SaveHistoryWithMetadata(projectID, name, parentSessionID string, history []
 	return saveHistoryFull(projectID, name, parentSessionID, prevUsage, history)
 }
 
+// SaveNewHistoryWithMetadata is the create-only variant used before a new
+// session is published. Refusing to replace an existing file prevents a rare
+// generated-ID collision from overwriting another conversation.
+func SaveNewHistoryWithMetadata(projectID, name, parentSessionID string, history []*genai.Content) error {
+	path := historyPath(projectID)
+	unlock := lockHistoryFile(path)
+	defer unlock()
+	if _, err := os.Lstat(path); err == nil {
+		return fmt.Errorf("history already exists")
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	return saveHistoryFull(projectID, name, parentSessionID, nil, history)
+}
+
 // SaveHistoryWithUsage is the explicit-everything variant. Used by the
 // agent loop after each chat:complete to bump the running usage totals.
 // Caller provides parent (preserves lineage) AND usage (the new totals).
@@ -208,10 +247,45 @@ func SaveHistoryWithUsage(projectID, name, parentSessionID string, usage *Sessio
 	return saveHistoryFull(projectID, name, parentSessionID, usage, history)
 }
 
+// RenameHistory changes only the display-name metadata of an existing history
+// file. Unlike SaveHistoryWithName it never reconstructs entries from a caller
+// snapshot, so a rename racing a completed agent save cannot truncate newer
+// turns or discard usage/lineage metadata. fallback is used only for a legacy
+// in-memory session whose file does not exist yet.
+func RenameHistory(projectID, name, parentSessionID string, usage *SessionUsage, fallback []*genai.Content) error {
+	path := historyPath(projectID)
+	unlock := lockHistoryFile(path)
+	defer unlock()
+	data, err := readRegularFileLimited(path, MaxHistoryFileBytes)
+	if os.IsNotExist(err) {
+		return saveHistoryFull(projectID, name, parentSessionID, usage, fallback)
+	}
+	if err != nil {
+		return err
+	}
+	var hf historyFile
+	if err := json.Unmarshal(data, &hf); err != nil {
+		// Pre-v2 histories were a bare entry array. Preserve every entry while
+		// upgrading the envelope and adding the requested name.
+		var legacy []HistoryEntry
+		if legacyErr := json.Unmarshal(data, &legacy); legacyErr != nil {
+			return fmt.Errorf("decode history for rename: %w", err)
+		}
+		hf = historyFile{Version: 2, Entries: legacy}
+	}
+	if len(hf.Entries) > 0 {
+		hf.Version = 3
+	} else {
+		hf.Version = 2
+	}
+	hf.Name = name
+	return writeHistoryFile(projectID, hf)
+}
+
 // loadPrevMetadata reads the previously-saved parent + usage so the
 // public Save* helpers can preserve them across writes.
 func loadPrevMetadata(projectID string) (string, *SessionUsage) {
-	data, err := os.ReadFile(historyPath(projectID))
+	data, err := readRegularFileLimited(historyPath(projectID), MaxHistoryFileBytes)
 	if err != nil {
 		return "", nil
 	}
@@ -222,11 +296,30 @@ func loadPrevMetadata(projectID string) (string, *SessionUsage) {
 	return hf.ParentSessionID, hf.Usage
 }
 
+// appendUnpersistableAttachmentNote records, inside the message text, that one
+// inline blob could not be stored. Keeping a visible marker is better than
+// silently dropping media the user can see in the live transcript but would
+// not find after a restart.
+func appendUnpersistableAttachmentNote(text, mimeType string) string {
+	kind := strings.TrimSpace(mimeType)
+	if kind == "" {
+		kind = "unknown type"
+	}
+	note := "[attachment omitted from saved history: " + kind + "]"
+	if strings.TrimSpace(text) == "" {
+		return note
+	}
+	return text + "\n\n" + note
+}
+
 // saveHistoryFull is the canonical writer that all public Save* helpers
 // delegate to. Keeps the entry-extraction + atomic-write logic in one place.
 func saveHistoryFull(projectID, name, parentSessionID string, usage *SessionUsage, history []*genai.Content) error {
 	if len(history) == 0 && name == "" && parentSessionID == "" && usage == nil {
 		return nil
+	}
+	if len(history) > MaxHistoryEntries {
+		return fmt.Errorf("history has too many entries (%d, maximum %d)", len(history), MaxHistoryEntries)
 	}
 
 	if err := os.MkdirAll(historyDir(), 0o700); err != nil {
@@ -234,8 +327,11 @@ func saveHistoryFull(projectID, name, parentSessionID string, usage *SessionUsag
 	}
 
 	entries := make([]HistoryEntry, 0, len(history))
+	referencedBlobs := make(map[string]struct{})
+	mediaBytes := 0
 	for _, c := range history {
 		text := ""
+		var attachments []PersistedHistoryAttachment
 		for _, p := range c.Parts {
 			// Thinking (reasoning) parts carry Text but should NOT bleed into
 			// the persisted assistant message — they're reconstructed at
@@ -246,27 +342,68 @@ func saveHistoryFull(projectID, name, parentSessionID string, usage *SessionUsag
 			if p.Text != "" {
 				text += p.Text
 			}
+			if p.InlineData != nil && len(p.InlineData.Data) > 0 {
+				mediaBytes += len(p.InlineData.Data)
+				if mediaBytes > MaxHistoryMediaBytes {
+					return fmt.Errorf("history media exceeds the %d MiB limit", MaxHistoryMediaBytes>>20)
+				}
+				ref, err := persistHistoryAttachment(projectID, p.InlineData)
+				if err != nil {
+					// Never fail the whole transcript over one blob. Tool
+					// output reaches history too — `read` on an .svg/.bmp/.ico
+					// /.tiff yields a MIME the composer allowlist rejects — and
+					// aborting here froze the session's on-disk history
+					// permanently: the offending part stays in memory, so every
+					// later save failed too and the conversation was lost on
+					// restart. Drop the blob, keep the conversation.
+					text = appendUnpersistableAttachmentNote(text, p.InlineData.MIMEType)
+					continue
+				}
+				attachments = append(attachments, ref)
+				referencedBlobs[ref.Blob] = struct{}{}
+			}
 		}
 		// Skip entries with function calls/responses (internal to agent loop).
-		if text == "" {
+		if text == "" && len(attachments) == 0 {
 			continue
 		}
 		entries = append(entries, HistoryEntry{
-			Role: c.Role,
-			Text: text,
+			Role:        c.Role,
+			Text:        text,
+			Attachments: attachments,
 		})
+		if len(entries) > MaxHistoryEntries {
+			return fmt.Errorf("history has too many entries (%d, maximum %d)", len(entries), MaxHistoryEntries)
+		}
 	}
 
 	hf := historyFile{
-		Version:         2,
+		Version:         3,
 		Name:            name,
 		ParentSessionID: parentSessionID,
 		Usage:           usage,
 		Entries:         entries,
 	}
+	if err := writeHistoryFile(projectID, hf); err != nil {
+		return err
+	}
+	cleanupUnreferencedHistoryAttachments(projectID, referencedBlobs)
+	return nil
+}
+
+func writeHistoryFile(projectID string, hf historyFile) error {
+	if len(hf.Entries) > MaxHistoryEntries {
+		return fmt.Errorf("history has too many entries (%d, maximum %d)", len(hf.Entries), MaxHistoryEntries)
+	}
+	if err := os.MkdirAll(historyDir(), 0o700); err != nil {
+		return err
+	}
 	data, err := json.MarshalIndent(hf, "", "  ")
 	if err != nil {
 		return err
+	}
+	if len(data) > MaxHistoryFileBytes {
+		return fmt.Errorf("history is too large (%d bytes, maximum %d)", len(data), MaxHistoryFileBytes)
 	}
 	return atomicWriteFile(historyPath(projectID), data, 0o600)
 }
@@ -279,10 +416,22 @@ func LoadHistory(projectID string) ([]*genai.Content, error) {
 	}
 	history := make([]*genai.Content, 0, len(entries))
 	for _, e := range entries {
-		history = append(history, &genai.Content{
-			Role:  e.Role,
-			Parts: []*genai.Part{genai.NewPartFromText(e.Text)},
-		})
+		parts := make([]*genai.Part, 0, 1+len(e.Attachments))
+		if e.Text != "" {
+			parts = append(parts, genai.NewPartFromText(e.Text))
+		}
+		for _, attachment := range e.Attachments {
+			blob, err := loadHistoryAttachment(projectID, attachment)
+			if err != nil {
+				// A missing/corrupt media blob must not make the textual
+				// conversation unusable. Skip only that attachment.
+				continue
+			}
+			parts = append(parts, &genai.Part{InlineData: blob})
+		}
+		if len(parts) > 0 {
+			history = append(history, &genai.Content{Role: e.Role, Parts: parts})
+		}
 	}
 	return history, nil
 }
@@ -312,7 +461,7 @@ func LoadHistoryUsage(projectID string) *SessionUsage {
 // stats (any of which may be empty/nil). Supports both legacy (bare
 // array) and versioned (object) file formats.
 func loadHistoryRaw(projectID string) ([]HistoryEntry, string, string, *SessionUsage, error) {
-	data, err := os.ReadFile(historyPath(projectID))
+	data, err := readRegularFileLimited(historyPath(projectID), MaxHistoryFileBytes)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, "", "", nil, nil
@@ -323,11 +472,17 @@ func loadHistoryRaw(projectID string) ([]HistoryEntry, string, string, *SessionU
 	if len(trimmed) == 0 {
 		return nil, "", "", nil, nil
 	}
+	if !utf8.Valid(trimmed) {
+		return nil, "", "", nil, fmt.Errorf("corrupt history file: invalid UTF-8")
+	}
 	// Legacy format — bare array.
 	if trimmed[0] == '[' {
 		var entries []HistoryEntry
 		if err := json.Unmarshal(data, &entries); err != nil {
 			return nil, "", "", nil, fmt.Errorf("corrupt history file: %w", err)
+		}
+		if err := validateHistoryEntries(entries); err != nil {
+			return nil, "", "", nil, err
 		}
 		return entries, "", "", nil, nil
 	}
@@ -336,16 +491,189 @@ func loadHistoryRaw(projectID string) ([]HistoryEntry, string, string, *SessionU
 	if err := json.Unmarshal(data, &hf); err != nil {
 		return nil, "", "", nil, fmt.Errorf("corrupt history file: %w", err)
 	}
+	if err := validateHistoryEntries(hf.Entries); err != nil {
+		return nil, "", "", nil, err
+	}
+	if hf.Usage != nil && (hf.Usage.TotalCostUSD < 0 || hf.Usage.TotalInputTokens < 0 ||
+		hf.Usage.TotalOutputTokens < 0 || hf.Usage.TotalCacheTokens < 0 ||
+		hf.Usage.TurnCount < 0 || hf.Usage.LastTurnAt < 0) {
+		return nil, "", "", nil, fmt.Errorf("corrupt history file: invalid negative usage metadata")
+	}
 	return hf.Entries, hf.Name, hf.ParentSessionID, hf.Usage, nil
+}
+
+func validateHistoryEntries(entries []HistoryEntry) error {
+	if len(entries) > MaxHistoryEntries {
+		return fmt.Errorf("history has too many entries (%d, maximum %d)", len(entries), MaxHistoryEntries)
+	}
+	for i := range entries {
+		switch entries[i].Role {
+		case "user", "model":
+		case "assistant":
+			// Accept common external/legacy spelling but normalize to the role
+			// expected by provider APIs before the history reaches a model.
+			entries[i].Role = "model"
+		default:
+			return fmt.Errorf("corrupt history file: invalid role %q at entry %d", entries[i].Role, i)
+		}
+		if entries[i].Text == "" && len(entries[i].Attachments) == 0 {
+			return fmt.Errorf("corrupt history file: empty entry at index %d", i)
+		}
+		for j, attachment := range entries[i].Attachments {
+			if attachment.Data != "" {
+				return fmt.Errorf("corrupt history file: inline attachment data at entry %d attachment %d", i, j)
+			}
+			mimeType := normalizeAttachmentMIME(attachment.MIMEType)
+			imageExt, isImage := supportedImageMIMEs[mimeType]
+			documentExt, isDocument := supportedDocumentMIMEs[mimeType]
+			if !isImage && !isDocument {
+				return fmt.Errorf("corrupt history file: unsupported attachment type at entry %d attachment %d", i, j)
+			}
+			if attachment.Size <= 0 || attachment.Size > MessageAttachmentMaxBytes {
+				return fmt.Errorf("corrupt history file: invalid attachment size at entry %d attachment %d", i, j)
+			}
+			if isImage && attachment.Size > MessageImageAttachmentMaxBytes {
+				return fmt.Errorf("corrupt history file: invalid image attachment size at entry %d attachment %d", i, j)
+			}
+			if attachment.Name != "" {
+				if _, err := validateAttachmentName(attachment.Name, j, imageExt, documentExt); err != nil {
+					return fmt.Errorf("corrupt history file: invalid attachment name at entry %d attachment %d", i, j)
+				}
+			}
+			if len(attachment.Blob) != sha256.Size*2 {
+				return fmt.Errorf("corrupt history file: invalid attachment reference at entry %d attachment %d", i, j)
+			}
+			if _, err := hex.DecodeString(attachment.Blob); err != nil {
+				return fmt.Errorf("corrupt history file: invalid attachment reference at entry %d attachment %d", i, j)
+			}
+		}
+	}
+	return nil
 }
 
 // DeleteHistory removes a project's history file. Takes the per-file lock so a
 // delete can't interleave with an in-flight save of the same file (which would
 // otherwise leave the just-deleted file recreated).
 func DeleteHistory(projectID string) {
+	_ = deleteHistoryChecked(projectID)
+}
+
+// deleteHistoryChecked is the durable variant used by user-facing destructive
+// operations. Cleanup/migration callers may keep using the best-effort wrapper.
+func deleteHistoryChecked(projectID string) error {
 	unlock := lockHistoryFile(historyPath(projectID))
 	defer unlock()
-	_ = os.Remove(historyPath(projectID))
+	if err := os.Remove(historyPath(projectID)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.RemoveAll(historyMediaDir(projectID)); err != nil {
+		return err
+	}
+	return nil
+}
+
+func historyMediaDir(projectID string) string {
+	return historyPath(projectID) + ".media"
+}
+
+func persistHistoryAttachment(projectID string, blob *genai.Blob) (PersistedHistoryAttachment, error) {
+	if blob == nil || len(blob.Data) == 0 || len(blob.Data) > MessageAttachmentMaxBytes {
+		return PersistedHistoryAttachment{}, fmt.Errorf("invalid attachment size")
+	}
+	mimeType := normalizeAttachmentMIME(blob.MIMEType)
+	imageExt, isImage := supportedImageMIMEs[mimeType]
+	documentExt, isDocument := supportedDocumentMIMEs[mimeType]
+	if !isImage && !isDocument {
+		return PersistedHistoryAttachment{}, fmt.Errorf("unsupported attachment type %q", blob.MIMEType)
+	}
+	if isImage && len(blob.Data) > MessageImageAttachmentMaxBytes {
+		return PersistedHistoryAttachment{}, fmt.Errorf("invalid image attachment size")
+	}
+	name, err := validateAttachmentName(blob.DisplayName, 0, imageExt, documentExt)
+	if err != nil {
+		return PersistedHistoryAttachment{}, err
+	}
+	sum := sha256.Sum256(blob.Data)
+	id := hex.EncodeToString(sum[:])
+	dir := historyMediaDir(projectID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return PersistedHistoryAttachment{}, err
+	}
+	if info, err := os.Lstat(dir); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return PersistedHistoryAttachment{}, fmt.Errorf("history media path is not a regular directory")
+	}
+	path := filepath.Join(dir, id)
+	if info, err := os.Lstat(path); err == nil {
+		if !info.Mode().IsRegular() || info.Size() != int64(len(blob.Data)) {
+			return PersistedHistoryAttachment{}, fmt.Errorf("attachment blob path is not a matching regular file")
+		}
+	} else if os.IsNotExist(err) {
+		if err := atomicWriteFile(path, blob.Data, 0o600); err != nil {
+			return PersistedHistoryAttachment{}, err
+		}
+	} else {
+		return PersistedHistoryAttachment{}, err
+	}
+	return PersistedHistoryAttachment{Name: name, MIMEType: mimeType, Blob: id, Size: len(blob.Data)}, nil
+}
+
+func loadHistoryAttachment(projectID string, ref PersistedHistoryAttachment) (*genai.Blob, error) {
+	if ref.Size <= 0 || ref.Size > MessageAttachmentMaxBytes || len(ref.Blob) != sha256.Size*2 {
+		return nil, fmt.Errorf("invalid attachment reference")
+	}
+	mimeType := normalizeAttachmentMIME(ref.MIMEType)
+	imageExt, isImage := supportedImageMIMEs[mimeType]
+	documentExt, isDocument := supportedDocumentMIMEs[mimeType]
+	if !isImage && !isDocument {
+		return nil, fmt.Errorf("invalid attachment type")
+	}
+	if isImage && ref.Size > MessageImageAttachmentMaxBytes {
+		return nil, fmt.Errorf("invalid image attachment size")
+	}
+	name := ""
+	if ref.Name != "" {
+		var err error
+		name, err = validateAttachmentName(ref.Name, 0, imageExt, documentExt)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if _, err := hex.DecodeString(ref.Blob); err != nil {
+		return nil, fmt.Errorf("invalid attachment reference")
+	}
+	path := filepath.Join(historyMediaDir(projectID), ref.Blob)
+	data, err := readRegularFileLimited(path, MessageAttachmentMaxBytes)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) != ref.Size {
+		return nil, fmt.Errorf("attachment size mismatch")
+	}
+	sum := sha256.Sum256(data)
+	if hex.EncodeToString(sum[:]) != ref.Blob {
+		return nil, fmt.Errorf("attachment digest mismatch")
+	}
+	return &genai.Blob{MIMEType: mimeType, DisplayName: name, Data: data}, nil
+}
+
+func cleanupUnreferencedHistoryAttachments(projectID string, referenced map[string]struct{}) {
+	dir := historyMediaDir(projectID)
+	if info, err := os.Lstat(dir); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		if _, ok := referenced[entry.Name()]; ok {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, entry.Name()))
+	}
 }
 
 // ListHistoryFilesForProject returns session IDs that have persisted history for a project.
@@ -356,10 +684,13 @@ func ListHistoryFilesForProject(projectID string) []string {
 		return nil
 	}
 
-	prefix := projectID + "_"
+	prefix := safeStorageKey(projectID) + "_"
 	suffix := ".json"
 	var sessionIDs []string
 	for _, e := range entries {
+		if !e.Type().IsRegular() {
+			continue
+		}
 		name := e.Name()
 		if len(name) < len(prefix)+len(suffix) {
 			continue

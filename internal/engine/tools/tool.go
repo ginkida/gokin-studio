@@ -115,27 +115,27 @@ func (r ToolResult) ToMap() map[string]any {
 	if r.Success {
 		result["success"] = true
 		if r.Content != "" {
-			result["content"] = truncateToolResultContent(r.Content, "(grep with pattern, head/tail)")
+			result["content"] = TruncateToolResultContent(r.Content, "(grep with pattern, head/tail)")
 		}
 		if r.Data != nil {
 			result["data"] = r.Data
 		}
 	} else {
 		result["success"] = false
-		result["error"] = truncateToolResultContent(r.Error, "")
+		result["error"] = TruncateToolResultContent(r.Error, "")
 		if r.Content != "" {
-			result["content"] = truncateToolResultContent(r.Content, "")
+			result["content"] = TruncateToolResultContent(r.Content, "")
 		}
 	}
 
 	return result
 }
 
-// truncateToolResultContent caps content at DefaultToolResultMaxChars runes.
+// TruncateToolResultContent caps content at DefaultToolResultMaxChars runes.
 // Rune-aware: multibyte characters (CJK, Cyrillic, emoji) are never split at
 // the boundary, avoiding invalid UTF-8 in API payloads. hint is appended to
 // the truncation notice when non-empty (e.g. "(grep with pattern, head/tail)").
-func truncateToolResultContent(content, hint string) string {
+func TruncateToolResultContent(content, hint string) string {
 	maxChars := config.DefaultToolResultMaxChars
 	runes := []rune(content)
 	if len(runes) <= maxChars {
@@ -151,6 +151,11 @@ func truncateToolResultContent(content, hint string) string {
 		suffix += " Use more specific queries to see full content."
 	}
 	return string(runes[:maxChars]) + suffix
+}
+
+// Retain the package-private spelling for existing internal callers/tests.
+func truncateToolResultContent(content, hint string) string {
+	return TruncateToolResultContent(content, hint)
 }
 
 // ValidationError represents a tool argument validation error.

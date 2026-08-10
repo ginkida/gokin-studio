@@ -17,7 +17,10 @@ export interface ProjectInfo {
   thinkingBudget?: number
   thinkingActive?: boolean          // backend-resolved: is Extended Thinking effectively on?
   thinkingBudgetEffective?: number  // backend-resolved budget (0 when off)
-  permissionMode?: string  // "" | "auto" | "ask"
+  permissionMode?: string  // "auto" | "accept_edits" | "manual" | "skip" (legacy ""/"ask" may load)
+  computerUseEnabled?: boolean
+  computerAllowedApps?: string[]
+  computerBlockedApps?: string[]
   budgetUSD?: number
   enforceBudget?: boolean
   pinned?: boolean

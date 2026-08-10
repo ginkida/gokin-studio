@@ -10,8 +10,7 @@ import (
 )
 
 // TestGetProviders_ReturnsExpectedProviders verifies that GetProviders returns
-// a non-empty list with the four expected providers and at least one model
-// each. This is what the frontend uses to populate the provider selector.
+// exactly the GLM/Kimi product contract with at least one model each.
 func TestGetProviders_ReturnsExpectedProviders(t *testing.T) {
 	s := NewStudio()
 	providers := s.GetProviders()
@@ -20,7 +19,10 @@ func TestGetProviders_ReturnsExpectedProviders(t *testing.T) {
 		t.Fatal("GetProviders returned empty list")
 	}
 
-	want := map[string]bool{"glm": false, "minimax": false, "kimi": false, "ollama": false}
+	if len(providers) != 2 {
+		t.Fatalf("GetProviders returned %d providers, want exactly 2", len(providers))
+	}
+	want := map[string]bool{"glm": false, "kimi": false}
 	for _, p := range providers {
 		if p.ID == "" {
 			t.Errorf("provider with empty ID in list")
@@ -39,22 +41,28 @@ func TestGetProviders_ReturnsExpectedProviders(t *testing.T) {
 		}
 	}
 
-	// Kimi must expose exactly one model (kimi-for-coding).
+	// Kimi exposes both stable K2.7 tiers and the current K3 tiers.
 	for _, p := range providers {
 		if p.ID == "kimi" {
-			if len(p.Models) != 1 || p.Models[0] != "kimi-for-coding" {
-				t.Errorf("kimi provider models = %v, want [kimi-for-coding]", p.Models)
+			wantModels := []string{"k3", "k3-256k", "kimi-for-coding", "kimi-for-coding-highspeed"}
+			if len(p.Models) != len(wantModels) {
+				t.Fatalf("kimi provider models = %v, want %v", p.Models, wantModels)
+			}
+			for i := range wantModels {
+				if p.Models[i] != wantModels[i] {
+					t.Errorf("kimi provider models = %v, want %v", p.Models, wantModels)
+					break
+				}
 			}
 		}
 	}
 }
 
-// TestToolSetsForProvider verifies that Ollama gets a minimal tool set (no
-// web/planning tools) while cloud providers get the full suite including web
-// and planning tools.
+// TestToolSetsForProvider verifies the GLM/Kimi-only desktop surface stays
+// identical for both supported providers and retains the full agent toolset.
 func TestToolSetsForProvider(t *testing.T) {
-	ollamaSets := toolSetsForProvider("ollama")
-	cloudSets := toolSetsForProvider("glm")
+	glmSets := toolSetsForProvider("glm")
+	kimiSets := toolSetsForProvider("kimi")
 
 	containsSet := func(sets []tools.ToolSet, target tools.ToolSet) bool {
 		for _, s := range sets {
@@ -65,30 +73,23 @@ func TestToolSetsForProvider(t *testing.T) {
 		return false
 	}
 
-	// Ollama must include ollama_core and git.
-	if !containsSet(ollamaSets, tools.ToolSetOllamaCore) {
-		t.Error("ollama tool sets missing ToolSetOllamaCore")
+	if len(glmSets) != len(kimiSets) {
+		t.Fatalf("GLM/Kimi toolset lengths differ: %v vs %v", glmSets, kimiSets)
 	}
-	if !containsSet(ollamaSets, tools.ToolSetGit) {
-		t.Error("ollama tool sets missing ToolSetGit")
-	}
-	// Ollama must NOT include web or planning tools (too heavy for local models).
-	if containsSet(ollamaSets, tools.ToolSetWeb) {
-		t.Error("ollama tool sets unexpectedly includes ToolSetWeb")
-	}
-	if containsSet(ollamaSets, tools.ToolSetPlanning) {
-		t.Error("ollama tool sets unexpectedly includes ToolSetPlanning")
-	}
-
-	// Cloud providers must include core, git, web, and planning.
-	for _, required := range []tools.ToolSet{tools.ToolSetCore, tools.ToolSetGit, tools.ToolSetWeb, tools.ToolSetPlanning} {
-		if !containsSet(cloudSets, required) {
-			t.Errorf("cloud tool sets missing %q", required)
+	for i := range glmSets {
+		if glmSets[i] != kimiSets[i] {
+			t.Fatalf("GLM/Kimi toolsets differ: %v vs %v", glmSets, kimiSets)
 		}
 	}
-	// Cloud must NOT include the Ollama-specific set.
-	if containsSet(cloudSets, tools.ToolSetOllamaCore) {
-		t.Error("cloud tool sets unexpectedly includes ToolSetOllamaCore")
+
+	// Both supported providers receive core, git, web, and planning.
+	for _, required := range []tools.ToolSet{tools.ToolSetCore, tools.ToolSetGit, tools.ToolSetWeb, tools.ToolSetPlanning} {
+		if !containsSet(glmSets, required) {
+			t.Errorf("GLM/Kimi tool sets missing %q", required)
+		}
+	}
+	if containsSet(glmSets, tools.ToolSetOllamaCore) {
+		t.Error("GLM/Kimi tool sets unexpectedly include legacy Ollama core")
 	}
 }
 

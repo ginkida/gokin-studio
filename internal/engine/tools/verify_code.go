@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ginkida/gokin-studio/internal/engine/security"
 	"google.golang.org/genai"
 )
 
@@ -26,6 +27,10 @@ func NewVerifyCodeTool(workDir string) *VerifyCodeTool {
 }
 
 func (t *VerifyCodeTool) Name() string { return "verify_code" }
+
+func (t *VerifyCodeTool) WorkspaceIsolationStatus() security.WorkspaceIsolationStatus {
+	return security.DetectWorkspaceIsolation()
+}
 
 func (t *VerifyCodeTool) Description() string {
 	return `Automatically verifies code correctness in the project.
@@ -44,6 +49,11 @@ func (t *VerifyCodeTool) Declaration() *genai.FunctionDeclaration {
 					Type:        genai.TypeString,
 					Description: "The directory to verify (defaults to project root)",
 				},
+				"network_access": {
+					Type: genai.TypeBoolean,
+					Description: "Request host network access for dependency resolution. Default false; " +
+						"enabling it always requires a fresh exact-action approval.",
+				},
 			},
 		},
 	}
@@ -52,9 +62,32 @@ func (t *VerifyCodeTool) Declaration() *genai.FunctionDeclaration {
 func (t *VerifyCodeTool) Validate(args map[string]any) error { return nil }
 
 func (t *VerifyCodeTool) Execute(ctx context.Context, args map[string]any) (ToolResult, error) {
+	allowNetwork := GetBoolDefault(args, "network_access", false)
+	projectRoot, err := filepath.Abs(t.workDir)
+	if err != nil {
+		return NewErrorResult("Could not resolve the connected project: " + err.Error()), nil
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(projectRoot); resolveErr == nil {
+		projectRoot = resolved
+	}
+
 	path, _ := GetString(args, "path")
 	if path == "" {
-		path = t.workDir
+		path = projectRoot
+	} else if !filepath.IsAbs(path) {
+		path = filepath.Join(projectRoot, path)
+	}
+	validator := security.NewPathValidator([]string{projectRoot}, true)
+	path, err = validator.Validate(path)
+	if err != nil {
+		return NewErrorResult("verification path must stay inside the connected project: " + err.Error()), nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return NewErrorResult("Could not access verification path: " + err.Error()), nil
+	}
+	if !info.IsDir() {
+		path = filepath.Dir(path)
 	}
 
 	const verifyTimeout = 3 * time.Minute
@@ -95,7 +128,29 @@ func (t *VerifyCodeTool) Execute(ctx context.Context, args map[string]any) (Tool
 		return NewErrorResult(fmt.Sprintf("No verification command found for project type: %s", projectType)), nil
 	}
 
-	cmd.Dir = targetDir
+	isolation := security.DetectWorkspaceIsolation()
+	if isolation.Available {
+		config := security.DefaultSandboxConfig()
+		config.AllowNetwork = allowNetwork
+		isolated, sandboxErr := security.NewSandboxedCommandArgs(
+			verifyCtx,
+			targetDir,
+			cmd.Args[0],
+			cmd.Args[1:],
+			config,
+		)
+		if sandboxErr != nil {
+			return NewErrorResult("Failed to create workspace sandbox for verification: " + sandboxErr.Error()), nil
+		}
+		cmd = isolated.Command()
+	} else {
+		cmd.Dir = targetDir
+		env, envErr := security.WorkspaceSafeEnvironment(targetDir)
+		if envErr != nil {
+			return NewErrorResult("Failed to create isolated verification environment: " + envErr.Error()), nil
+		}
+		cmd.Env = env
+	}
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {

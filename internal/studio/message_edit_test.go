@@ -28,10 +28,10 @@ func TestEditUserMessage_Validation(t *testing.T) {
 		text     string
 		wantErrS string
 	}{
-		{"empty text",       "pid", "default", 0, "",   "cannot be empty"},
-		{"whitespace text",  "pid", "default", 0, "  ", "cannot be empty"},
-		{"negative index",   "pid", "default", -1, "edited", "must be >= 0"},
-		{"unknown project",  "no-such", "default", 0, "edited", "not found"},
+		{"empty text", "pid", "default", 0, "", "cannot be empty"},
+		{"whitespace text", "pid", "default", 0, "  ", "cannot be empty"},
+		{"negative index", "pid", "default", -1, "edited", "must be >= 0"},
+		{"unknown project", "no-such", "default", 0, "edited", "not found"},
 		// Index beyond history: history has 1 user turn so index 5 is not found.
 		{"index out of range", "pid", "default", 5, "edited", "not found in history"},
 	}

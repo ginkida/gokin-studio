@@ -210,3 +210,47 @@ func TestShouldSerializeGroup_DedupesByToolName(t *testing.T) {
 		t.Errorf("stats lookup fired %d times, want 2 (unique tool names)", calls)
 	}
 }
+
+func TestRequiresUserApprovalDistinguishesReadAndMutatingOperations(t *testing.T) {
+	tests := []struct {
+		name string
+		args map[string]any
+		want bool
+	}{
+		{"read", nil, false},
+		{"run_tests", nil, false},
+		{"write", nil, true},
+		{"bash", map[string]any{"command": "pwd"}, true},
+		{"computer_screenshot", map[string]any{}, true},
+		{"computer_action", map[string]any{"action": "click", "x": 1, "y": 2}, true},
+		{"external_browser", map[string]any{"action": "list"}, false},
+		{"external_browser", map[string]any{"action": "inspect"}, true},
+		{"external_browser", map[string]any{"action": "click"}, true},
+		{"mcp_anything", nil, true},
+		{"git_branch", map[string]any{"action": "list"}, false},
+		{"git_branch", map[string]any{"action": "switch"}, true},
+		{"git_pr", map[string]any{"action": "checks"}, false},
+		{"git_pr", map[string]any{"action": "merge"}, true},
+		{"task", map[string]any{"subagent_type": "explore"}, false},
+		{"task", map[string]any{"subagent_type": "general"}, true},
+		{"coordinate", nil, true},
+		{"batch", map[string]any{"dry_run": true}, false},
+		{"batch", map[string]any{"dry_run": false}, true},
+		{"coordinate", map[string]any{"tasks": []any{
+			map[string]any{"agent_type": "explore"}, map[string]any{"agent_type": "plan"},
+		}}, false},
+		{"coordinate", map[string]any{"tasks": []any{
+			map[string]any{"agent_type": "explore"}, map[string]any{"agent_type": "general"},
+		}}, true},
+		{"future_unknown_tool", nil, true},
+		{"web_fetch", nil, false},
+		{"request_tool", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := RequiresUserApproval(tt.name, tt.args); got != tt.want {
+				t.Fatalf("RequiresUserApproval(%q, %#v) = %v, want %v", tt.name, tt.args, got, tt.want)
+			}
+		})
+	}
+}

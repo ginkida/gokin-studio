@@ -2,6 +2,7 @@ package studio
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,36 +22,41 @@ type ProviderHealthInfo struct {
 	LatencyMs   int64  `json:"latencyMs,omitempty"`
 	StatusCode  int    `json:"statusCode,omitempty"`
 	Error       string `json:"error,omitempty"`
-	Endpoint    string `json:"endpoint,omitempty"` // URL we hit, for the user to verify in their head
+	Endpoint    string `json:"endpoint,omitempty"`    // URL we hit, for the user to verify in their head
 	Description string `json:"description,omitempty"` // friendly description (e.g. "API key valid · 12 ms")
+	// AvailableModels contains only IDs from Studio's GLM/Kimi allowlist that
+	// the authenticated /v1/models response actually advertised. An empty list
+	// means discovery was unavailable, not that every model is forbidden.
+	AvailableModels  []string `json:"availableModels,omitempty"`
+	RecommendedModel string   `json:"recommendedModel,omitempty"`
 }
 
 // healthCheckTimeout caps each probe so a hung provider can't block the
 // Settings UI. 5s matches typical "is this server up" expectations and is
 // long enough for trans-continental latency without being annoying.
 const healthCheckTimeout = 5 * time.Second
+const studioModelDiscoveryTTL = 15 * time.Minute
 
 // CheckProviderHealth probes a provider's API to verify connectivity and
-// authentication. The probe varies per provider:
-//   - GLM, MiniMax, Kimi (Anthropic-compatible): GET /v1/models with Bearer
-//     auth. Cheapest authenticated call that doesn't consume tokens.
-//   - Ollama (local): GET /api/tags. No auth.
+// authentication. GLM and Kimi use an authenticated GET /v1/models probe,
+// which does not consume completion tokens.
 //
 // Status code interpretation:
 //   - 2xx → OK (auth + server reachable)
 //   - 401 → "invalid API key" (most useful signal — the user mistyped)
 //   - 403 → "forbidden" (key is valid but lacks permission for this endpoint)
 //   - 404 → "endpoint not found" (treat as reachable — the API key likely works,
-//      just this endpoint isn't implemented; some Anthropic-compatible providers
-//      omit /v1/models)
+//     just this endpoint isn't implemented; some Anthropic-compatible providers
+//     omit /v1/models)
 //   - 4xx other → "client error: <code>"
 //   - 5xx → "server error: <code>"
 //   - connection refused / timeout → "unreachable" / "timeout"
 func (s *Studio) CheckProviderHealth(provider string) *ProviderHealthInfo {
-	info := &ProviderHealthInfo{Provider: provider}
-
 	s.mu.RLock()
-	settings := s.config.Settings
+	settings := defaultConfig().Settings
+	if s.config != nil {
+		settings = s.config.Settings
+	}
 	s.mu.RUnlock()
 
 	// iter 780+: resolve via ResolveProviderKey so env vars (GLM_API_KEY etc.)
@@ -58,23 +64,65 @@ func (s *Studio) CheckProviderHealth(provider string) *ProviderHealthInfo {
 	// does at send-time. Otherwise an env-only user gets a misleading
 	// "no API key configured" from the Test Connection button despite
 	// chats working fine.
+	var info *ProviderHealthInfo
 	switch provider {
-	case "ollama":
-		url, _ := ResolveProviderKey("ollama", settings)
-		base := strings.TrimRight(url, "/")
-		probeOllama(info, base)
 	case "glm":
 		key, _ := ResolveProviderKey("glm", settings)
-		probeAnthropicCompat(info, "glm", key, client.DefaultGLMBaseURL)
-	case "minimax":
-		key, _ := ResolveProviderKey("minimax", settings)
-		probeAnthropicCompat(info, "minimax", key, client.DefaultMiniMaxBaseURL)
+		info = checkProviderHealthWithKey("glm", key)
 	case "kimi":
 		key, _ := ResolveProviderKey("kimi", settings)
-		probeAnthropicCompat(info, "kimi", key, client.DefaultKimiBaseURL)
-	case "deepseek":
-		key, _ := ResolveProviderKey("deepseek", settings)
-		probeAnthropicCompat(info, "deepseek", key, client.DefaultDeepSeekBaseURL)
+		info = checkProviderHealthWithKey("kimi", key)
+	default:
+		info = checkProviderHealthWithKey(provider, "")
+	}
+	s.rememberAvailableStudioModels(info)
+	return info
+}
+
+// CheckProviderHealthWithKey probes the credential currently present in the
+// UI without persisting it first. This keeps "Test connection" honest when a
+// user has edited a key but has not clicked Save yet.
+func (s *Studio) CheckProviderHealthWithKey(provider, apiKey string) *ProviderHealthInfo {
+	info := checkProviderHealthWithKey(provider, apiKey)
+	s.rememberAvailableStudioModels(info)
+	return info
+}
+
+func (s *Studio) rememberAvailableStudioModels(info *ProviderHealthInfo) {
+	if info == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !info.OK || len(info.AvailableModels) == 0 {
+		delete(s.discoveredModels, info.Provider)
+		delete(s.discoveredModelsAt, info.Provider)
+		return
+	}
+	if s.discoveredModels == nil {
+		s.discoveredModels = make(map[string]map[string]bool)
+	}
+	if s.discoveredModelsAt == nil {
+		s.discoveredModelsAt = make(map[string]time.Time)
+	}
+	models := make(map[string]bool, len(info.AvailableModels))
+	for _, model := range info.AvailableModels {
+		if validateStudioProviderModel(info.Provider, model) == nil || isFutureStudioModelID(info.Provider, model) {
+			models[model] = true
+		}
+	}
+	s.discoveredModels[info.Provider] = models
+	s.discoveredModelsAt[info.Provider] = time.Now()
+}
+
+func checkProviderHealthWithKey(provider, apiKey string) *ProviderHealthInfo {
+	info := &ProviderHealthInfo{Provider: provider}
+	apiKey = strings.TrimSpace(apiKey)
+	switch provider {
+	case "glm":
+		probeAnthropicCompat(info, "glm", apiKey, client.DefaultGLMBaseURL)
+	case "kimi":
+		probeAnthropicCompat(info, "kimi", apiKey, client.DefaultKimiBaseURL)
 	default:
 		info.Error = fmt.Sprintf("unknown provider: %s", provider)
 	}
@@ -82,7 +130,7 @@ func (s *Studio) CheckProviderHealth(provider string) *ProviderHealthInfo {
 }
 
 // probeAnthropicCompat hits `<base>/v1/models` with Bearer auth. Used for
-// every Anthropic-compatible cloud provider GLM, MiniMax, Kimi).
+// both supported Anthropic-compatible cloud providers (GLM and Kimi).
 func probeAnthropicCompat(info *ProviderHealthInfo, provider, apiKey, baseURL string) {
 	if apiKey == "" {
 		info.Error = "no API key configured"
@@ -101,19 +149,7 @@ func probeAnthropicCompat(info *ProviderHealthInfo, provider, apiKey, baseURL st
 	// Some providers want x-api-key too (Anthropic native). Set both — extras are ignored.
 	req.Header.Set("x-api-key", apiKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
-	_ = provider // unused; kept for parity with probeOllama
-	doProbe(info, req)
-}
-
-// probeOllama hits `<base>/api/tags`. No auth.
-func probeOllama(info *ProviderHealthInfo, baseURL string) {
-	endpoint := strings.TrimRight(baseURL, "/") + "/api/tags"
-	info.Endpoint = endpoint
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
-	if err != nil {
-		info.Error = "bad request: " + err.Error()
-		return
-	}
+	_ = provider // retained for readable call sites and future provider headers
 	doProbe(info, req)
 }
 
@@ -141,8 +177,10 @@ func doProbe(info *ProviderHealthInfo, req *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
-	// Drain the body so the connection can be reused (and so a misbehaving
-	// server doesn't leave us with a half-read TCP stream).
+	// Model catalogs are tiny, but keep the health endpoint bounded. Drain any
+	// remainder so the HTTP connection can still be reused.
+	const maxHealthBody = 1 << 20
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxHealthBody+1))
 	_, _ = io.Copy(io.Discard, resp.Body)
 
 	info.StatusCode = resp.StatusCode
@@ -150,6 +188,12 @@ func doProbe(info *ProviderHealthInfo, req *http.Request) {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		info.OK = true
 		info.Description = fmt.Sprintf("OK · %d ms", info.LatencyMs)
+		if readErr == nil && len(body) <= maxHealthBody {
+			populateAvailableStudioModels(info, body)
+			if len(info.AvailableModels) > 0 {
+				info.Description += fmt.Sprintf(" · %d Studio model(s) available", len(info.AvailableModels))
+			}
+		}
 	case resp.StatusCode == 401:
 		info.Error = "invalid API key"
 		info.Description = "Server says the API key is wrong — re-check it in the provider dashboard"
@@ -170,5 +214,86 @@ func doProbe(info *ProviderHealthInfo, req *http.Request) {
 		info.Description = "Provider is having trouble — try again in a moment"
 	default:
 		info.Error = fmt.Sprintf("unexpected HTTP %d", resp.StatusCode)
+	}
+}
+
+// populateAvailableStudioModels intersects an untrusted provider response with
+// the product catalog. It never forwards arbitrary remote model IDs into the
+// UI, preserving the GLM/Kimi-only boundary even if a gateway returns extras.
+func populateAvailableStudioModels(info *ProviderHealthInfo, body []byte) {
+	definition := providerDefinition(info.Provider)
+	if definition == nil || len(body) == 0 {
+		return
+	}
+	var payload any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return
+	}
+	advertised := make(map[string]bool)
+	advertisedOrder := make([]string, 0)
+	collectModelIDs(payload, advertised, &advertisedOrder)
+	known := make(map[string]bool, len(definition.Models))
+	for _, model := range definition.Models {
+		known[model] = true
+		if advertised[model] || advertised[model+"[1m]"] {
+			info.AvailableModels = append(info.AvailableModels, model)
+		}
+	}
+	// Add provider-advertised future models that stay inside the strict GLM or
+	// Kimi namespace. Newer numeric families lead the list and become the
+	// recommendation; other safe variants follow the stable catalog.
+	newer := make([]string, 0)
+	other := make([]string, 0)
+	seenExtra := make(map[string]bool)
+	for _, raw := range advertisedOrder {
+		model := strings.TrimSuffix(raw, "[1m]")
+		if known[model] || seenExtra[model] || !isFutureStudioModelID(info.Provider, model) {
+			continue
+		}
+		seenExtra[model] = true
+		if modelVersionCompare(info.Provider, model, defaultModelForProvider(info.Provider)) > 0 {
+			newer = append(newer, model)
+		} else {
+			other = append(other, model)
+		}
+	}
+	info.AvailableModels = append(append(newer, info.AvailableModels...), other...)
+	if len(info.AvailableModels) > 0 {
+		info.RecommendedModel = info.AvailableModels[0]
+	}
+}
+
+func collectModelIDs(payload any, out map[string]bool, order *[]string) {
+	var list []any
+	switch value := payload.(type) {
+	case []any:
+		list = value
+	case map[string]any:
+		for _, key := range []string{"data", "models"} {
+			if candidate, ok := value[key].([]any); ok {
+				list = append(list, candidate...)
+			}
+		}
+	}
+	for _, item := range list {
+		add := func(id string) {
+			id = strings.ToLower(strings.TrimSpace(id))
+			if id == "" || out[id] {
+				return
+			}
+			out[id] = true
+			*order = append(*order, id)
+		}
+		switch value := item.(type) {
+		case string:
+			add(value)
+		case map[string]any:
+			for _, key := range []string{"id", "name", "model"} {
+				if id, ok := value[key].(string); ok && strings.TrimSpace(id) != "" {
+					add(id)
+					break
+				}
+			}
+		}
 	}
 }

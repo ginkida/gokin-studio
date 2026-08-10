@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { PanelLeft, PanelRight, Folder, GitBranch } from 'lucide-react'
+import { ChevronLeft, ChevronRight, PanelLeft, PanelRight, GitBranch } from 'lucide-react'
 import { GetProjectGitContext } from '../../../wailsjs/go/studio/Studio'
 import { EventsOn } from '../../../wailsjs/runtime/runtime'
 
@@ -9,16 +9,28 @@ interface TopBarProps {
   projectId?: string | null
   isChat: boolean
   onToggleSidebar: () => void
+  sidebarExpanded: boolean
+  canNavigateBack: boolean
+  canNavigateForward: boolean
+  onNavigateBack: () => void
+  onNavigateForward: () => void
 }
 
-// Full-width window top bar (sits BELOW the native OS titlebar — we did not go
-// frameless, so there is no traffic-light region to clear). It shows the active
-// view/session title, the active-project chip, the read-only current git
-// branch, and panel toggles that drive the REAL sidebar-collapse + context-panel
-// toggle. Back/forward navigation and an account avatar are deliberately omitted:
-// studio has no view-history stack and no user identity, and dead chrome reads
-// worse than honest absence.
-export function TopBar({ title, projectName, projectId, isChat, onToggleSidebar }: TopBarProps) {
+// Full-width window top bar (sits below the native OS titlebar). Keep it as a
+// quiet breadcrumb rather than a second status dashboard: project and current
+// view answer "where am I?", while the two edge buttons control the panels.
+export function TopBar({
+  title,
+  projectName,
+  projectId,
+  isChat,
+  onToggleSidebar,
+  sidebarExpanded,
+  canNavigateBack,
+  canNavigateForward,
+  onNavigateBack,
+  onNavigateForward,
+}: TopBarProps) {
   const [branch, setBranch] = useState('')
 
   // Read-only current branch. Loaded on project switch and refreshed when a turn
@@ -43,21 +55,42 @@ export function TopBar({ title, projectName, projectId, isChat, onToggleSidebar 
         <button
           className="top-bar-btn"
           onClick={onToggleSidebar}
-          title="Toggle sidebar (Ctrl+B)"
-          aria-label="Toggle sidebar"
+          title={`${sidebarExpanded ? 'Hide' : 'Show'} sidebar (Ctrl+B)`}
+          aria-label={`${sidebarExpanded ? 'Hide' : 'Show'} sidebar`}
+          aria-expanded={sidebarExpanded}
+          aria-controls="project-sidebar"
         >
           <PanelLeft size={15} />
+        </button>
+        <span className="top-bar-nav-divider" aria-hidden />
+        <button
+          className="top-bar-btn top-bar-history-btn"
+          type="button"
+          onClick={onNavigateBack}
+          disabled={!canNavigateBack}
+          title="Back (Ctrl/Cmd+[ · Mouse Back)"
+          aria-label="Go back"
+        >
+          <ChevronLeft size={15} />
+        </button>
+        <button
+          className="top-bar-btn top-bar-history-btn"
+          type="button"
+          onClick={onNavigateForward}
+          disabled={!canNavigateForward}
+          title="Forward (Ctrl/Cmd+] · Mouse Forward)"
+          aria-label="Go forward"
+        >
+          <ChevronRight size={15} />
         </button>
       </div>
 
       <div className="top-bar-center">
-        <span className="top-bar-title" title={title}>{title}</span>
-        {projectName && (
-          <span className="top-bar-chip">
-            <Folder size={11} />
-            <span className="tbc-text">{projectName}</span>
-          </span>
-        )}
+        <div className="top-bar-breadcrumb" aria-label="Current location">
+          {projectName && <span className="top-bar-project" title={projectName}>{projectName}</span>}
+          {projectName && title && <span className="top-bar-slash" aria-hidden>/</span>}
+          <span className="top-bar-title" title={title}>{title}</span>
+        </div>
         {branch && (
           <span className="top-bar-branch" title={`On branch ${branch}`}>
             <GitBranch size={11} />

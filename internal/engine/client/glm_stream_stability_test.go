@@ -151,7 +151,7 @@ func TestErrorBodyReadIsBounded(t *testing.T) {
 	c, err := NewAnthropicClient(AnthropicConfig{
 		APIKey:     "test-key-1234567890",
 		BaseURL:    srv.URL,
-		Model:      "glm-5.2",
+		Model:      "glm-5.1",
 		MaxRetries: 0,
 	})
 	if err != nil {
@@ -159,7 +159,7 @@ func TestErrorBodyReadIsBounded(t *testing.T) {
 	}
 
 	_, sErr := c.streamRequest(context.Background(), map[string]interface{}{
-		"model":    "glm-5.2",
+		"model":    "glm-5.1",
 		"messages": []map[string]interface{}{{"role": "user", "content": "hi"}},
 	})
 	if sErr == nil {

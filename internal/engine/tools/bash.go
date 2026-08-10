@@ -162,11 +162,12 @@ type BashTool struct {
 
 // NewBashTool creates a new BashTool instance.
 func NewBashTool(workDir string) *BashTool {
+	isolation := security.DetectWorkspaceIsolation()
 	return &BashTool{
 		workDir:        workDir,
 		session:        NewBashSession(workDir),
 		timeout:        DefaultBashTimeout, // Set default timeout
-		sandboxEnabled: false,              // Sandbox disabled by default (requires root)
+		sandboxEnabled: isolation.Available,
 	}
 }
 
@@ -221,6 +222,21 @@ func (t *BashTool) SetSandboxEnabled(enabled bool) {
 	t.sandboxEnabled = enabled
 }
 
+// WorkspaceIsolationStatus reports whether this tool will run commands in a
+// real filesystem sandbox. Callers use it to hard-gate unavoidable host
+// execution on platforms without a supported backend.
+func (t *BashTool) WorkspaceIsolationStatus() security.WorkspaceIsolationStatus {
+	status := security.DetectWorkspaceIsolation()
+	if !t.sandboxEnabled || !status.Available {
+		status.Enforced = false
+		status.Mode = "host"
+		if status.Available {
+			status.Detail = "Workspace isolation was disabled; this command would run with host filesystem access."
+		}
+	}
+	return status
+}
+
 // SetUnrestrictedMode enables or disables unrestricted mode.
 // When enabled (both sandbox and permissions are off), command validation is skipped.
 func (t *BashTool) SetUnrestrictedMode(enabled bool) {
@@ -272,6 +288,7 @@ PARAMETERS:
 - description (optional): Brief description of what the command does
 - stdin (optional): Content to pipe as stdin to the command
 - run_in_background (optional): If true, run in background and return task ID
+- network_access (optional): Full host networking; false by default and always requires fresh exact approval
 
 TIMEOUT:
 - Default: 30 seconds
@@ -327,6 +344,11 @@ func (t *BashTool) Declaration() *genai.FunctionDeclaration {
 					Type:        genai.TypeBoolean,
 					Description: "If true, run the command in background and return task ID immediately",
 				},
+				"network_access": {
+					Type: genai.TypeBoolean,
+					Description: "Request host network access for this command. Default false. " +
+						"Enabling it always requires a fresh exact-action approval.",
+				},
 			},
 			Required: []string{"command"},
 		},
@@ -361,6 +383,7 @@ func (t *BashTool) Validate(args map[string]any) error {
 func (t *BashTool) Execute(ctx context.Context, args map[string]any) (ToolResult, error) {
 	command, _ := GetString(args, "command")
 	stdinContent, _ := GetString(args, "stdin")
+	allowNetwork := GetBoolDefault(args, "network_access", false)
 
 	// The dangerous-command blocklist (fork bombs, rm -rf /, reverse shells,
 	// curl|sh, ...) MUST run on every execution. The studio agent loop
@@ -385,14 +408,14 @@ func (t *BashTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 		if stdinContent != "" {
 			return NewErrorResult("stdin is not supported with run_in_background=true"), nil
 		}
-		return t.executeBackground(ctx, command)
+		return t.executeBackground(ctx, command, allowNetwork)
 	}
 
-	return t.executeForeground(ctx, command, stdinContent)
+	return t.executeForeground(ctx, command, stdinContent, allowNetwork)
 }
 
 // executeBackground starts a command in background and returns task ID.
-func (t *BashTool) executeBackground(ctx context.Context, command string) (ToolResult, error) {
+func (t *BashTool) executeBackground(ctx context.Context, command string, allowNetwork bool) (ToolResult, error) {
 	if t.taskManager == nil {
 		return NewErrorResult("background tasks not configured"), nil
 	}
@@ -402,7 +425,7 @@ func (t *BashTool) executeBackground(ctx context.Context, command string) (ToolR
 	// Task.Cancel() via task_stop still works (task has its own cancelFunc).
 	bgCtx := context.WithoutCancel(ctx)
 
-	taskID, err := t.taskManager.Start(bgCtx, command)
+	taskID, err := t.taskManager.StartWithNetwork(bgCtx, command, allowNetwork)
 	if err != nil {
 		return NewErrorResult(fmt.Sprintf("failed to start background task: %s", err)), nil
 	}
@@ -418,7 +441,20 @@ func (t *BashTool) executeBackground(ctx context.Context, command string) (ToolR
 
 // buildSessionEnv creates a sanitized environment with session env vars injected.
 func (t *BashTool) buildSessionEnv() []string {
-	env := buildSafeEnv()
+	envRoot := t.workspaceRoot
+	if strings.TrimSpace(envRoot) == "" {
+		envRoot = t.workDir
+	}
+	env, err := security.WorkspaceSafeEnvironment(envRoot)
+	if err != nil {
+		env = buildSafeEnv()
+		// Even if creation of the isolated runtime failed, do not point HOME
+		// or XDG variables at real user data.
+		env = upsertEnvVar(env, "HOME", t.workDir)
+		for _, key := range []string{"XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"} {
+			env = upsertEnvVar(env, key, filepath.Join(t.workDir, ".gokin-shell-unavailable"))
+		}
+	}
 
 	if t.managedWorkspaceApplyBack && t.workspaceRoot != "" {
 		tmpDir := filepath.Join(t.workspaceRoot, ".gokin-tmp")
@@ -652,7 +688,12 @@ func startCommandErrorResult(execCtx context.Context, err error) ToolResult {
 	}
 }
 
-func (t *BashTool) executeForeground(ctx context.Context, command string, stdinContent string) (ToolResult, error) {
+func (t *BashTool) executeForeground(
+	ctx context.Context,
+	command string,
+	stdinContent string,
+	allowNetwork bool,
+) (ToolResult, error) {
 	// Create context with explicit timeout to prevent indefinite hangs
 	execCtx := ctx
 	if t.timeout > 0 {
@@ -663,11 +704,8 @@ func (t *BashTool) executeForeground(ctx context.Context, command string, stdinC
 
 	// Apply sandboxing if enabled
 	if t.sandboxEnabled {
-		if stdinContent != "" {
-			return NewErrorResult("stdin is not supported in sandbox mode"), nil
-		}
 		// Use sandbox wrapper for command execution
-		return t.executeSandboxed(execCtx, command)
+		return t.executeSandboxed(execCtx, command, stdinContent, allowNetwork)
 	}
 
 	// Use session working directory
@@ -1099,15 +1137,26 @@ func commandLooksLikeValidation(command string) bool {
 }
 
 // executeSandboxed executes the command with sandbox isolation
-func (t *BashTool) executeSandboxed(ctx context.Context, command string) (ToolResult, error) {
+func (t *BashTool) executeSandboxed(
+	ctx context.Context,
+	command, stdinContent string,
+	allowNetwork bool,
+) (ToolResult, error) {
 	// Create sandbox configuration
 	sandboxConfig := security.DefaultSandboxConfig()
 	sandboxConfig.Enabled = true
+	sandboxConfig.AllowNetwork = allowNetwork
+
+	workDir := t.sessionWorkDir()
+	wrappedCommand := wrapCommandWithPWD(command)
 
 	// Create sandboxed command
-	sandboxed, err := security.NewSandboxedCommand(ctx, t.workDir, command, sandboxConfig)
+	sandboxed, err := security.NewSandboxedCommand(ctx, workDir, wrappedCommand, sandboxConfig)
 	if err != nil {
 		return NewErrorResult(fmt.Sprintf("failed to create sandboxed command: %s", err)), nil
+	}
+	if stdinContent != "" {
+		sandboxed.Command().Stdin = strings.NewReader(stdinContent)
 	}
 
 	// Run the sandboxed command
@@ -1119,9 +1168,11 @@ func (t *BashTool) executeSandboxed(ctx context.Context, command string) (ToolRe
 	}
 
 	// Build output
+	stdout, detectedDir := extractPWDFromOutput(string(result.Stdout))
+	t.updateSessionFromPWD(detectedDir)
 	var output strings.Builder
-	if len(result.Stdout) > 0 {
-		output.Write(result.Stdout)
+	if stdout != "" {
+		output.WriteString(stdout)
 	}
 	if len(result.Stderr) > 0 {
 		if output.Len() > 0 {
@@ -1133,11 +1184,7 @@ func (t *BashTool) executeSandboxed(ctx context.Context, command string) (ToolRe
 
 	// Check exit code
 	if result.ExitCode != 0 {
-		return ToolResult{
-			Content: output.String(),
-			Error:   fmt.Sprintf("command exited with code %d", result.ExitCode),
-			Success: false,
-		}, nil
+		return t.buildExitResult(command, output.String(), "", result.ExitCode), nil
 	}
 
 	return NewSuccessResult(output.String()), nil

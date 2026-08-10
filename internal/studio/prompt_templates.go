@@ -39,7 +39,7 @@ var promptTemplates = []PromptTemplate{
 - When stuck, surface the blocker and ask — don't guess at requirements.`,
 	},
 	{
-		ID: "code-reviewer",
+		ID:          "code-reviewer",
 		Name:        "Code Reviewer",
 		Category:    "Coding",
 		Description: "Reviews diffs and existing code for bugs, edge cases, and style issues. Doesn't write code unless asked.",
@@ -54,7 +54,7 @@ var promptTemplates = []PromptTemplate{
 - When asked to score, use a 5-point scale and justify in one sentence.`,
 	},
 	{
-		ID: "test-writer",
+		ID:          "test-writer",
 		Name:        "Test Writer",
 		Category:    "Coding",
 		Description: "Adds high-coverage tests for existing code. Targets edge cases, not just happy paths.",
@@ -69,7 +69,7 @@ var promptTemplates = []PromptTemplate{
 - Run the test suite after writing to confirm it actually passes — never claim coverage you haven't verified.`,
 	},
 	{
-		ID: "refactorer",
+		ID:          "refactorer",
 		Name:        "Refactorer",
 		Category:    "Coding",
 		Description: "Improves structure without changing behaviour. Backed by tests; halts if tests would change.",
@@ -84,7 +84,7 @@ var promptTemplates = []PromptTemplate{
 - After each step, summarise: what changed, why, what you verified.`,
 	},
 	{
-		ID: "bug-hunter",
+		ID:          "bug-hunter",
 		Name:        "Bug Hunter",
 		Category:    "Coding",
 		Description: "Reproduces, isolates, and fixes bugs root-cause-first. Avoids surface patches.",
@@ -101,7 +101,7 @@ var promptTemplates = []PromptTemplate{
 
 	// --- Architecture & design -----------------------------------------------
 	{
-		ID: "architect",
+		ID:          "architect",
 		Name:        "Software Architect",
 		Category:    "Design",
 		Description: "Discusses tradeoffs, sketches designs, and writes ADRs. Doesn't dive into implementation.",
@@ -115,7 +115,7 @@ var promptTemplates = []PromptTemplate{
 - Write designs that a junior engineer can implement — define interfaces, edge cases, invariants, and what "done" looks like.`,
 	},
 	{
-		ID: "performance-optimizer",
+		ID:          "performance-optimizer",
 		Name:        "Performance Optimizer",
 		Category:    "Design",
 		Description: "Profiles and optimises real bottlenecks. Refuses to micro-optimise without measurements.",
@@ -131,7 +131,7 @@ var promptTemplates = []PromptTemplate{
 
 	// --- Documentation -------------------------------------------------------
 	{
-		ID: "doc-writer",
+		ID:          "doc-writer",
 		Name:        "Documentation Writer",
 		Category:    "Docs",
 		Description: "Writes user-facing docs, runbooks, and onboarding guides. Reads code to verify accuracy.",
@@ -146,7 +146,7 @@ var promptTemplates = []PromptTemplate{
 - Re-read before submitting: every claim should be traceable to specific code.`,
 	},
 	{
-		ID: "code-explainer",
+		ID:          "code-explainer",
 		Name:        "Code Explainer",
 		Category:    "Docs",
 		Description: "Explains existing code clearly, layer by layer, without modifying it.",
@@ -163,7 +163,7 @@ var promptTemplates = []PromptTemplate{
 
 	// --- Operations / safety -------------------------------------------------
 	{
-		ID: "incident-responder",
+		ID:          "incident-responder",
 		Name:        "Incident Responder",
 		Category:    "Ops",
 		Description: "Triages production incidents. Stabilise first, root cause second, write postmortem after.",
@@ -180,7 +180,7 @@ var promptTemplates = []PromptTemplate{
 
 	// --- Empty / minimal -----------------------------------------------------
 	{
-		ID: "minimal",
+		ID:          "minimal",
 		Name:        "Minimal (no prompt)",
 		Category:    "Reset",
 		Description: "Clears the system prompt entirely — useful as a reset before pasting a custom one.",

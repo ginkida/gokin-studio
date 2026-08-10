@@ -105,29 +105,33 @@ func askUserRouting(ctx context.Context) (projectID, sessionID string) {
 // emit call — stable for the lifetime of the studio.
 func (s *Studio) makeAskUserHandler(wailsCtx context.Context) func(ctx context.Context, question string, options []string, defaultOpt string) (string, error) {
 	return func(ctx context.Context, question string, options []string, defaultOpt string) (string, error) {
-		projectID, sessionID := askUserRouting(ctx)
-		qid := uuid.New().String()[:12]
-		ch := s.askUsers.register(qid)
-		defer s.askUsers.cleanup(qid)
-
-		wailsRuntime.EventsEmit(wailsCtx, EventAskUser, AskUserEvent{
-			ProjectID:  projectID,
-			SessionID:  sessionID,
-			QuestionID: qid,
-			Question:   question,
-			Options:    options,
-			Default:    defaultOpt,
+		return s.waitForUserAnswer(wailsCtx, ctx, AskUserEvent{
+			Question: question,
+			Options:  options,
+			Default:  defaultOpt,
 		})
+	}
+}
 
-		select {
-		case answer, ok := <-ch:
-			if !ok {
-				return "", fmt.Errorf("user dismissed the question")
-			}
-			return answer, nil
-		case <-ctx.Done():
-			return "", ctx.Err()
+// waitForUserAnswer emits a prepared question and blocks until the frontend
+// resolves it. Both ordinary model questions and first-class approval cards
+// use the same registry, cancellation, and race-safe single-resolution path.
+func (s *Studio) waitForUserAnswer(wailsCtx, ctx context.Context, event AskUserEvent) (string, error) {
+	event.ProjectID, event.SessionID = askUserRouting(ctx)
+	event.QuestionID = uuid.New().String()[:12]
+	ch := s.askUsers.register(event.QuestionID)
+	defer s.askUsers.cleanup(event.QuestionID)
+
+	wailsRuntime.EventsEmit(wailsCtx, EventAskUser, event)
+
+	select {
+	case answer, ok := <-ch:
+		if !ok {
+			return "", fmt.Errorf("user dismissed the question")
 		}
+		return answer, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
 	}
 }
 
@@ -135,6 +139,12 @@ func (s *Studio) makeAskUserHandler(wailsCtx context.Context) func(ctx context.C
 // The agent handler blocked on the question returns immediately with the
 // provided answer. Returns an error if no question with that ID is pending.
 func (s *Studio) AnswerQuestion(questionID, answer string) error {
+	if err := validateRPCText("question ID", questionID, QuestionIDMaxBytes, true); err != nil {
+		return err
+	}
+	if err := validateRPCText("answer", answer, QuestionAnswerMaxBytes, true); err != nil {
+		return err
+	}
 	if s.askUsers == nil {
 		return fmt.Errorf("ask-user registry not initialised")
 	}
@@ -149,6 +159,9 @@ func (s *Studio) AnswerQuestion(questionID, answer string) error {
 // question") rather than a confusing pseudo-answer string. Used when the user
 // dismisses the question card without providing an answer.
 func (s *Studio) CancelQuestion(questionID string) error {
+	if err := validateRPCText("question ID", questionID, QuestionIDMaxBytes, true); err != nil {
+		return err
+	}
 	if s.askUsers == nil {
 		return fmt.Errorf("ask-user registry not initialised")
 	}

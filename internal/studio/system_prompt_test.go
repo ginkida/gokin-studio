@@ -26,6 +26,7 @@ func TestDefaultSystemPrompt_MergedDisciplines(t *testing.T) {
 		"ask_user",
 		"pin_context",
 		"memorize",
+		"document_create",
 	}
 	for _, w := range wantContains {
 		if !strings.Contains(p, w) {

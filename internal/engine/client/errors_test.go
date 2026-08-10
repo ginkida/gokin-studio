@@ -148,11 +148,13 @@ func TestIsContextTooLongError(t *testing.T) {
 	}{
 		{"nil", nil, false},
 		{"HTTP 400 context", &HTTPError{StatusCode: 400, Message: "context window exceeded"}, true},
+		{"HTTP 413", &HTTPError{StatusCode: 413, Message: "payload too large"}, true},
 		{"HTTP 400 token", &HTTPError{StatusCode: 400, Message: "token limit exceeded"}, true},
 		{"HTTP 400 too long", &HTTPError{StatusCode: 400, Message: "input too long"}, true},
 		{"HTTP 400 unrelated", &HTTPError{StatusCode: 400, Message: "invalid parameter"}, false},
 		{"HTTP 500", &HTTPError{StatusCode: 500, Message: "context"}, false},
 		{"API 400 context", &APIError{StatusCode: 400, Message: "maximum context length"}, true},
+		{"API 413", &APIError{StatusCode: 413, Message: "request entity too large"}, true},
 		{"API 400 unrelated", &APIError{StatusCode: 400, Message: "invalid model"}, false},
 		// Over-match regressions: a genuine 400 mentioning bare "maximum"/"token"
 		// that is NOT a context overflow must NOT trigger IsContextTooLongError.

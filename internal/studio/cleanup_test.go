@@ -3,6 +3,7 @@ package studio
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/ginkida/gokin-studio/internal/engine/memory"
@@ -110,6 +111,68 @@ func TestDeleteChatSession_CleansUpHistoryAndReplay(t *testing.T) {
 	}
 	if len(sessions) != 1 {
 		t.Errorf("expected 1 remaining session, got %d", len(sessions))
+	}
+}
+
+func TestDeleteChatSession_DiskFailureKeepsSessionVisible(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	s := newStudioForTest(t)
+	info := addTestProject(t, s, "Delete Failure")
+	extra, err := s.CreateChatSession(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := historyPath(info.ID + "_" + extra.ID)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(path, "child"), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.DeleteChatSession(info.ID, extra.ID); err == nil {
+		t.Fatal("expected history deletion error")
+	}
+	sessions, err := s.ListChatSessions(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, session := range sessions {
+		found = found || session.ID == extra.ID
+	}
+	if !found {
+		t.Fatal("session disappeared from memory despite disk deletion failure")
+	}
+}
+
+func TestClearHistory_DiskFailureKeepsConversationVisible(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	s := newStudioForTest(t)
+	info := addTestProject(t, s, "Clear Failure")
+	s.mu.RLock()
+	p := s.projects[info.ID]
+	s.mu.RUnlock()
+	session := p.GetSession("default")
+	session.mu.Lock()
+	session.history = []*genai.Content{{Role: "user", Parts: []*genai.Part{genai.NewPartFromText("keep this")}}}
+	session.mu.Unlock()
+	path := historyPath(info.ID + "_default")
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(path, "child"), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.ClearHistory(info.ID, "default"); err == nil {
+		t.Fatal("expected history deletion error")
+	}
+	session.mu.RLock()
+	remaining := len(session.history)
+	session.mu.RUnlock()
+	if remaining != 1 {
+		t.Fatalf("history changed despite disk deletion failure: %d entries", remaining)
 	}
 }
 

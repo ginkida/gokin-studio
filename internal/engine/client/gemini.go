@@ -30,6 +30,7 @@ type GeminiClient struct {
 	streamIdleTimeout time.Duration  // Max pause between stream chunks (default: 30s)
 	statusCallback    StatusCallback // Optional callback for status updates
 	systemInstruction string         // System-level instruction passed via API parameter
+	turnContext       string         // Ephemeral context appended to the final user turn
 	thinkingBudget    int32          // Thinking budget (0 = disabled)
 	reasoningEffort   string         // Reasoning effort level from config (low/medium/high)
 }
@@ -107,8 +108,11 @@ func (c *GeminiClient) SetSystemInstruction(instruction string) {
 	c.systemInstruction = instruction
 }
 
-// SetTurnContext is a no-op for GeminiClient (turn context not supported on this provider).
-func (c *GeminiClient) SetTurnContext(_ string) {}
+func (c *GeminiClient) SetTurnContext(turnContext string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.turnContext = turnContext
+}
 
 // SetThinkingBudget configures the thinking/reasoning budget.
 func (c *GeminiClient) SetThinkingBudget(budget int32) {
@@ -271,6 +275,10 @@ func (c *GeminiClient) isRetryableError(err error) bool {
 
 // generateContentStream handles the streaming content generation with retry logic.
 func (c *GeminiClient) generateContentStream(ctx context.Context, contents []*genai.Content) (*StreamingResponse, error) {
+	c.mu.RLock()
+	turnContext := c.turnContext
+	c.mu.RUnlock()
+	contents = appendTurnContextToContents(contents, turnContext)
 	// Sanitize contents before sending to API
 	contents = sanitizeContents(contents)
 
@@ -691,6 +699,7 @@ func (c *GeminiClient) WithModel(modelName string) Client {
 		streamIdleTimeout: c.streamIdleTimeout,
 		statusCallback:    c.statusCallback,
 		systemInstruction: c.systemInstruction,
+		turnContext:       c.turnContext,
 		thinkingBudget:    c.thinkingBudget,
 		reasoningEffort:   c.reasoningEffort,
 	}

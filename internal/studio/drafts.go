@@ -1,6 +1,7 @@
 package studio
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -50,7 +51,7 @@ func truncateUTF8(s string, maxBytes int) string {
 // only generate alphanumeric IDs, but we sanitise anyway so a future change
 // (or a hand-edited config) can't escape draftsDir().
 func draftPath(projectID, sessionID string) string {
-	return filepath.Join(draftsDir(), sanitiseDraftKey(projectID)+"_"+sanitiseDraftKey(sessionID)+".txt")
+	return filepath.Join(draftsDir(), safeStorageKey(projectID)+"_"+safeStorageKey(sessionID)+".txt")
 }
 
 // sanitiseDraftKey strips path separators, control characters, and dot
@@ -94,6 +95,9 @@ func (s *Studio) SaveDraft(projectID, sessionID, text string) error {
 	if strings.TrimSpace(text) == "" {
 		return s.ClearDraft(projectID, sid)
 	}
+	if !utf8.ValidString(text) {
+		return fmt.Errorf("draft must be valid UTF-8")
+	}
 	text = truncateUTF8(text, DraftMaxBytes)
 	if err := os.MkdirAll(draftsDir(), 0o700); err != nil {
 		return err
@@ -112,12 +116,15 @@ func (s *Studio) GetDraft(projectID, sessionID string) (string, error) {
 	if sid == "" {
 		sid = "default"
 	}
-	data, err := os.ReadFile(draftPath(projectID, sid))
+	data, err := readRegularFileLimited(draftPath(projectID, sid), DraftMaxBytes)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return "", nil
 		}
 		return "", err
+	}
+	if !utf8.Valid(data) {
+		return "", fmt.Errorf("draft file contains invalid UTF-8")
 	}
 	return string(data), nil
 }
@@ -152,7 +159,7 @@ func removeProjectDrafts(projectID string) {
 	if err != nil {
 		return
 	}
-	prefix := sanitiseDraftKey(projectID) + "_"
+	prefix := safeStorageKey(projectID) + "_"
 	for _, e := range entries {
 		if e.IsDir() {
 			continue

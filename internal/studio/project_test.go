@@ -26,14 +26,52 @@ func TestAddProject_RejectsInvalidInputs(t *testing.T) {
 		name string
 		dir  string
 	}{
-		{"", t.TempDir()},              // empty name
-		{"   ", t.TempDir()},           // whitespace-only name
-		{"Proj", "/no/such/path/xyz"},  // non-existent directory
+		{"", t.TempDir()},             // empty name
+		{"   ", t.TempDir()},          // whitespace-only name
+		{"Proj", ""},                  // empty path must not resolve to cwd
+		{"Proj", "   "},               // whitespace-only path
+		{"Proj", "/no/such/path/xyz"}, // non-existent directory
 	}
 	for _, c := range cases {
 		if _, err := s.AddProject(c.name, c.dir); err == nil {
 			t.Errorf("AddProject(%q, %q): expected error, got nil", c.name, c.dir)
 		}
+	}
+}
+
+func TestAddProject_RejectsSymlinkAliasOfRegisteredDirectory(t *testing.T) {
+	s := newStudioForTest(t)
+	dir := t.TempDir()
+	if _, err := s.AddProject("Real", dir); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(dir, alias); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AddProject("Alias", alias); err == nil {
+		t.Fatal("symlink alias registered the same workspace twice")
+	}
+}
+
+func TestAddProject_PersistenceFailureDoesNotPublish(t *testing.T) {
+	s := newStudioForTest(t)
+	workspace := t.TempDir()
+	blocked := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocked, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	previous := os.Getenv("GOKIN_CONFIG_DIR")
+	if err := os.Setenv("GOKIN_CONFIG_DIR", blocked); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Setenv("GOKIN_CONFIG_DIR", previous) })
+
+	if info, err := s.AddProject("Ghost", workspace); err == nil || info != nil {
+		t.Fatalf("AddProject() = %#v, %v; want persistence failure", info, err)
+	}
+	if projects := s.ListProjects(); len(projects) != 0 {
+		t.Fatalf("failed project was published: %+v", projects)
 	}
 }
 
@@ -217,6 +255,145 @@ func TestSetProjectProvider(t *testing.T) {
 	}
 }
 
+func TestSetProjectProvider_RejectsUnsupportedProviderOrModel(t *testing.T) {
+	s := newStudioForTest(t)
+	info := addTestProject(t, s, "Provider contract")
+	for _, tc := range []struct{ provider, model string }{
+		{"ollama", "llama3.1"},
+		{"deepseek", "deepseek-v4-pro"},
+		{"glm", "glm-6-unknown"},
+		{"kimi", "not-a-kimi-model"},
+	} {
+		if err := s.SetProjectProvider(info.ID, tc.provider, tc.model); err == nil {
+			t.Errorf("SetProjectProvider(%q, %q) unexpectedly succeeded", tc.provider, tc.model)
+		}
+	}
+}
+
+func TestConfigureProjectModel_CommitsOneCompleteSnapshot(t *testing.T) {
+	s := newStudioForTest(t)
+	info := addTestProject(t, s, "Atomic model config")
+
+	s.mu.RLock()
+	p := s.projects[info.ID]
+	s.mu.RUnlock()
+	p.mu.Lock()
+	p.client = &mockClient{}
+	p.mu.Unlock()
+
+	result, err := s.ConfigureProjectModel(info.ID, " KIMI ", "k3", 0.4, 65536, "enabled", 32768)
+	if err != nil {
+		t.Fatalf("ConfigureProjectModel: %v", err)
+	}
+	if result == nil || result.Provider != "kimi" || result.Model != "k3" || !result.ThinkingActive || result.ThinkingBudgetEffective != 32768 {
+		t.Fatalf("returned resolved project snapshot = %+v", result)
+	}
+	p.mu.RLock()
+	provider, model := p.Provider, p.Model
+	temperature, maxTokens := p.Temperature, p.MaxTokens
+	mode, budget := p.ThinkingMode, p.ThinkingBudget
+	cachedClient := p.client
+	p.mu.RUnlock()
+	if provider != "kimi" || model != "k3" || temperature != 0.4 || maxTokens != 65536 || mode != "enabled" || budget != 32768 {
+		t.Fatalf("project snapshot = %s/%s temp=%v max=%d thinking=%s/%d", provider, model, temperature, maxTokens, mode, budget)
+	}
+	if cachedClient != nil {
+		t.Fatal("cached client was not invalidated")
+	}
+
+	var persisted *ProjectConfig
+	for i := range s.config.Projects {
+		if s.config.Projects[i].ID == info.ID {
+			persisted = &s.config.Projects[i]
+			break
+		}
+	}
+	if persisted == nil {
+		t.Fatal("project missing from persisted snapshot")
+	}
+	if persisted.Provider != provider || persisted.Model != model || persisted.Temperature != temperature ||
+		persisted.MaxTokens != maxTokens || persisted.ThinkingMode != mode || persisted.ThinkingBudget != budget {
+		t.Fatalf("persisted snapshot diverged: %+v", *persisted)
+	}
+}
+
+func TestConfigureProjectModel_ValidationIsAtomic(t *testing.T) {
+	s := newStudioForTest(t)
+	info := addTestProject(t, s, "Atomic validation")
+	before, err := s.GetProject(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// k3 allows at most 131072 output tokens. No earlier field may publish
+	// when this last-stage validation fails.
+	if _, err := s.ConfigureProjectModel(info.ID, "kimi", "k3", 0.5, 131073, "enabled", 8192); err == nil {
+		t.Fatal("expected max-token validation failure")
+	}
+	after, err := s.GetProject(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Provider != after.Provider || before.Model != after.Model ||
+		before.Temperature != after.Temperature || before.MaxTokens != after.MaxTokens ||
+		before.ThinkingMode != after.ThinkingMode || before.ThinkingBudget != after.ThinkingBudget {
+		t.Fatalf("project changed after rejected configuration:\nbefore=%+v\nafter=%+v", before, after)
+	}
+}
+
+func TestProjectModelConfigurationRejectsActiveWork(t *testing.T) {
+	for _, busyState := range []string{"active turn", "claimed queue worker"} {
+		t.Run(busyState, func(t *testing.T) {
+			s := newStudioForTest(t)
+			info := addTestProject(t, s, "Busy model config")
+			s.mu.RLock()
+			project := s.projects[info.ID]
+			s.mu.RUnlock()
+			session := project.GetSession("default")
+			session.mu.Lock()
+			if busyState == "active turn" {
+				session.active = true
+			} else {
+				session.queueWorker = true
+			}
+			session.mu.Unlock()
+			t.Cleanup(func() {
+				session.mu.Lock()
+				session.active = false
+				session.queueWorker = false
+				session.mu.Unlock()
+			})
+
+			operations := []struct {
+				name string
+				run  func() error
+			}{
+				{"provider", func() error { return s.SetProjectProvider(info.ID, "kimi", "k3") }},
+				{"atomic config", func() error {
+					_, err := s.ConfigureProjectModel(info.ID, "kimi", "k3", 0.4, 65536, "enabled", 8192)
+					return err
+				}},
+				{"parameters", func() error { return s.SetProjectModelParams(info.ID, 0.5, 8192) }},
+				{"reasoning", func() error { return s.SetProjectThinking(info.ID, "enabled", 8192) }},
+			}
+			for _, operation := range operations {
+				if err := operation.run(); err == nil || !strings.Contains(err.Error(), "stop all running chats") {
+					t.Errorf("%s during %s error = %v", operation.name, busyState, err)
+				}
+			}
+
+			project.mu.RLock()
+			provider, model := project.Provider, project.Model
+			temperature, maxTokens := project.Temperature, project.MaxTokens
+			mode, budget := project.ThinkingMode, project.ThinkingBudget
+			project.mu.RUnlock()
+			if provider != "glm" || model != "glm-5.2" || temperature != 0 || maxTokens != 0 || mode != "" || budget != 0 {
+				t.Fatalf("busy model settings mutated: %s/%s temp=%v max=%d thinking=%s/%d", provider, model, temperature, maxTokens, mode, budget)
+			}
+		})
+	}
+}
+
 // TestSetProjectModelParams verifies that temperature and maxTokens are stored
 // and the client cache is invalidated.
 func TestSetProjectModelParams(t *testing.T) {
@@ -246,6 +423,10 @@ func TestSetProjectModelParams(t *testing.T) {
 	}
 	if maxTok != 4096 {
 		t.Errorf("MaxTokens = %d, want 4096", maxTok)
+	}
+
+	if err := s.SetProjectModelParams(info.ID, 0.7, 131_073); err == nil {
+		t.Fatal("model-specific maximum output limit was not enforced")
 	}
 }
 
@@ -281,6 +462,97 @@ func TestGetProject_DirectoryOK(t *testing.T) {
 	}
 	if got.DirectoryOK {
 		t.Errorf("DirectoryOK = true after directory was removed, want false")
+	}
+}
+
+func TestRelinkProjectDirectoryPreservesProjectIdentityAndSettings(t *testing.T) {
+	s := newStudioForTest(t)
+	oldDir := t.TempDir()
+	info, err := s.AddProject("Moved", oldDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ConfigureProjectModel(info.ID, "kimi", "k3", 0.4, 65536, "enabled", 8192); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(oldDir); err != nil {
+		t.Fatal(err)
+	}
+	newDir := t.TempDir()
+	got, err := s.RelinkProjectDirectory(info.ID, newDir)
+	if err != nil {
+		t.Fatalf("RelinkProjectDirectory: %v", err)
+	}
+	wantDir, _ := filepath.Abs(newDir)
+	if got.ID != info.ID || got.Name != "Moved" || got.Directory != wantDir || !got.DirectoryOK {
+		t.Fatalf("relinked project identity/path = %+v", got)
+	}
+	if got.Provider != "kimi" || got.Model != "k3" || got.Temperature != 0.4 || got.MaxTokens != 65536 || got.ThinkingBudget != 8192 {
+		t.Fatalf("relinked project settings changed: %+v", got)
+	}
+	if len(s.projects[info.ID].sessions) == 0 {
+		t.Fatal("relink discarded chat sessions")
+	}
+	var persisted *ProjectConfig
+	for index := range s.config.Projects {
+		if s.config.Projects[index].ID == info.ID {
+			persisted = &s.config.Projects[index]
+			break
+		}
+	}
+	if persisted == nil || persisted.Directory != wantDir {
+		t.Fatalf("persisted directory = %+v, want %q", persisted, wantDir)
+	}
+}
+
+func TestRelinkProjectDirectoryRejectsDuplicateAndActiveProject(t *testing.T) {
+	s := newStudioForTest(t)
+	first := addTestProject(t, s, "First")
+	second := addTestProject(t, s, "Second")
+	if _, err := s.RelinkProjectDirectory(first.ID, second.Directory); err == nil {
+		t.Fatal("duplicate registered directory was accepted")
+	}
+	p := s.projects[first.ID]
+	session := p.sessions["default"]
+	session.mu.Lock()
+	session.active = true
+	session.mu.Unlock()
+	if _, err := s.RelinkProjectDirectory(first.ID, t.TempDir()); err == nil || !strings.Contains(err.Error(), "running chats") {
+		t.Fatalf("active project relink error = %v", err)
+	}
+	session.mu.Lock()
+	session.active = false
+	session.mu.Unlock()
+	got, err := s.GetProject(first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Directory != first.Directory {
+		t.Fatalf("failed relink changed directory to %q", got.Directory)
+	}
+}
+
+func TestRelinkProjectDirectoryFailureIsAtomic(t *testing.T) {
+	s := newStudioForTest(t)
+	info := addTestProject(t, s, "Atomic relink")
+	blocked := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocked, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	previous := os.Getenv("GOKIN_CONFIG_DIR")
+	if err := os.Setenv("GOKIN_CONFIG_DIR", blocked); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Setenv("GOKIN_CONFIG_DIR", previous) })
+	if result, err := s.RelinkProjectDirectory(info.ID, t.TempDir()); err == nil || result != nil {
+		t.Fatalf("RelinkProjectDirectory() = %+v, %v; want persistence failure", result, err)
+	}
+	got, err := s.GetProject(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Directory != info.Directory {
+		t.Fatalf("failed relink published directory %q, want %q", got.Directory, info.Directory)
 	}
 }
 
@@ -375,9 +647,9 @@ func TestClearPinnedContext(t *testing.T) {
 	}
 }
 
-// TestClearPinnedContext_RemoveError verifies that ClearPinnedContext still
-// clears the in-memory pin but returns an error when the disk file cannot be
-// removed for a reason other than it not existing (e.g., it's a directory).
+// TestClearPinnedContext_RemoveError verifies that ClearPinnedContext preserves
+// the in-memory pin when its persisted copy cannot be removed. The two views
+// must never disagree about whether the pin is active.
 func TestClearPinnedContext_RemoveError(t *testing.T) {
 	s := newStudioForTest(t)
 	dir := t.TempDir()
@@ -401,15 +673,15 @@ func TestClearPinnedContext_RemoveError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when disk remove fails, got nil")
 	}
-	if !strings.Contains(err.Error(), "could not remove disk file") {
-		t.Errorf("error = %q, want 'could not remove disk file'", err)
+	if !strings.Contains(err.Error(), "could not remove pinned context from disk") {
+		t.Errorf("error = %q, want disk removal context", err)
 	}
 
-	// In-memory pin must be cleared even when the disk op fails.
+	// The in-memory pin must remain active when the disk operation fails.
 	p.mu.RLock()
 	remaining := p.pinnedContext
 	p.mu.RUnlock()
-	if remaining != "" {
-		t.Errorf("pinnedContext after error = %q, want empty", remaining)
+	if remaining != "some note" {
+		t.Errorf("pinnedContext after error = %q, want original value", remaining)
 	}
 }

@@ -4,8 +4,15 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"google.golang.org/genai"
+)
+
+const (
+	AskUserQuestionMaxBytes = 16 << 10
+	AskUserOptionMaxBytes   = 4 << 10
+	AskUserMaxOptions       = 20
 )
 
 // QuestionHandler is called to ask the user a question.
@@ -65,11 +72,70 @@ func (t *AskUserTool) Declaration() *genai.FunctionDeclaration {
 
 func (t *AskUserTool) Validate(args map[string]any) error {
 	question, ok := GetString(args, "question")
-	if !ok || question == "" {
+	if !ok || strings.TrimSpace(question) == "" {
 		return NewValidationError("question", "question is required")
+	}
+	if !utf8.ValidString(question) || strings.ContainsRune(question, 0) || len(question) > AskUserQuestionMaxBytes {
+		return NewValidationError("question", fmt.Sprintf("question must be valid UTF-8 and at most %d bytes", AskUserQuestionMaxBytes))
+	}
+	options, validOptions := askUserOptions(args)
+	if !validOptions {
+		return NewValidationError("options", "options must be an array of strings")
+	}
+	if len(options) > AskUserMaxOptions {
+		return NewValidationError("options", fmt.Sprintf("at most %d options are allowed", AskUserMaxOptions))
+	}
+	seen := make(map[string]struct{}, len(options))
+	for _, option := range options {
+		if strings.TrimSpace(option) == "" || !utf8.ValidString(option) || strings.ContainsRune(option, 0) || len(option) > AskUserOptionMaxBytes {
+			return NewValidationError("options", fmt.Sprintf("each option must be non-empty valid UTF-8 and at most %d bytes", AskUserOptionMaxBytes))
+		}
+		if _, duplicate := seen[option]; duplicate {
+			return NewValidationError("options", "duplicate options are not allowed")
+		}
+		seen[option] = struct{}{}
+	}
+	defaultOpt := ""
+	if rawDefault, exists := args["default"]; exists && rawDefault != nil {
+		var ok bool
+		defaultOpt, ok = rawDefault.(string)
+		if !ok {
+			return NewValidationError("default", "default must be a string")
+		}
+	}
+	if defaultOpt != "" {
+		if !utf8.ValidString(defaultOpt) || strings.ContainsRune(defaultOpt, 0) || len(defaultOpt) > AskUserOptionMaxBytes {
+			return NewValidationError("default", "default option is invalid")
+		}
+		if _, exists := seen[defaultOpt]; !exists {
+			return NewValidationError("default", "default must match one of the options")
+		}
 	}
 
 	return nil
+}
+
+func askUserOptions(args map[string]any) ([]string, bool) {
+	raw, exists := args["options"]
+	if !exists || raw == nil {
+		return nil, true
+	}
+	switch values := raw.(type) {
+	case []string:
+		return append([]string(nil), values...), true
+	case []any:
+		out := make([]string, 0, len(values))
+		for _, value := range values {
+			option, ok := value.(string)
+			if !ok {
+				return nil, false
+			}
+			out = append(out, option)
+		}
+		return out, true
+	default:
+		return nil, false
+	}
 }
 
 func (t *AskUserTool) Execute(ctx context.Context, args map[string]any) (ToolResult, error) {
@@ -77,16 +143,7 @@ func (t *AskUserTool) Execute(ctx context.Context, args map[string]any) (ToolRes
 	defaultOpt := GetStringDefault(args, "default", "")
 
 	// Parse options
-	var options []string
-	if optionsRaw, ok := args["options"]; ok {
-		if optList, ok := optionsRaw.([]any); ok {
-			for _, opt := range optList {
-				if optStr, ok := opt.(string); ok {
-					options = append(options, optStr)
-				}
-			}
-		}
-	}
+	options, _ := askUserOptions(args)
 
 	// If no handler is set, return an error
 	if t.handler == nil {

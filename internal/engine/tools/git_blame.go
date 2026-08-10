@@ -114,8 +114,7 @@ func (t *GitBlameTool) Execute(ctx context.Context, args map[string]any) (ToolRe
 
 	cmdArgs = append(cmdArgs, "--", file)
 
-	cmd := exec.CommandContext(ctx, "git", cmdArgs...)
-	cmd.Dir = t.workDir
+	cmd := newGitCommand(ctx, t.workDir, cmdArgs...)
 
 	output, err := cmd.Output()
 	if err != nil {

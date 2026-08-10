@@ -39,3 +39,16 @@ Thumbs.db
 .claude/
 CLAUDE.md
 docs/HISTORY.md
+
+# Gokin working files
+.gokin/.session-memory.md
+.gokin/.working-memory.md
+.gokin/project-memory.md
+.gokin/task-output/
+.gokin/checkpoints/
+.gokin/computer-use/
+.gokin/learning.yaml
+GOKIN.local.md
+
+# Gokin runtime artifacts (local paths, prompt previews, agent output)
+.gokin/

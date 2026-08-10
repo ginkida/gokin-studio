@@ -6,6 +6,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/ginkida/gokin-studio/internal/engine/security"
 )
 
 // CompletionHandler is called when a task completes.
@@ -18,16 +20,43 @@ type Manager struct {
 	counter int
 
 	onComplete CompletionHandler
+	sandbox    bool
 
 	mu sync.RWMutex
 }
 
 // NewManager creates a new task manager.
 func NewManager(workDir string) *Manager {
+	isolation := security.DetectWorkspaceIsolation()
 	return &Manager{
 		tasks:   make(map[string]*Task),
 		workDir: workDir,
+		sandbox: isolation.Available,
 	}
+}
+
+// SetWorkspaceSandboxEnabled controls whether newly started background tasks
+// use the platform workspace sandbox.
+func (m *Manager) SetWorkspaceSandboxEnabled(enabled bool) {
+	m.mu.Lock()
+	m.sandbox = enabled
+	m.mu.Unlock()
+}
+
+// WorkspaceIsolationStatus reports the isolation applied to new tasks.
+func (m *Manager) WorkspaceIsolationStatus() security.WorkspaceIsolationStatus {
+	status := security.DetectWorkspaceIsolation()
+	m.mu.RLock()
+	enabled := m.sandbox
+	m.mu.RUnlock()
+	if !enabled || !status.Available {
+		status.Enforced = false
+		status.Mode = "host"
+		if status.Available {
+			status.Detail = "Workspace isolation was disabled; background tasks would run with host filesystem access."
+		}
+	}
+	return status
 }
 
 // SetCompletionHandler sets the handler called when tasks complete.
@@ -39,11 +68,19 @@ func (m *Manager) SetCompletionHandler(handler CompletionHandler) {
 
 // Start starts a new background task and returns its ID.
 func (m *Manager) Start(ctx context.Context, command string) (string, error) {
+	return m.StartWithNetwork(ctx, command, false)
+}
+
+// StartWithNetwork starts a shell task and records whether its sandbox may use
+// the host network. Callers must exact-gate allowNetwork=true.
+func (m *Manager) StartWithNetwork(ctx context.Context, command string, allowNetwork bool) (string, error) {
 	m.mu.Lock()
 	m.counter++
 	id := fmt.Sprintf("task_%d_%d", time.Now().Unix(), m.counter)
 
 	task := NewTask(id, command, m.workDir)
+	task.Sandboxed = m.sandbox
+	task.AllowNetwork = allowNetwork
 	m.tasks[id] = task
 	onComplete := m.onComplete
 	m.mu.Unlock()
@@ -65,11 +102,23 @@ func (m *Manager) Start(ctx context.Context, command string) (string, error) {
 // StartWithArgs starts a new background task using direct exec (no shell interpretation).
 // This prevents command injection attacks when constructing commands from user input.
 func (m *Manager) StartWithArgs(ctx context.Context, program string, args []string) (string, error) {
+	return m.StartWithArgsAndNetwork(ctx, program, args, false)
+}
+
+// StartWithArgsAndNetwork is the direct-exec counterpart of StartWithNetwork.
+func (m *Manager) StartWithArgsAndNetwork(
+	ctx context.Context,
+	program string,
+	args []string,
+	allowNetwork bool,
+) (string, error) {
 	m.mu.Lock()
 	m.counter++
 	id := fmt.Sprintf("task_%d_%d", time.Now().Unix(), m.counter)
 
 	task := NewTaskWithArgs(id, program, args, m.workDir)
+	task.Sandboxed = m.sandbox
+	task.AllowNetwork = allowNetwork
 	m.tasks[id] = task
 	onComplete := m.onComplete
 	m.mu.Unlock()

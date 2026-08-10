@@ -12,7 +12,7 @@ import (
 
 // Version is the current release version of Gokin Studio.
 // Bumped on each release. Surfaced in About panel and diagnostics exports.
-const Version = "1.2.0"
+const Version = "2.0.0"
 
 // BuildInfo describes the running binary: version + runtime environment.
 // Used by the About panel and "Copy diagnostics" reports so support requests
@@ -267,9 +267,7 @@ func checkConfigDirWritable(dir string) HealthCheck {
 	}
 }
 
-// checkAPIKeys warns when a project's provider has no key configured.
-// Ollama is excluded (local, no key needed). Returns one check per provider
-// that has projects configured.
+// checkAPIKeys warns when a supported project's provider has no key configured.
 func checkAPIKeys(projects []*Project, settings Settings) []HealthCheck {
 	// providerInUse[provider] = true if at least one project uses it.
 	providerInUse := map[string]bool{}
@@ -283,15 +281,12 @@ func checkAPIKeys(projects []*Project, settings Settings) []HealthCheck {
 
 	checks := []HealthCheck{}
 	providerLabel := map[string]string{
-		"glm":      "GLM",
-		"minimax":  "MiniMax",
-		"kimi":     "Kimi",
-		"deepseek": "DeepSeek",
-		"ollama":   "Ollama",
+		"glm":  "GLM",
+		"kimi": "Kimi",
 	}
 
 	// Stable iteration order so the report is reproducible.
-	for _, prov := range []string{"glm", "minimax", "kimi", "deepseek", "ollama"} {
+	for _, prov := range []string{"glm", "kimi"} {
 		if !providerInUse[prov] {
 			continue
 		}
@@ -300,30 +295,6 @@ func checkAPIKeys(projects []*Project, settings Settings) []HealthCheck {
 		// initClient's actual lookup order) are recognised here too.
 		// Previously env-only users saw a false "API key missing" error.
 		key, src := ResolveProviderKey(prov, settings)
-		if prov == "ollama" {
-			// Local — no key check, but flag missing base URL.
-			if src == KeySourceDefault {
-				checks = append(checks, HealthCheck{
-					Category: "providers",
-					Name:     label + " base URL",
-					Status:   "warn",
-					Message:  "Ollama URL not set (will use http://localhost:11434)",
-				})
-			} else {
-				detail := key
-				if src == KeySourceEnv {
-					detail = key + " (from $" + envVarForProvider(prov) + ")"
-				}
-				checks = append(checks, HealthCheck{
-					Category: "providers",
-					Name:     label + " base URL",
-					Status:   "ok",
-					Message:  "URL configured",
-					Detail:   detail,
-				})
-			}
-			continue
-		}
 		if key == "" {
 			checks = append(checks, HealthCheck{
 				Category: "providers",

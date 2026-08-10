@@ -48,6 +48,7 @@ const ImportArchiveMaxBytes = 200 * 1024 * 1024
 var archiveSkipNames = map[string]bool{
 	".gokin-write-probe": true,
 	".DS_Store":          true,
+	permissionsFileName:  true, // device-local network trust must be re-approved after restore/migration
 }
 
 // ExportAllDataBase64 walks the studio config directory, builds a gzip'd
@@ -114,6 +115,18 @@ func writeConfigArchive(out io.Writer, dir string) (int, error) {
 		// are themselves backups; including them would make every Export
 		// grow by the size of previous auto-backups.
 		if rel == AutoBackupDirName || strings.HasPrefix(rel, AutoBackupDirName+string(filepath.Separator)) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		// Session Git worktrees live under <configDir>/worktrees/. Each one is
+		// a full second checkout of the user's repository, so walking them
+		// would make every export and every daily auto-backup carry a copy of
+		// every connected repo — gigabytes, and growing with each new chat.
+		// They are reconstructible from the repository and are deliberately
+		// device-local, so they never belong in a portable archive.
+		if rel == sessionWorktreeDirName || strings.HasPrefix(rel, sessionWorktreeDirName+string(filepath.Separator)) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
@@ -283,6 +296,11 @@ func (s *Studio) extractArchiveToConfigDir(r io.Reader, kind, safetyPrefix strin
 		if strings.HasPrefix(clean, "..") || filepath.IsAbs(clean) {
 			_ = os.RemoveAll(stagingDir)
 			return nil, fmt.Errorf("archive contains unsafe path: %s", hdr.Name)
+		}
+		if filepath.Base(clean) == permissionsFileName {
+			// Domain trust is device-local. Even a handcrafted or older backup
+			// cannot silently grant network navigation on the restored machine.
+			continue
 		}
 		target := filepath.Join(stagingDir, clean)
 		switch hdr.Typeflag {

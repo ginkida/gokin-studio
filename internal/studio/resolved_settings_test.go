@@ -60,10 +60,9 @@ func TestResolveProviderKey_EnvFallback(t *testing.T) {
 
 func TestResolveProviderKey_BothEmpty(t *testing.T) {
 	clearEnv(t, "GLM_API_KEY")
-	clearEnv(t, "MINIMAX_API_KEY")
 	clearEnv(t, "KIMI_API_KEY")
 	s := Settings{}
-	for _, prov := range []string{"glm", "minimax", "kimi"} {
+	for _, prov := range []string{"glm", "kimi"} {
 		key, src := ResolveProviderKey(prov, s)
 		if key != "" {
 			t.Errorf("%s: key=%q, want empty", prov, key)
@@ -80,7 +79,6 @@ func TestResolveProviderKey_AllProviders(t *testing.T) {
 		envVar string
 	}{
 		{"glm", "GLM_API_KEY"},
-		{"minimax", "MINIMAX_API_KEY"},
 		{"kimi", "KIMI_API_KEY"},
 	}
 	for _, c := range cases {
@@ -94,42 +92,6 @@ func TestResolveProviderKey_AllProviders(t *testing.T) {
 				t.Errorf("src=%q, want env", src)
 			}
 		})
-	}
-}
-
-func TestResolveProviderKey_Ollama_DefaultFallback(t *testing.T) {
-	clearEnv(t, "OLLAMA_HOST")
-	s := Settings{OllamaURL: ""}
-	url, src := ResolveProviderKey("ollama", s)
-	if url != "http://localhost:11434" {
-		t.Errorf("url=%q, want default localhost", url)
-	}
-	if src != KeySourceDefault {
-		t.Errorf("src=%q, want default", src)
-	}
-}
-
-func TestResolveProviderKey_Ollama_EnvOverride(t *testing.T) {
-	withEnv(t, "OLLAMA_HOST", "http://my-ollama:11434")
-	s := Settings{OllamaURL: ""}
-	url, src := ResolveProviderKey("ollama", s)
-	if url != "http://my-ollama:11434" {
-		t.Errorf("url=%q, want from-env value", url)
-	}
-	if src != KeySourceEnv {
-		t.Errorf("src=%q, want env", src)
-	}
-}
-
-func TestResolveProviderKey_Ollama_SettingWins(t *testing.T) {
-	withEnv(t, "OLLAMA_HOST", "http://from-env:11434")
-	s := Settings{OllamaURL: "http://from-setting:11434"}
-	url, src := ResolveProviderKey("ollama", s)
-	if url != "http://from-setting:11434" {
-		t.Errorf("url=%q, want from-setting value", url)
-	}
-	if src != KeySourceSetting {
-		t.Errorf("src=%q, want setting", src)
 	}
 }
 
@@ -164,12 +126,28 @@ func TestResolveProviderKey_TrimsWhitespace(t *testing.T) {
 	}
 }
 
+func TestGetProviderCredentialSources_ReturnsMetadataWithoutSecrets(t *testing.T) {
+	withEnv(t, "GLM_API_KEY", "env-glm-secret")
+	withEnv(t, "KIMI_API_KEY", "env-kimi-secret")
+	s := NewStudio()
+	s.config = defaultConfig()
+	s.config.Settings.GLMKey = "settings-glm-secret"
+
+	got := s.GetProviderCredentialSources()
+	if len(got) != 2 || got["glm"] != string(KeySourceSetting) || got["kimi"] != string(KeySourceEnv) {
+		t.Fatalf("credential sources = %#v, want glm=setting kimi=env", got)
+	}
+	for provider, source := range got {
+		if strings.Contains(source, "secret") {
+			t.Fatalf("credential source leaked secret for %s: %q", provider, source)
+		}
+	}
+}
+
 func TestEnvVarForProvider(t *testing.T) {
 	cases := map[string]string{
 		"glm":     "GLM_API_KEY",
-		"minimax": "MINIMAX_API_KEY",
 		"kimi":    "KIMI_API_KEY",
-		"ollama":  "OLLAMA_HOST",
 		"GLM":     "GLM_API_KEY", // case-insensitive
 		"  kimi ": "KIMI_API_KEY",
 		"":        "",
@@ -238,33 +216,5 @@ func TestCheckAPIKeys_EnvAndSettingBothMissingReportsError(t *testing.T) {
 	}
 	if !foundErr {
 		t.Errorf("no key anywhere should report error; got: %+v", d.Checks)
-	}
-}
-
-func TestCheckAPIKeys_OllamaEnvFallbackReportsOK(t *testing.T) {
-	_ = withTempHistoryDir(t)
-	withEnv(t, "OLLAMA_HOST", "http://my-ollama:11434")
-
-	s := NewStudio()
-	s.config = defaultConfig()
-	s.config.Settings.OllamaURL = ""
-	p, err := s.AddProject("P", t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := s.SetProjectProvider(p.ID, "ollama", "llama3.1"); err != nil {
-		t.Fatal(err)
-	}
-
-	d := s.GetDiagnostics()
-	foundOK := false
-	for _, c := range d.Checks {
-		if c.Category == "providers" && strings.Contains(c.Name, "Ollama") && c.Status == "ok" {
-			foundOK = true
-			break
-		}
-	}
-	if !foundOK {
-		t.Errorf("Ollama env-fallback should report OK; got: %+v", d.Checks)
 	}
 }

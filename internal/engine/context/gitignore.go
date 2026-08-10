@@ -11,6 +11,7 @@ var gokinGitignoreEntries = []string{
 	".gokin/.session-memory.md",
 	".gokin/task-output/",
 	".gokin/checkpoints/",
+	".gokin/computer-use/",
 	".gokin/learning.yaml",
 	"GOKIN.local.md",
 }

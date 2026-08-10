@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useId, useRef } from 'react'
 import { useProjectStore } from '../../stores/projectStore'
 import { useSettingsStore, Settings } from '../../stores/settingsStore'
 import { Dispatch } from '../../../wailsjs/go/studio/Studio'
@@ -17,9 +17,7 @@ function dispatchBlockerFor(provider: string, directoryOK: boolean | undefined, 
   if (directoryOK === false) return 'project directory missing'
   const keyFields: Record<string, keyof Settings> = {
     glm: 'glmKey',
-    minimax: 'minimaxKey',
     kimi: 'kimiKey',
-    deepseek: 'deepseekKey',
   }
   const keyField = keyFields[provider]
   if (keyField && !settings[keyField]) return 'no API key in settings'
@@ -31,10 +29,19 @@ export function DispatchModal({ fromProjectId, fromSessionId, onClose }: Dispatc
   const settings = useSettingsStore((s) => s.settings)
   const otherProjects = projects.filter((p) => p.id !== fromProjectId)
 
-  const [targetId, setTargetId] = useState(otherProjects[0]?.id || '')
+  const [targetId, setTargetId] = useState(
+    otherProjects.find((project) => !dispatchBlockerFor(project.provider || 'glm', project.directoryOK, settings))?.id ||
+    otherProjects[0]?.id || '',
+  )
   const [task, setTask] = useState('')
   const [sending, setSending] = useState(false)
   const [result, setResult] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const titleId = useId()
+  const taskId = useId()
+  const modalRef = useRef<HTMLDivElement>(null)
+  const returnFocusRef = useRef<HTMLElement | null>(
+    document.activeElement instanceof HTMLElement ? document.activeElement : null,
+  )
 
   // Close on Escape
   useEffect(() => {
@@ -43,7 +50,11 @@ export function DispatchModal({ fromProjectId, fromSessionId, onClose }: Dispatc
       if (e.key === 'Escape') onClose()
     }
     window.addEventListener('keydown', handleKey)
-    return () => window.removeEventListener('keydown', handleKey)
+    return () => {
+      window.removeEventListener('keydown', handleKey)
+      const target = returnFocusRef.current
+      requestAnimationFrame(() => { if (target?.isConnected) target.focus() })
+    }
   }, [onClose])
 
   const targetProject = otherProjects.find((p) => p.id === targetId)
@@ -70,11 +81,33 @@ export function DispatchModal({ fromProjectId, fromSessionId, onClose }: Dispatc
 
   return (
     <>
-      <div className="dispatch-backdrop" onClick={onClose} />
-      <div className="dispatch-modal">
+      <div className="dispatch-backdrop" onMouseDown={onClose} />
+      <div
+        ref={modalRef}
+        className="dispatch-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        onKeyDown={(event) => {
+          if (event.key !== 'Tab') return
+          const focusable = Array.from(modalRef.current?.querySelectorAll<HTMLElement>(
+            'button:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+          ) || [])
+          if (focusable.length === 0) return
+          const first = focusable[0]
+          const last = focusable[focusable.length - 1]
+          if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault()
+            last.focus()
+          } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault()
+            first.focus()
+          }
+        }}
+      >
         <div className="dispatch-header">
-          <h3>Dispatch Task</h3>
-          <button className="icon-btn" onClick={onClose} title="Close">
+          <h3 id={titleId}>Dispatch task</h3>
+          <button type="button" className="icon-btn" onClick={onClose} title="Close" aria-label="Close dispatch dialog">
             <X size={16} />
           </button>
         </div>
@@ -86,16 +119,19 @@ export function DispatchModal({ fromProjectId, fromSessionId, onClose }: Dispatc
         ) : (
           <>
             <div className="dispatch-field">
-              <label>Target Project</label>
-              <div className="dispatch-project-cards">
+              <div className="dispatch-field-label">Target project</div>
+              <div className="dispatch-project-cards" role="group" aria-label="Target project">
                 {otherProjects.map((p) => {
                   const blocker = dispatchBlockerFor(p.provider || 'glm', p.directoryOK, settings)
                   return (
-                    <div
+                    <button
+                      type="button"
                       key={p.id}
                       className={`dispatch-project-card ${targetId === p.id ? 'selected' : ''} ${blocker ? 'has-blocker' : ''}`}
                       onClick={() => setTargetId(p.id)}
                       title={blocker || undefined}
+                      aria-pressed={targetId === p.id}
+                      disabled={!!blocker || sending}
                     >
                       <div className="dispatch-project-card-radio">
                         <div className="dispatch-project-card-radio-inner" />
@@ -114,15 +150,16 @@ export function DispatchModal({ fromProjectId, fromSessionId, onClose }: Dispatc
                           {blocker && <span className="dispatch-card-blocker-text"> · {blocker}</span>}
                         </div>
                       </div>
-                    </div>
+                    </button>
                   )
                 })}
               </div>
             </div>
 
             <div className="dispatch-field">
-              <label>Task Description</label>
+              <label htmlFor={taskId}>Task description</label>
               <textarea
+                id={taskId}
                 value={task}
                 onChange={(e) => setTask(e.target.value)}
                 placeholder="Describe the task to dispatch..."
@@ -148,8 +185,9 @@ export function DispatchModal({ fromProjectId, fromSessionId, onClose }: Dispatc
 
             <div className="dispatch-actions">
               <span className="dispatch-hint">Ctrl/Cmd+Enter to send</span>
-              <button className="btn-secondary" onClick={onClose}>Cancel</button>
+              <button type="button" className="btn-secondary" onClick={onClose}>Cancel</button>
               <button
+                type="button"
                 className="btn-primary"
                 onClick={handleSend}
                 disabled={!targetId || !task.trim() || sending || !!targetBlocker}
@@ -163,7 +201,7 @@ export function DispatchModal({ fromProjectId, fromSessionId, onClose }: Dispatc
         )}
 
         {result && (
-          <div className={`dispatch-result ${result.type}`}>
+          <div className={`dispatch-result ${result.type}`} role="status" aria-live="polite">
             {result.text}
           </div>
         )}

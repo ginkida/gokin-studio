@@ -399,25 +399,37 @@ func equalFold(a, b string) bool {
 }
 
 // IsContextTooLongError returns true if the error indicates the request exceeded
-// the model's context window (HTTP 400 with context/token-related message).
+// the model's context window. Providers use either 400 with a context/token
+// message or 413 Payload Too Large for this condition.
 func IsContextTooLongError(err error) bool {
 	if err == nil {
 		return false
 	}
 	// Check typed HTTPError (Anthropic/GLM/DeepSeek)
 	var httpErr *HTTPError
-	if errors.As(err, &httpErr) && httpErr.StatusCode == 400 {
-		return messageIndicatesContextOverflow(strings.ToLower(httpErr.Message))
+	if errors.As(err, &httpErr) {
+		if httpErr.StatusCode == 413 {
+			return true
+		}
+		if httpErr.StatusCode == 400 {
+			return messageIndicatesContextOverflow(strings.ToLower(httpErr.Message))
+		}
 	}
 	// Check typed APIError (Gemini)
 	var apiErr *APIError
-	if errors.As(err, &apiErr) && apiErr.StatusCode == 400 {
-		return messageIndicatesContextOverflow(strings.ToLower(apiErr.Message))
+	if errors.As(err, &apiErr) {
+		if apiErr.StatusCode == 413 {
+			return true
+		}
+		if apiErr.StatusCode == 400 {
+			return messageIndicatesContextOverflow(strings.ToLower(apiErr.Message))
+		}
 	}
 	// String fallback for untyped errors
 	msg := strings.ToLower(err.Error())
-	return (strings.Contains(msg, "400") || strings.Contains(msg, "bad request")) &&
-		messageIndicatesContextOverflow(msg)
+	return strings.Contains(msg, "413") ||
+		((strings.Contains(msg, "400") || strings.Contains(msg, "bad request")) &&
+			messageIndicatesContextOverflow(msg))
 }
 
 // messageIndicatesContextOverflow reports whether a (lowercased) provider error

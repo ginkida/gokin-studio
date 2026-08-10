@@ -182,6 +182,7 @@ type ReadTool struct {
 	notebookReader *readers.NotebookReader
 	imageReader    *readers.ImageReader
 	pdfReader      *readers.PDFReader
+	officeReader   *readers.OfficeReader
 	workDir        string
 	pathValidator  *security.PathValidator
 	predictor      ContextPredictorInterface
@@ -197,6 +198,7 @@ func NewReadTool(workDir string) *ReadTool {
 		notebookReader: readers.NewNotebookReader(),
 		imageReader:    readers.NewImageReader(),
 		pdfReader:      readers.NewPDFReader(),
+		officeReader:   readers.NewOfficeReader(),
 	}
 	if workDir != "" {
 		t.pathValidator = security.NewPathValidator([]string{workDir}, false)
@@ -236,6 +238,7 @@ PARAMETERS:
 SUPPORTED FORMATS:
 - Text files: Returns content with line numbers (cat -n style)
 - PDF files (.pdf): Extracts and returns text content
+- Office files (.docx, .xlsx, .pptx): Extracts paragraphs, cells/formulas, and slide text
 - Images (.png, .jpg, .gif, etc.): Returns image metadata and can be analyzed
 - Jupyter notebooks (.ipynb): Returns all cells with outputs
 
@@ -347,6 +350,11 @@ func (t *ReadTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 			return NewErrorResult(fmt.Sprintf("PDF too large to read (%d bytes, max %d)", info.Size(), readPDFNotebookMaxBytes)), nil
 		}
 		return t.readPDF(filePath)
+	case ".docx", ".xlsx", ".pptx":
+		if info.Size() > readPDFNotebookMaxBytes {
+			return NewErrorResult(fmt.Sprintf("Office file too large to read (%d bytes, max %d)", info.Size(), readPDFNotebookMaxBytes)), nil
+		}
+		return t.readOffice(filePath, ext)
 	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico", ".tiff", ".tif":
 		if info.Size() > readImageMaxBytes {
 			return NewErrorResult(fmt.Sprintf("image too large to read (%d bytes, max %d)", info.Size(), readImageMaxBytes)), nil
@@ -379,6 +387,17 @@ func (t *ReadTool) Execute(ctx context.Context, args map[string]any) (ToolResult
 		}
 		return t.readText(ctx, filePath, args)
 	}
+}
+
+func (t *ReadTool) readOffice(filePath, ext string) (ToolResult, error) {
+	content, err := t.officeReader.Read(filePath)
+	if err != nil {
+		return NewErrorResult(fmt.Sprintf("error reading Office document: %s", err)), nil
+	}
+	return NewSuccessResultWithData(content, map[string]any{
+		"type":      strings.TrimPrefix(ext, "."),
+		"file_path": filePath,
+	}), nil
 }
 
 // readLargeFile reads a large file using chunked streaming.

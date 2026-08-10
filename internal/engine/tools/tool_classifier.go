@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"strings"
 	"time"
 
 	"google.golang.org/genai"
@@ -44,20 +45,26 @@ type toolGroup struct {
 
 var defaultClassifier = &toolDependencyClassifier{
 	writeTools: map[string]bool{
-		"write":       true,
-		"edit":        true,
-		"bash":        true,
-		"delete":      true,
-		"move":        true,
-		"copy":        true,
-		"mkdir":       true,
-		"git_commit":  true,
-		"git_add":     true,
-		"ssh":         true,
-		"run_tests":   true,
-		"batch":       true,
-		"refactor":    true,
-		"atomicwrite": true,
+		"write":            true,
+		"edit":             true,
+		"bash":             true,
+		"delete":           true,
+		"move":             true,
+		"copy":             true,
+		"mkdir":            true,
+		"git_commit":       true,
+		"git_add":          true,
+		"ssh":              true,
+		"run_tests":        true,
+		"batch":            true,
+		"refactor":         true,
+		"atomicwrite":      true,
+		"document_create":  true,
+		"plugin_agent":     true,
+		"scheduled_task":   true,
+		"preview_browser":  true,
+		"external_browser": true,
+		"session_agent":    true,
 	},
 }
 
@@ -67,6 +74,87 @@ var defaultClassifier = &toolDependencyClassifier{
 // callers — prevents drift where sub-systems each maintain their own list.
 func IsWriteTool(name string) bool {
 	return defaultClassifier.writeTools[name]
+}
+
+// RequiresUserApproval classifies operations that may mutate user files,
+// repositories, processes, or external systems. It is intentionally separate
+// from IsWriteTool: dependency serialization includes run_tests, while the
+// permission gate should allow tests and read-only git subcommands.
+func RequiresUserApproval(name string, args map[string]any) bool {
+	if strings.HasPrefix(name, "mcp_") {
+		return true // remote tools have unknown effects
+	}
+	switch name {
+	case "computer_screenshot", "computer_action":
+		return true // screen contents are sensitive even though capture is read-only
+	case "preview_browser":
+		return false // constrained to the active loopback preview origin
+	case "external_browser":
+		action, _ := args["action"].(string)
+		return !strings.EqualFold(strings.TrimSpace(action), "list")
+	case "session_agent":
+		// Listing and reading are bounded and attributed. Everything else
+		// crosses into another chat: "send" starts a full tool-enabled turn
+		// there under THAT session's permission mode, "archive" changes the
+		// user's visible catalog, "rename" edits it. The weaker one-shot
+		// ask_agent is already gated below, so these must be too. "suggest"
+		// only offers a chip the user must click, so it stays ungated.
+		action, _ := args["action"].(string)
+		switch strings.ToLower(strings.TrimSpace(action)) {
+		case "send", "rename", "archive":
+			return true
+		}
+		return false
+	case "write", "edit", "document_create", "delete", "move", "copy", "mkdir",
+		"git_add", "git_commit", "bash", "ssh", "refactor", "atomicwrite",
+		"kill_shell", "task_stop", "ask_agent":
+		return true
+	case "plugin_agent":
+		return true
+	case "scheduled_task":
+		action, _ := args["action"].(string)
+		return strings.ToLower(strings.TrimSpace(action)) != "list"
+	case "batch":
+		dryRun, _ := args["dry_run"].(bool)
+		return !dryRun
+	case "git_branch":
+		action, _ := args["action"].(string)
+		return action != "list" && action != "current"
+	case "git_pr":
+		action, _ := args["action"].(string)
+		return action != "list" && action != "view" && action != "checks"
+	case "task":
+		kind, _ := args["subagent_type"].(string)
+		return kind != "explore" && kind != "plan" && kind != "claude-code-guide"
+	case "coordinate":
+		tasks, ok := args["tasks"].([]any)
+		if !ok || len(tasks) == 0 {
+			return true
+		}
+		for _, raw := range tasks {
+			task, ok := raw.(map[string]any)
+			if !ok {
+				return true
+			}
+			kind, _ := task["agent_type"].(string)
+			if kind != "explore" && kind != "plan" {
+				return true
+			}
+		}
+		return false
+	case "read", "glob", "grep", "list_dir", "tree", "diff",
+		"git_status", "git_diff", "git_log", "git_blame",
+		"web_fetch", "web_search", "run_tests", "check_impact", "verify_code", "review_changes", "submit_code_review",
+		"go_to_definition", "find_references", "env", "task_output",
+		"ask_user", "todo", "tools_list", "request_tool",
+		"plugin_resource",
+		"search_session_transcripts",
+		"memory", "memorize", "pin_context", "history_search", "shared_memory", "update_scratchpad",
+		"enter_plan_mode", "update_plan_progress", "get_plan_status", "exit_plan_mode":
+		return false
+	default:
+		return true // fail closed for newly-added or dynamically-requested tools
+	}
 }
 
 // ExtractFilePaths returns the file paths referenced by a tool call based on

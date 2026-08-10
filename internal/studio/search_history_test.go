@@ -1,8 +1,12 @@
 package studio
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"testing"
+	"unicode/utf16"
+	"unicode/utf8"
 
 	"google.golang.org/genai"
 )
@@ -56,6 +60,7 @@ func TestSearchProjectHistory_FindsAcrossSessions(t *testing.T) {
 	// Session A — single hit on "rabbit"
 	sessA := p.sessions["default"]
 	sessA.Name = "Session A"
+	sessA.lastUsedAt = 100
 	sessA.history = []*genai.Content{
 		{Role: "user", Parts: []*genai.Part{genai.NewPartFromText("hello world")}},
 		{Role: "model", Parts: []*genai.Part{genai.NewPartFromText("the quick brown rabbit jumps")}},
@@ -67,6 +72,7 @@ func TestSearchProjectHistory_FindsAcrossSessions(t *testing.T) {
 		t.Fatalf("CreateChatSession: %v", err)
 	}
 	p.sessions[sessB.ID].Name = "Session B"
+	p.sessions[sessB.ID].lastUsedAt = 200
 	p.sessions[sessB.ID].history = []*genai.Content{
 		{Role: "user", Parts: []*genai.Part{genai.NewPartFromText("a cat is not a rabbit")}},
 	}
@@ -79,7 +85,10 @@ func TestSearchProjectHistory_FindsAcrossSessions(t *testing.T) {
 		t.Fatalf("got %d hits, want 2", len(hits))
 	}
 
-	// Both sessions should appear; map iteration order is random.
+	// Both sessions should appear, with the most recently used session first.
+	if hits[0].SessionID != sessB.ID {
+		t.Errorf("first hit session = %q, want most recent %q", hits[0].SessionID, sessB.ID)
+	}
 	bySession := map[string]SearchHit{}
 	for _, h := range hits {
 		bySession[h.SessionID] = h
@@ -212,12 +221,37 @@ func TestSearchProjectHistory_SnippetTrimsLongText(t *testing.T) {
 	if !strings.Contains(h.Snippet, "RABBIT") {
 		t.Error("snippet missing the matched substring")
 	}
-	// MatchOffset is byte-indexed; verify it aligns with the start of "RABBIT".
-	if h.MatchOffset < 0 || h.MatchOffset >= len(h.Snippet) {
-		t.Errorf("matchOffset %d out of range [0,%d)", h.MatchOffset, len(h.Snippet))
+	// ASCII has identical byte and UTF-16 indexes; verify the reported offset
+	// aligns with the start of "RABBIT".
+	units := utf16.Encode([]rune(h.Snippet))
+	if h.MatchOffset < 0 || h.MatchOffset >= len(units) {
+		t.Errorf("matchOffset %d out of UTF-16 range [0,%d)", h.MatchOffset, len(units))
 	}
-	if h.Snippet[h.MatchOffset] != 'R' {
-		t.Errorf("snippet[matchOffset] = %q, want 'R'", string(h.Snippet[h.MatchOffset]))
+	if got := string(utf16.Decode(units[h.MatchOffset : h.MatchOffset+1])); got != "R" {
+		t.Errorf("snippet at UTF-16 matchOffset = %q, want 'R'", got)
+	}
+}
+
+func TestSearchProjectHistoryUnicodeSnippetUsesUTF16Offset(t *testing.T) {
+	s := newStudioForTest(t)
+	info := addTestProject(t, s, "Unicode")
+	p := projectFromInfo(t, s, info)
+	prefix := "🙂🙂 Привет — "
+	body := prefix + "КОТ" + " сидит у окна"
+	p.sessions["default"].history = []*genai.Content{
+		{Role: "user", Parts: []*genai.Part{genai.NewPartFromText(body)}},
+	}
+	hits, err := s.SearchProjectHistory(info.ID, "кот")
+	if err != nil || len(hits) != 1 {
+		t.Fatalf("unicode search = %#v, %v", hits, err)
+	}
+	hit := hits[0]
+	if !utf8.ValidString(hit.Snippet) {
+		t.Fatalf("snippet split UTF-8: %q", hit.Snippet)
+	}
+	wantOffset := len(utf16.Encode([]rune(prefix)))
+	if hit.MatchOffset != wantOffset {
+		t.Fatalf("UTF-16 match offset = %d, want %d for %q", hit.MatchOffset, wantOffset, hit.Snippet)
 	}
 }
 
@@ -231,6 +265,9 @@ func TestSearchProjectHistory_MessageIdxMatchesGetHistory(t *testing.T) {
 	p.sessions["default"].history = []*genai.Content{
 		{Role: "user", Parts: []*genai.Part{genai.NewPartFromText("first user")}},
 		{Role: "model", Parts: []*genai.Part{genai.NewPartFromText("first reply")}},
+		// Attachment-only turns remain visible in GetHistory and therefore must
+		// advance the search index even though they cannot match a text query.
+		{Role: "user", Parts: []*genai.Part{{InlineData: &genai.Blob{MIMEType: "image/png", Data: []byte{1, 2, 3}}}}},
 		// Function-response turn: filtered out of GetHistory AND skipped by
 		// SearchProjectHistory's filteredIdx counter.
 		{Role: "user", Parts: []*genai.Part{genai.NewPartFromFunctionResponse("tool", map[string]any{"r": "x"})}},
@@ -254,5 +291,9 @@ func TestSearchProjectHistory_MessageIdxMatchesGetHistory(t *testing.T) {
 	}
 	if !strings.Contains(msgs[hits[0].MessageIdx].Content, "RABBIT") {
 		t.Errorf("hit pointed to wrong message: %q", msgs[hits[0].MessageIdx].Content)
+	}
+	digest := sha256.Sum256([]byte("user\x00" + msgs[hits[0].MessageIdx].Content))
+	if want := hex.EncodeToString(digest[:]); hits[0].MessageHash != want {
+		t.Errorf("messageHash = %q, want %q", hits[0].MessageHash, want)
 	}
 }

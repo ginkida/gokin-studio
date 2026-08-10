@@ -2,6 +2,7 @@ package studio
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"os"
@@ -88,15 +89,14 @@ func (l *EventLog) LoadFromDisk(path string) error {
 	if strings.TrimSpace(path) == "" {
 		return errors.New("empty path")
 	}
-	f, err := os.Open(path)
+	data, err := readRegularFileLimited(path, EventLogDiskMaxBytes+65536)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil // not having a log file yet is fine
 		}
 		return err
 	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
+	sc := bufio.NewScanner(bytes.NewReader(data))
 	// Allow lines up to 64 KB — events are normally <2 KB but be tolerant.
 	sc.Buffer(make([]byte, 4096), 65536)
 	for sc.Scan() {
@@ -170,7 +170,7 @@ func (l *EventLog) persistEntry(e EventLogEntry) {
 	if err != nil {
 		return
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	f, err := openRegularFileAppend(path, 0o600)
 	if err != nil {
 		return
 	}
@@ -189,7 +189,10 @@ func (l *EventLog) persistEntry(e EventLogEntry) {
 // is the simplest correct way to bound the file: read everything, split,
 // rewrite. For 1 MB files this is fast enough to run inline.
 func (l *EventLog) rotateLocked(path string) error {
-	data, err := os.ReadFile(path)
+	// Rotation may be triggered on a legacy file produced before source/message
+	// caps existed, so allow a bounded 2x recovery window while still refusing
+	// arbitrarily large external files.
+	data, err := readRegularFileLimited(path, 2*EventLogDiskMaxBytes)
 	if err != nil {
 		return err
 	}
@@ -198,17 +201,25 @@ func (l *EventLog) rotateLocked(path string) error {
 	if len(lines) > 0 && lines[len(lines)-1] == "" {
 		lines = lines[:len(lines)-1]
 	}
-	if len(lines) <= 1 {
-		return nil // nothing to rotate
+	// Keep the newest complete lines that fit in half the normal budget. Using
+	// bytes rather than line count also repairs legacy files containing one
+	// abnormally large event instead of leaving them permanently oversized.
+	target := EventLogDiskMaxBytes / 2
+	keepFrom := len(lines)
+	keptBytes := 0
+	for keepFrom > 0 {
+		lineBytes := len(lines[keepFrom-1]) + 1
+		if keptBytes+lineBytes > target {
+			break
+		}
+		keepFrom--
+		keptBytes += lineBytes
 	}
-	keepFrom := len(lines) / 2
 	kept := lines[keepFrom:]
-	// Atomic-ish rewrite via tmp + rename.
-	tmp := path + ".rot"
-	if err := os.WriteFile(tmp, []byte(strings.Join(kept, "\n")+"\n"), 0o600); err != nil {
-		return err
+	if len(kept) == 0 {
+		return atomicWriteFile(path, nil, 0o600)
 	}
-	return os.Rename(tmp, path)
+	return atomicWriteFile(path, []byte(strings.Join(kept, "\n")+"\n"), 0o600)
 }
 
 // ClearDisk removes the persistence file. Called by EventLog.Clear so the

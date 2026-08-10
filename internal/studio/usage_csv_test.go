@@ -102,11 +102,11 @@ func TestExportProjectUsageCSV_NeverUsedSession(t *testing.T) {
 // TestFmtCurrency confirms the helper formats with 4 decimals.
 func TestFmtCurrency(t *testing.T) {
 	cases := map[float64]string{
-		0:        "0.0000",
-		0.1234:   "0.1234",
-		12.5:     "12.5000",
-		1.23456:  "1.2346", // rounds to 4 decimals
-		100:      "100.0000",
+		0:       "0.0000",
+		0.1234:  "0.1234",
+		12.5:    "12.5000",
+		1.23456: "1.2346", // rounds to 4 decimals
+		100:     "100.0000",
 	}
 	for in, want := range cases {
 		if got := fmtCurrency(in); got != want {

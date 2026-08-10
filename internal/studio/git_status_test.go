@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -285,6 +286,39 @@ func TestRunGit_MissingBinaryNoPanic(t *testing.T) {
 	got := runGit(t.TempDir(), "rev-parse", "--show-toplevel")
 	if got != "" {
 		t.Errorf("expected empty result when git is missing, got %q", got)
+	}
+}
+
+func TestRunGitTimeoutWaitsForAndReapsCommand(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test helper uses a POSIX shell script")
+	}
+	bin := t.TempDir()
+	gitPath := filepath.Join(bin, "git")
+	if err := os.WriteFile(gitPath, []byte("#!/bin/sh\nsleep 10\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+
+	started := time.Now()
+	if got := runGitWithTimeout(t.TempDir(), 50*time.Millisecond, "status"); got != "" {
+		t.Fatalf("timed-out command returned output %q", got)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("timeout took %v; child pipes were not closed promptly", elapsed)
+	}
+}
+
+func TestCappedCommandOutputDrainsWithoutGrowing(t *testing.T) {
+	b := &cappedCommandOutput{limit: 5}
+	for _, chunk := range []string{"abc", "def", "ghijkl"} {
+		n, err := b.Write([]byte(chunk))
+		if err != nil || n != len(chunk) {
+			t.Fatalf("Write(%q) = (%d, %v), want (%d, nil)", chunk, n, err, len(chunk))
+		}
+	}
+	if got := b.String(); got != "abcde" {
+		t.Fatalf("bounded output = %q, want %q", got, "abcde")
 	}
 }
 

@@ -8,17 +8,16 @@ import (
 	"google.golang.org/genai"
 )
 
-// TestUpdateSettings_TrimsKeyWhitespace verifies that API keys and URLs with
-// surrounding whitespace (a common clipboard-paste mistake) are stored trimmed.
-func TestUpdateSettings_TrimsKeyWhitespace(t *testing.T) {
+// TestUpdateSettings_TrimsSupportedKeysAndClearsLegacy verifies that current
+// credentials are normalized and credentials outside the product contract are
+// not retained.
+func TestUpdateSettings_TrimsSupportedKeysAndClearsLegacy(t *testing.T) {
 	s := newStudioForTest(t)
 
 	cfg := StudioConfig{
 		Settings: Settings{
-			GLMKey:     "  myglmkey  ",
-			MiniMaxKey: "\tmyminimaxkey\n",
-			KimiKey:    " mykimikey ",
-			OllamaURL:  " http://localhost:11434 ",
+			GLMKey:  "  myglmkey  ",
+			KimiKey: " mykimikey ",
 		},
 	}
 	if err := s.UpdateSettings(cfg); err != nil {
@@ -28,14 +27,21 @@ func TestUpdateSettings_TrimsKeyWhitespace(t *testing.T) {
 	if got.GLMKey != "myglmkey" {
 		t.Errorf("GLMKey = %q, want 'myglmkey'", got.GLMKey)
 	}
-	if got.MiniMaxKey != "myminimaxkey" {
-		t.Errorf("MiniMaxKey = %q, want 'myminimaxkey'", got.MiniMaxKey)
-	}
 	if got.KimiKey != "mykimikey" {
 		t.Errorf("KimiKey = %q, want 'mykimikey'", got.KimiKey)
 	}
-	if got.OllamaURL != "http://localhost:11434" {
-		t.Errorf("OllamaURL = %q, want 'http://localhost:11434'", got.OllamaURL)
+}
+
+func TestUpdateSettings_RejectsUnsupportedProviderOrModel(t *testing.T) {
+	s := newStudioForTest(t)
+	for _, settings := range []Settings{
+		{DefaultProvider: "deepseek", DefaultModel: "deepseek-v4-pro"},
+		{DefaultProvider: "glm", DefaultModel: "glm-6-unknown"},
+		{DefaultProvider: "kimi", DefaultModel: "moonshot-v1-auto"},
+	} {
+		if err := s.UpdateSettings(StudioConfig{Settings: settings}); err == nil {
+			t.Errorf("UpdateSettings(%s/%s) unexpectedly succeeded", settings.DefaultProvider, settings.DefaultModel)
+		}
 	}
 }
 
@@ -63,11 +69,13 @@ func TestUpdateSettings_PersistsSettings(t *testing.T) {
 
 	cfg := StudioConfig{
 		Settings: Settings{
-			Theme:                 "light",
-			DefaultProvider:       "kimi",
-			DefaultModel:          "kimi-for-coding",
-			DefaultThinkingMode:   "enabled",
-			DefaultThinkingBudget: 4096,
+			Theme:                   "light",
+			DefaultProvider:         "kimi",
+			DefaultModel:            "kimi-for-coding",
+			GlobalInstructions:      "Answer concisely and cite project evidence.",
+			DefaultThinkingMode:     "enabled",
+			DefaultThinkingBudget:   4096,
+			AutoArchivePRAfterClose: true,
 		},
 	}
 	if err := s.UpdateSettings(cfg); err != nil {
@@ -85,6 +93,31 @@ func TestUpdateSettings_PersistsSettings(t *testing.T) {
 	}
 	if got.DefaultThinkingBudget != 4096 {
 		t.Errorf("DefaultThinkingBudget = %d, want 4096", got.DefaultThinkingBudget)
+	}
+	if got.GlobalInstructions != "Answer concisely and cite project evidence." {
+		t.Errorf("GlobalInstructions = %q", got.GlobalInstructions)
+	}
+	if !got.AutoArchivePRAfterClose {
+		t.Error("AutoArchivePRAfterClose was not persisted")
+	}
+}
+
+func TestUpdateSettings_GlobalInstructionsUTF8AndLimit(t *testing.T) {
+	s := newStudioForTest(t)
+	if err := s.UpdateSettings(StudioConfig{Settings: Settings{
+		GlobalInstructions: string([]byte{0xff}),
+	}}); err == nil {
+		t.Fatal("invalid UTF-8 global instructions were accepted")
+	}
+	input := strings.Repeat("🙂", GlobalInstructionsMaxBytes)
+	if err := s.UpdateSettings(StudioConfig{Settings: Settings{
+		GlobalInstructions: input,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	got := s.GetSettings().Settings.GlobalInstructions
+	if len(got) > GlobalInstructionsMaxBytes || !strings.HasPrefix(input, got) {
+		t.Fatalf("global instructions were not safely truncated: %d bytes", len(got))
 	}
 }
 
@@ -112,6 +145,32 @@ func TestUpdateSettings_InvalidatesClientCache(t *testing.T) {
 	p.mu.RUnlock()
 	if c != nil {
 		t.Error("expected p.client to be nil after UpdateSettings, but it is non-nil")
+	}
+}
+
+// TestUpdateSettings_DefaultIsCreationOnly protects the Settings UX contract:
+// changing the global default must not silently rewrite existing workspaces.
+// An explicit bulk migration, if offered by a future UI, is a separate action.
+func TestUpdateSettings_DefaultIsCreationOnly(t *testing.T) {
+	s := newStudioForTest(t)
+	info := addTestProject(t, s, "Existing")
+	if err := s.SetProjectProvider(info.ID, "glm", "glm-4.7"); err != nil {
+		t.Fatalf("SetProjectProvider: %v", err)
+	}
+
+	if err := s.UpdateSettings(StudioConfig{Settings: Settings{
+		DefaultProvider: "kimi",
+		DefaultModel:    "k3",
+	}}); err != nil {
+		t.Fatalf("UpdateSettings: %v", err)
+	}
+
+	project, err := s.GetProject(info.ID)
+	if err != nil {
+		t.Fatalf("GetProject: %v", err)
+	}
+	if project.Provider != "glm" || project.Model != "glm-4.7" {
+		t.Fatalf("existing project changed to %s/%s; want glm/glm-4.7", project.Provider, project.Model)
 	}
 }
 
@@ -207,6 +266,36 @@ func TestCreateChatSession_UnknownProject(t *testing.T) {
 	s := newStudioForTest(t)
 	if _, err := s.CreateChatSession("no-such-project"); err == nil {
 		t.Error("expected error for unknown project, got nil")
+	}
+}
+
+func TestCreateChatSession_PersistenceFailureIsNotPublished(t *testing.T) {
+	s := newStudioForTest(t)
+	info := addTestProject(t, s, "Durable Session")
+	before, err := s.ListChatSessions(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blockedConfigDir := t.TempDir() + "/not-a-directory"
+	if err := os.WriteFile(blockedConfigDir, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	previous := os.Getenv("GOKIN_CONFIG_DIR")
+	if err := os.Setenv("GOKIN_CONFIG_DIR", blockedConfigDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Setenv("GOKIN_CONFIG_DIR", previous) })
+
+	if created, err := s.CreateChatSession(info.ID); err == nil || created != nil {
+		t.Fatalf("CreateChatSession() = %#v, %v; want durable-save error", created, err)
+	}
+	after, err := s.ListChatSessions(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("failed session was published in memory: before=%d after=%d", len(before), len(after))
 	}
 }
 

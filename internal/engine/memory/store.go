@@ -80,6 +80,88 @@ func NewStore(configDir, projectPath string, maxEntries int) (*Store, error) {
 	return store, nil
 }
 
+// CloneProjectMemory copies the path-keyed project memory namespace to a new
+// workspace path. Project registration has a stable ID, but the memory engine
+// predates it and hashes the workspace path; without this migration, moving a
+// connected folder would make every saved project memory disappear after the
+// next restart. The source files are intentionally retained as a recoverable
+// backup. Existing destination entries are merged and the current source wins
+// on an ID collision.
+func CloneProjectMemory(configDir, oldProjectPath, newProjectPath string) error {
+	oldHash := hashPath(oldProjectPath)
+	newHash := hashPath(newProjectPath)
+	if oldHash == newHash {
+		return nil
+	}
+	memDir := filepath.Join(configDir, "memory")
+	if err := os.MkdirAll(memDir, 0755); err != nil {
+		return fmt.Errorf("create memory directory: %w", err)
+	}
+	for _, suffix := range []string{".json", ".archive.json"} {
+		sourcePath := filepath.Join(memDir, oldHash+suffix)
+		targetPath := filepath.Join(memDir, newHash+suffix)
+		source, sourceExists, err := readMemoryEntriesForClone(sourcePath)
+		if err != nil {
+			return fmt.Errorf("read source memory %s: %w", filepath.Base(sourcePath), err)
+		}
+		if !sourceExists {
+			continue
+		}
+		target, _, err := readMemoryEntriesForClone(targetPath)
+		if err != nil {
+			return fmt.Errorf("read destination memory %s: %w", filepath.Base(targetPath), err)
+		}
+		merged := make(map[string]*Entry, len(source)+len(target))
+		for _, entry := range target {
+			if entry != nil {
+				merged[entry.ID] = entry
+			}
+		}
+		for _, entry := range source {
+			if entry != nil {
+				merged[entry.ID] = entry
+			}
+		}
+		entries := make([]*Entry, 0, len(merged))
+		for _, entry := range merged {
+			copy := copyEntry(entry)
+			if copy.Type != MemoryGlobal {
+				copy.Project = newHash
+			}
+			entries = append(entries, copy)
+		}
+		sort.Slice(entries, func(i, j int) bool {
+			if entries[i].Timestamp.Equal(entries[j].Timestamp) {
+				return entries[i].ID < entries[j].ID
+			}
+			return entries[i].Timestamp.Before(entries[j].Timestamp)
+		})
+		data, err := json.MarshalIndent(entries, "", "  ")
+		if err != nil {
+			return fmt.Errorf("encode cloned memory: %w", err)
+		}
+		if err := fileutil.AtomicWrite(targetPath, data, 0644); err != nil {
+			return fmt.Errorf("write cloned memory: %w", err)
+		}
+	}
+	return nil
+}
+
+func readMemoryEntriesForClone(path string) ([]*Entry, bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	var entries []*Entry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, true, err
+	}
+	return entries, true, nil
+}
+
 // markDirty marks the store as dirty and invalidates the GetForContext cache.
 // Must be called under s.mu.Lock().
 func (s *Store) markDirty() {

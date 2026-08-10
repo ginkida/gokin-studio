@@ -49,6 +49,7 @@ type GeminiOAuthClient struct {
 
 	statusCallback    StatusCallback
 	systemInstruction string
+	turnContext       string
 	thinkingBudget    int32
 	reasoningEffort   string
 
@@ -424,8 +425,11 @@ func (c *GeminiOAuthClient) SetSystemInstruction(instruction string) {
 	c.systemInstruction = instruction
 }
 
-// SetTurnContext is a no-op for GeminiOAuthClient (turn context not supported on this provider).
-func (c *GeminiOAuthClient) SetTurnContext(_ string) {}
+func (c *GeminiOAuthClient) SetTurnContext(turnContext string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.turnContext = turnContext
+}
 
 // SetThinkingBudget configures the thinking/reasoning budget.
 func (c *GeminiOAuthClient) SetThinkingBudget(budget int32) {
@@ -553,6 +557,7 @@ func (c *GeminiOAuthClient) WithModel(modelName string) Client {
 		streamIdleTimeout: c.streamIdleTimeout,
 		statusCallback:    c.statusCallback,
 		systemInstruction: c.systemInstruction,
+		turnContext:       c.turnContext,
 		thinkingBudget:    c.thinkingBudget,
 		reasoningEffort:   c.reasoningEffort,
 		refreshGroup:      c.refreshGroup, // share to serialize refreshes across clones
@@ -646,6 +651,10 @@ func (c *GeminiOAuthClient) ensureValidToken(ctx context.Context) error {
 
 // generateContentStream handles the streaming content generation
 func (c *GeminiOAuthClient) generateContentStream(ctx context.Context, contents []*genai.Content) (*StreamingResponse, error) {
+	c.mu.RLock()
+	turnContext := c.turnContext
+	c.mu.RUnlock()
+	contents = appendTurnContextToContents(contents, turnContext)
 	contents = sanitizeContents(contents)
 
 	var lastErr error

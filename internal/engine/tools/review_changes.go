@@ -75,9 +75,7 @@ const (
 // be resolved back to files when workDir is a subdirectory of the repo root.
 func (t *ReviewChangesTool) gitReviewCmd(ctx context.Context, args ...string) *exec.Cmd {
 	full := append([]string{"-c", "core.quotepath=off"}, args...)
-	cmd := exec.CommandContext(ctx, "git", full...)
-	cmd.Dir = t.workDir
-	return cmd
+	return newGitCommand(ctx, t.workDir, full...)
 }
 
 func (t *ReviewChangesTool) Execute(ctx context.Context, args map[string]any) (ToolResult, error) {

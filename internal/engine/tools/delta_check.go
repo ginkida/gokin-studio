@@ -25,6 +25,7 @@ import (
 	"google.golang.org/genai"
 
 	"github.com/ginkida/gokin-studio/internal/engine/logging"
+	"github.com/ginkida/gokin-studio/internal/engine/security"
 )
 
 const (
@@ -271,6 +272,18 @@ func (e *Executor) runDeltaCheck(ctx context.Context) deltaCheckResult {
 		e.commitDeltaCheckResult(result, warnOnly)
 		return result
 	}
+	isolation := security.DetectWorkspaceIsolation()
+	if !isolation.Available {
+		result := deltaCheckResult{
+			Ran:     false,
+			Passed:  true,
+			Skipped: len(commands),
+			Summary: "delta-check skipped: workspace isolation is unavailable",
+			Details: isolation.Detail,
+		}
+		e.commitDeltaCheckResult(result, warnOnly)
+		return result
+	}
 
 	hash := hashDeltaCheckState(changed, commands, hashSeed)
 	if hasCached && hash == lastHash {
@@ -286,8 +299,26 @@ func (e *Executor) runDeltaCheck(ctx context.Context) deltaCheckResult {
 	failures := make([]string, 0)
 	for _, check := range commands {
 		runCtx, cancel := context.WithTimeout(ctx, timeout)
-		cmd := exec.CommandContext(runCtx, check.Command, check.Args...)
-		cmd.Dir = check.Dir
+		isolated, sandboxErr := security.NewSandboxedCommandArgs(
+			runCtx,
+			check.Dir,
+			check.Command,
+			check.Args,
+			security.DefaultSandboxConfig(),
+		)
+		if sandboxErr != nil {
+			cancel()
+			result.Failed++
+			result.Passed = false
+			failures = append(failures, fmt.Sprintf(
+				"%s in %s could not start in workspace sandbox: %s",
+				check.Display,
+				check.Dir,
+				trimDeltaOutput(sandboxErr.Error(), 500),
+			))
+			continue
+		}
+		cmd := isolated.Command()
 		output, err := cmd.CombinedOutput()
 		cancel()
 
@@ -412,12 +443,30 @@ func deltaGitStatusPaths(ctx context.Context, workDir string) (map[string]struct
 		return paths, "", false
 	}
 
-	if out, err := exec.CommandContext(ctx, "git", "-C", workDir, "rev-parse", "--is-inside-work-tree").CombinedOutput(); err != nil ||
+	isolation := security.DetectWorkspaceIsolation()
+	if !isolation.Available {
+		return paths, "", false
+	}
+	runGit := func(args ...string) ([]byte, error) {
+		isolated, err := security.NewSandboxedCommandArgs(
+			ctx,
+			workDir,
+			"git",
+			append([]string{"-c", "core.hooksPath=/dev/null", "-C", workDir}, args...),
+			security.DefaultSandboxConfig(),
+		)
+		if err != nil {
+			return nil, err
+		}
+		return isolated.Command().CombinedOutput()
+	}
+
+	if out, err := runGit("rev-parse", "--is-inside-work-tree"); err != nil ||
 		!strings.EqualFold(strings.TrimSpace(string(out)), "true") {
 		return paths, "", false
 	}
 
-	out, err := exec.CommandContext(ctx, "git", "-C", workDir, "status", "--porcelain", "--untracked-files=all").CombinedOutput()
+	out, err := runGit("status", "--porcelain", "--untracked-files=all")
 	if err != nil {
 		return paths, "", false
 	}

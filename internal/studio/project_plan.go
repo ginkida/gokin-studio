@@ -1,6 +1,10 @@
 package studio
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/ginkida/gokin-studio/internal/engine/plan"
+)
 
 // ProjectPlanStep is one step of the active plan, projected for the frontend.
 type ProjectPlanStep struct {
@@ -38,8 +42,26 @@ func (s *Studio) GetProjectPlan(projectID string) (*ProjectPlanInfo, error) {
 	p.mu.RLock()
 	mgr := p.planManager
 	p.mu.RUnlock()
+	return projectPlanInfo(mgr), nil
+}
+
+// GetSessionPlan reports plan-mode progress for the selected conversation.
+// Sessions own independent plan managers just as they own independent tools
+// and worktrees.
+func (s *Studio) GetSessionPlan(projectID, sessionID string) (*ProjectPlanInfo, error) {
+	_, session, err := s.projectSession(projectID, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	session.mu.RLock()
+	mgr := session.planManager
+	session.mu.RUnlock()
+	return projectPlanInfo(mgr), nil
+}
+
+func projectPlanInfo(mgr *plan.Manager) *ProjectPlanInfo {
 	if mgr == nil {
-		return &ProjectPlanInfo{Active: false}, nil
+		return &ProjectPlanInfo{Active: false}
 	}
 	// Use GetCurrentPlan rather than IsActive: a fully-completed plan is no
 	// longer "active" but we still want the panel to show its Goal + the
@@ -47,7 +69,7 @@ func (s *Studio) GetProjectPlan(projectID string) (*ProjectPlanInfo, error) {
 	// plan goes away only when ClearPlan/exit_plan_mode nils currentPlan.
 	pl := mgr.GetCurrentPlan()
 	if pl == nil {
-		return &ProjectPlanInfo{Active: false}, nil
+		return &ProjectPlanInfo{Active: false}
 	}
 
 	current, total, _ := mgr.GetProgress()
@@ -78,5 +100,5 @@ func (s *Studio) GetProjectPlan(projectID string) (*ProjectPlanInfo, error) {
 	default:
 		info.Status = "in_progress"
 	}
-	return info, nil
+	return info
 }

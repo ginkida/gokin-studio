@@ -65,7 +65,27 @@ func (s *Studio) ListProjectFiles(projectID string) ([]string, error) {
 	if !ok {
 		return nil, fmt.Errorf("project not found: %s", projectID)
 	}
+	p.mu.RLock()
 	root := p.Directory
+	p.mu.RUnlock()
+	return listProjectFilesAt(root)
+}
+
+// ListSessionFiles backs the chat composer's @path autocomplete with the
+// active session checkout instead of the shared project root.
+func (s *Studio) ListSessionFiles(projectID, sessionID string) ([]string, error) {
+	p, session, err := s.projectSession(projectID, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	root, err := sessionWorkingDirectory(p, session)
+	if err != nil {
+		return nil, err
+	}
+	return listProjectFilesAt(root)
+}
+
+func listProjectFilesAt(root string) ([]string, error) {
 	if root == "" {
 		return []string{}, nil
 	}
@@ -94,6 +114,16 @@ func (s *Studio) ListProjectFiles(projectID string) ([]string, error) {
 			if noiseDirNames[name] || strings.HasPrefix(name, ".") {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		// Never suggest symlinks or special files. Symlinks can point outside
+		// the workspace, while FIFOs/devices/sockets are not meaningful text
+		// attachments and may block when opened.
+		if d.Type()&fs.ModeSymlink != 0 {
+			return nil
+		}
+		entryInfo, infoErr := d.Info()
+		if infoErr != nil || !entryInfo.Mode().IsRegular() {
 			return nil
 		}
 		// Regular file: emit relative path.

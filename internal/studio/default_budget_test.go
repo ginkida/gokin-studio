@@ -50,7 +50,6 @@ func TestUpdateSettings_ClampsDefaultBudget(t *testing.T) {
 		Theme:            "dark",
 		DefaultProvider:  "glm",
 		DefaultModel:     "glm-5.1",
-		OllamaURL:        "http://localhost:11434",
 		DefaultBudgetUSD: -50,
 	}}
 	if err := s.UpdateSettings(cfg); err != nil {

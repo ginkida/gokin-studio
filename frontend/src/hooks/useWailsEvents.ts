@@ -8,8 +8,6 @@ function notifyIfBlurred(title: string, body: string) {
   if (document.hasFocus()) return
   if ('Notification' in window && Notification.permission === 'granted') {
     new Notification(title, { body, icon: '/wails.png' })
-  } else if ('Notification' in window && Notification.permission === 'default') {
-    Notification.requestPermission()
   }
 }
 
@@ -22,12 +20,6 @@ function chatKey(data: any): string | null {
 }
 
 export function useWailsEvents() {
-  useEffect(() => {
-    if ('Notification' in window && Notification.permission === 'default') {
-      Notification.requestPermission()
-    }
-  }, [])
-
   useEffect(() => {
     const cleanups = [
       EventsOn('chat:delta', (data: any) => {
@@ -60,7 +52,7 @@ export function useWailsEvents() {
       }),
       EventsOn('chat:tool_result', (data: any) => {
         const key = chatKey(data); if (!key) return
-        useChatStore.getState().addToolResult(key, data.tool, data.success, data.content)
+        useChatStore.getState().addToolResult(key, data.tool, data.success, data.content, data.mcpApp)
       }),
       EventsOn('chat:usage', (data: any) => {
         const key = chatKey(data); if (!key) return
@@ -173,6 +165,25 @@ export function useWailsEvents() {
           notifyIfBlurred(`${name} -- done`, preview || 'Agent finished.')
         }
       }),
+      EventsOn('sessions:changed', (data: any) => {
+        const activeProjectID = useProjectStore.getState().activeProjectId
+        if (!data?.projectID || data.projectID === activeProjectID) {
+          window.dispatchEvent(new CustomEvent('gokin:sessions-changed'))
+        }
+        if (data?.action === 'archived' && data?.reason === 'pull_request') {
+          window.dispatchEvent(new CustomEvent('gokin:session-auto-archived', { detail: data }))
+          if (!isProjectMuted(data.projectID)) {
+            const project = useProjectStore.getState().projects.find((p) => p.id === data.projectID)
+            const name = project?.name || 'Project'
+            const number = Number(data.pullRequestNumber || 0)
+            const state = String(data.pullRequestState || '').toLowerCase()
+            notifyIfBlurred(
+              `${name} — chat archived`,
+              `${number > 0 ? `PR #${number} ` : 'Pull request '}${state || 'finished'}; the clean idle chat was moved to Archived chats.`,
+            )
+          }
+        }
+      }),
       EventsOn('chat:error', (data: any) => {
         const key = chatKey(data); if (!key) return
         const store = useChatStore.getState()
@@ -211,6 +222,11 @@ export function useWailsEvents() {
         if ((!sessionMatches || !document.hasFocus()) && !isProjectMuted(data.projectID)) {
           store.bumpUnread(key)
         }
+        if (!isProjectMuted(data.projectID)) {
+          const project = useProjectStore.getState().projects.find((p) => p.id === data.projectID)
+          const name = project?.name || 'Project'
+          notifyIfBlurred(`${name} — error`, text.slice(0, 120) || 'The agent encountered an error.')
+        }
       }),
       EventsOn('chat:ask_user', (data: any) => {
         const key = chatKey(data); if (!key) return
@@ -220,6 +236,10 @@ export function useWailsEvents() {
           question: data.question,
           options: data.options || [],
           default: data.default || '',
+          kind: data.kind,
+          tool: data.tool,
+          scope: data.scope,
+          details: Array.isArray(data.details) ? data.details : [],
           askedAt: Date.now(),
         })
         // Bump unread when the agent asks for input in a session the user
@@ -231,6 +251,15 @@ export function useWailsEvents() {
         const sessionMatches = activeProj === data.projectID && activeSid === (data.sessionID || 'default')
         if ((!sessionMatches || !document.hasFocus()) && !isProjectMuted(data.projectID)) {
           store.bumpUnread(key)
+        }
+        if (!isProjectMuted(data.projectID)) {
+          const project = useProjectStore.getState().projects.find((p) => p.id === data.projectID)
+          const name = project?.name || 'Project'
+          const approval = data.kind === 'tool_approval'
+          notifyIfBlurred(
+            `${name} — ${approval ? 'approval required' : 'input needed'}`,
+            approval ? 'The agent is waiting for permission.' : 'The agent is waiting for your answer.',
+          )
         }
       }),
       EventsOn('chat:retry', (data: any) => {
@@ -256,6 +285,35 @@ export function useWailsEvents() {
             elapsedMs: data.elapsedMs,
           })
         }
+      }),
+      EventsOn('chat:queue_added', (data: any) => {
+        const key = chatKey(data); if (!key || !data.id || !data.text) return
+        useChatStore.getState().enqueueTurn(key, {
+          id: data.id,
+          content: data.text,
+          queuedAt: Date.now(),
+        })
+      }),
+      EventsOn('chat:queue_started', (data: any) => {
+        const key = chatKey(data); if (!key || !data.id) return
+        // Move the waiting card into the transcript only when the backend
+        // worker actually starts it. This keeps persisted history and visible
+        // user turns in the same order.
+        const store = useChatStore.getState()
+        // Scheduled tasks that start while the session is idle were never in
+        // the visible queue. Materialize their backend-supplied text first.
+        if (data.text && !(store.queuedTurns[key] || []).some((turn) => turn.id === data.id)) {
+          store.enqueueTurn(key, {
+            id: data.id,
+            content: data.text,
+            queuedAt: Date.now(),
+          })
+        }
+        useChatStore.getState().startQueuedTurn(key, data.id)
+      }),
+      EventsOn('chat:queue_cleared', (data: any) => {
+        const key = chatKey(data); if (!key) return
+        useChatStore.getState().clearQueuedTurns(key, data.ids || undefined)
       }),
       EventsOn('session:renamed', (data: any) => {
         // App.tsx owns the sessions list; emit a DOM event it can listen to.

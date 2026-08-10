@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -49,6 +51,16 @@ type PinnedMessage struct {
 // long-but-real assistant response.
 const PinContentMaxBytes = 200 * 1024
 
+const (
+	pinsFileMaxBytes     = 4 << 20
+	maxPinnedMessages    = 100
+	maxPinMessageIDBytes = 256
+)
+
+// A pin operation is a read-modify-write transaction. Serialize these small,
+// infrequent files so concurrent UI calls cannot overwrite one another.
+var pinsFileMu sync.Mutex
+
 func pinsDir() string {
 	return filepath.Join(configDir(), "pins")
 }
@@ -56,11 +68,11 @@ func pinsDir() string {
 // pinsPath returns the on-disk path for a session's pins file. Reuses the
 // drafts.go sanitiser to defend against path traversal in malformed IDs.
 func pinsPath(projectID, sessionID string) string {
-	return filepath.Join(pinsDir(), sanitiseDraftKey(projectID)+"_"+sanitiseDraftKey(sessionID)+".json")
+	return filepath.Join(pinsDir(), safeStorageKey(projectID)+"_"+safeStorageKey(sessionID)+".json")
 }
 
 func loadPinsFile(projectID, sessionID string) ([]PinnedMessage, error) {
-	data, err := os.ReadFile(pinsPath(projectID, sessionID))
+	data, err := readRegularFileLimited(pinsPath(projectID, sessionID), pinsFileMaxBytes)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -73,6 +85,15 @@ func loadPinsFile(projectID, sessionID string) ([]PinnedMessage, error) {
 	var pins []PinnedMessage
 	if err := json.Unmarshal(data, &pins); err != nil {
 		return nil, fmt.Errorf("corrupt pins file: %w", err)
+	}
+	if len(pins) > maxPinnedMessages {
+		return nil, fmt.Errorf("pins file has too many entries (%d, maximum %d)", len(pins), maxPinnedMessages)
+	}
+	for i, pin := range pins {
+		if pin.ID == "" || (pin.Role != "user" && pin.Role != "assistant") ||
+			len(pin.Content) > PinContentMaxBytes || !utf8.ValidString(pin.Content) {
+			return nil, fmt.Errorf("corrupt pins file: invalid pin at index %d", i)
+		}
 	}
 	return pins, nil
 }
@@ -91,6 +112,9 @@ func savePinsFile(projectID, sessionID string, pins []PinnedMessage) error {
 	data, err := json.MarshalIndent(pins, "", "  ")
 	if err != nil {
 		return err
+	}
+	if len(data) > pinsFileMaxBytes {
+		return fmt.Errorf("pins file would be too large (%d bytes, maximum %d)", len(data), pinsFileMaxBytes)
 	}
 	return atomicWriteFile(pinsPath(projectID, sessionID), data, 0o600)
 }
@@ -111,6 +135,9 @@ func (s *Studio) PinMessage(projectID, sessionID, role, content, messageID strin
 	if content == "" {
 		return "", fmt.Errorf("content cannot be empty")
 	}
+	if !utf8.ValidString(content) || !utf8.ValidString(messageID) {
+		return "", fmt.Errorf("pin content and message ID must be valid UTF-8")
+	}
 	content = truncateUTF8(content, PinContentMaxBytes)
 	sid := sessionID
 	if sid == "" {
@@ -125,6 +152,8 @@ func (s *Studio) PinMessage(projectID, sessionID, role, content, messageID strin
 		return "", fmt.Errorf("project not found: %s", projectID)
 	}
 
+	pinsFileMu.Lock()
+	defer pinsFileMu.Unlock()
 	pins, err := loadPinsFile(projectID, sid)
 	if err != nil {
 		return "", err
@@ -137,12 +166,15 @@ func (s *Studio) PinMessage(projectID, sessionID, role, content, messageID strin
 			return p.ID, nil
 		}
 	}
+	if len(pins) >= maxPinnedMessages {
+		return "", fmt.Errorf("pin limit reached (%d per session)", maxPinnedMessages)
+	}
 	newPin := PinnedMessage{
 		ID:        uuid.New().String()[:12],
 		Role:      role,
 		Content:   content,
 		PinnedAt:  time.Now().UnixMilli(),
-		MessageID: messageID,
+		MessageID: truncateUTF8(messageID, maxPinMessageIDBytes),
 	}
 	pins = append(pins, newPin)
 	if err := savePinsFile(projectID, sid, pins); err != nil {
@@ -161,6 +193,8 @@ func (s *Studio) UnpinMessage(projectID, sessionID, pinID string) error {
 	if sid == "" {
 		sid = "default"
 	}
+	pinsFileMu.Lock()
+	defer pinsFileMu.Unlock()
 	pins, err := loadPinsFile(projectID, sid)
 	if err != nil {
 		return err
@@ -186,6 +220,8 @@ func (s *Studio) ListPinnedMessages(projectID, sessionID string) ([]PinnedMessag
 	if sid == "" {
 		sid = "default"
 	}
+	pinsFileMu.Lock()
+	defer pinsFileMu.Unlock()
 	pins, err := loadPinsFile(projectID, sid)
 	if err != nil {
 		return nil, err
@@ -206,12 +242,14 @@ func removeProjectPins(projectID string) {
 	if projectID == "" {
 		return
 	}
+	pinsFileMu.Lock()
+	defer pinsFileMu.Unlock()
 	dir := pinsDir()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
-	prefix := sanitiseDraftKey(projectID) + "_"
+	prefix := safeStorageKey(projectID) + "_"
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -228,6 +266,8 @@ func removeSessionPins(projectID, sessionID string) {
 	if projectID == "" {
 		return
 	}
+	pinsFileMu.Lock()
+	defer pinsFileMu.Unlock()
 	sid := sessionID
 	if sid == "" {
 		sid = "default"
