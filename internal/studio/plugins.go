@@ -487,7 +487,7 @@ func openPluginBundle(bundlePath string) (*parsedPlugin, error) {
 	}
 	fail := func(err error) (*parsedPlugin, error) { _ = archive.Close(); return nil, err }
 	opened, err := archive.Stat()
-	if err != nil || !os.SameFile(info, opened) {
+	if err != nil || !sameOpenedFile(info, opened) {
 		return fail(fmt.Errorf("plugin archive changed while opening"))
 	}
 	hash := sha256.New()

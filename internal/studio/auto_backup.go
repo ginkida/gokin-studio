@@ -509,7 +509,7 @@ func (s *Studio) RestoreAutoBackup(filename string) (*ImportResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot verify opened backup: %w", err)
 	}
-	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+	if !opened.Mode().IsRegular() || !sameOpenedFile(info, opened) {
 		return nil, errors.New("backup changed while opening")
 	}
 	if opened.Size() > ImportArchiveMaxBytes {

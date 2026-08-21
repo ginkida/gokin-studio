@@ -7,6 +7,53 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## Release v2.1.1 (2026-08-21)
+
+Patch release. Fixes a file-substitution check that was weaker on Linux than on
+macOS — found by the v2.1.0 CI run, which went red on Ubuntu while the same
+suite was green locally.
+
+### Stat-then-open identity checks no longer rely on inode identity alone
+
+Every "did this file change while I was opening it?" guard in `internal/studio`
+compared the pre-open `Lstat` with the opened descriptor's `Stat` using
+`os.SameFile`, which tests device + inode only. That is not enough on
+filesystems that recycle inode numbers eagerly: on ext4, deleting a file and
+creating another in the same directory routinely hands the freed inode straight
+back, so a substituted file presents the identity of the one it replaced and
+passes the check. APFS does not reuse inodes that quickly, which is why the
+gap was invisible on macOS and only surfaced on a Linux runner — the platform
+the Linux release binary actually runs on.
+
+`sameOpenedFile` (`file_identity.go`) now compares size and modification time in
+addition to `os.SameFile`, so a swap has to reproduce device, inode, byte
+length, and mtime to slip through. Applied to the seven read-side tamper checks:
+auto-backup restore, plugin archive parsing, worktree include copying, artifact
+version storage, local storage read and append, project skill manifests, and MCP
+bundle import.
+
+Three sites deliberately keep bare `os.SameFile`, and the helper documents why so
+the exclusion is not "fixed" later:
+
+- `replay.go` truncating open uses `O_TRUNC`, which zeroes size and stamps mtime
+  as part of the open itself — the stricter comparison could never hold.
+- `replay.go` appending open is a write path for our own log, not a tamper check
+  on someone else's file.
+- `data_archive.go` tolerates churn by design: it skips a file that moved under
+  the archive walk rather than failing, and `events.log` is appended to *while*
+  the backup runs, so comparing mtime would silently drop it from the archive.
+
+### Tests
+
+`TestSameOpenedFileRejectsInPlaceContentSwap` and
+`TestRestoreAutoBackup_RejectsInPlaceContentSwap` rewrite the file in place,
+which keeps the inode on every filesystem. That reproduces the ext4 condition
+deterministically on macOS too, instead of leaving the regression detectable
+only on a Linux runner — which is exactly how it escaped into v2.1.0. The
+pre-existing delete-and-recreate test is kept: it covers the fresh-inode path.
+
+---
+
 ## Release v2.1.0 (2026-08-21)
 
 A feature release on top of v2.0.0: 127 modified files and 101 new ones

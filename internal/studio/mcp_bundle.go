@@ -298,7 +298,7 @@ func openMCPBundle(bundlePath string) (*parsedMCPBundle, error) {
 		_ = archive.Close()
 		return nil, fmt.Errorf("stat open MCP bundle: %w", err)
 	}
-	if !archiveInfo.Mode().IsRegular() || !os.SameFile(info, archiveInfo) ||
+	if !archiveInfo.Mode().IsRegular() || !sameOpenedFile(info, archiveInfo) ||
 		archiveInfo.Size() <= 0 || archiveInfo.Size() > maxMCPBundleBytes {
 		_ = archive.Close()
 		return nil, fmt.Errorf("MCP bundle changed while it was being opened")

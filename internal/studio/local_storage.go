@@ -72,7 +72,7 @@ func readRegularFileLimited(path string, maxBytes int64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !os.SameFile(info, openedInfo) || !openedInfo.Mode().IsRegular() {
+	if !sameOpenedFile(info, openedInfo) || !openedInfo.Mode().IsRegular() {
 		return nil, fmt.Errorf("storage file changed while opening")
 	}
 	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
@@ -104,7 +104,7 @@ func openRegularFileAppend(path string, perm os.FileMode) (*os.File, error) {
 		return nil, err
 	}
 	opened, err := f.Stat()
-	if err != nil || !os.SameFile(info, opened) || !opened.Mode().IsRegular() {
+	if err != nil || !sameOpenedFile(info, opened) || !opened.Mode().IsRegular() {
 		_ = f.Close()
 		if err != nil {
 			return nil, err

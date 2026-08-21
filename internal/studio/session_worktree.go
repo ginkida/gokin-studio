@@ -416,7 +416,7 @@ func copyWorktreeRegularFile(source, destination string, expected os.FileInfo) e
 	if err != nil {
 		return err
 	}
-	if !opened.Mode().IsRegular() || !os.SameFile(expected, opened) {
+	if !opened.Mode().IsRegular() || !sameOpenedFile(expected, opened) {
 		return fmt.Errorf("source changed while opening")
 	}
 	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {

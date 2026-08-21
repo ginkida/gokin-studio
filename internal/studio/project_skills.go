@@ -165,7 +165,7 @@ func readProjectSkill(projectDir, relDir, source string) (ProjectSkillInfo, erro
 		return ProjectSkillInfo{}, err
 	}
 	opened, statErr := f.Stat()
-	if statErr != nil || !os.SameFile(info, opened) || !opened.Mode().IsRegular() {
+	if statErr != nil || !sameOpenedFile(info, opened) || !opened.Mode().IsRegular() {
 		_ = f.Close()
 		if statErr != nil {
 			return ProjectSkillInfo{}, statErr

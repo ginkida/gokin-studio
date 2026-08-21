@@ -189,7 +189,7 @@ func readRootRegularFileLimited(root *os.Root, rel string, maxBytes int64) ([]by
 	if err != nil {
 		return nil, err
 	}
-	if !os.SameFile(info, opened) || !opened.Mode().IsRegular() {
+	if !sameOpenedFile(info, opened) || !opened.Mode().IsRegular() {
 		return nil, fmt.Errorf("artifact version storage file changed while opening")
 	}
 	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
