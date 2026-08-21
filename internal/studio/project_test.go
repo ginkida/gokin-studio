@@ -1,10 +1,14 @@
 package studio
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/ginkida/gokin-studio/internal/engine/tasks"
 )
 
 // addTestProject is a helper that calls AddProject with a fresh TempDir and
@@ -475,6 +479,8 @@ func TestRelinkProjectDirectoryPreservesProjectIdentityAndSettings(t *testing.T)
 	if _, err := s.ConfigureProjectModel(info.ID, "kimi", "k3", 0.4, 65536, "enabled", 8192); err != nil {
 		t.Fatal(err)
 	}
+	oldTaskManager := tasks.NewManager(oldDir)
+	s.projects[info.ID].taskManager = oldTaskManager
 	if err := os.Remove(oldDir); err != nil {
 		t.Fatal(err)
 	}
@@ -492,6 +498,9 @@ func TestRelinkProjectDirectoryPreservesProjectIdentityAndSettings(t *testing.T)
 	}
 	if len(s.projects[info.ID].sessions) == 0 {
 		t.Fatal("relink discarded chat sessions")
+	}
+	if _, err := oldTaskManager.Start(context.Background(), "unused"); !errors.Is(err, tasks.ErrManagerClosed) {
+		t.Fatalf("old path task manager remained open after relink: %v", err)
 	}
 	var persisted *ProjectConfig
 	for index := range s.config.Projects {

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ginkida/gokin-studio/internal/engine/security"
+	"github.com/ginkida/gokin-studio/internal/engine/wsl"
 	"google.golang.org/genai"
 )
 
@@ -150,6 +151,10 @@ func (t *VerifyCodeTool) Execute(ctx context.Context, args map[string]any) (Tool
 			return NewErrorResult("Failed to create isolated verification environment: " + envErr.Error()), nil
 		}
 		cmd.Env = env
+		// Same reasoning as run_tests: the distro verifies with its own
+		// toolchain, and the curated host environment does not cross.
+		wsl.ApplyExec(cmd, wsl.DetectFor(targetDir), append([]string{cmd.Args[0]}, cmd.Args[1:]...),
+			security.WorkspaceEnvironmentSnapshot())
 	}
 	output, err := cmd.CombinedOutput()
 

@@ -2,6 +2,7 @@ package studio
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -375,6 +376,26 @@ func TestStop_CancelsRunningTasks(t *testing.T) {
 	remaining := tm.ListRunning()
 	if len(remaining) != 0 {
 		t.Errorf("expected 0 running tasks after Stop, got %d", len(remaining))
+	}
+}
+
+func TestProjectClosePermanentlyClosesBackgroundTaskManagers(t *testing.T) {
+	p := NewProject(ProjectConfig{ID: "pid-close-tasks", Name: "P", Directory: t.TempDir()})
+	projectManager := tasks.NewManager(p.Directory)
+	sessionManager := tasks.NewManager(p.Directory)
+	p.taskManager = projectManager
+	session := p.sessions["default"]
+	session.taskManager = sessionManager
+
+	p.Close()
+
+	for name, manager := range map[string]*tasks.Manager{
+		"project": projectManager,
+		"session": sessionManager,
+	} {
+		if _, err := manager.Start(context.Background(), "unused"); !errors.Is(err, tasks.ErrManagerClosed) {
+			t.Fatalf("%s manager Start after project Close = %v, want ErrManagerClosed", name, err)
+		}
 	}
 }
 

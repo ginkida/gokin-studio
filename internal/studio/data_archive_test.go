@@ -5,10 +5,12 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/base64"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // seedConfigDirForArchive populates the temp config dir with a representative
@@ -144,6 +146,21 @@ func TestExportAllDataBase64_MissingConfigDir(t *testing.T) {
 	}
 }
 
+func TestExportAllDataBase64_RequiresReadableConfigYAML(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	if err := os.MkdirAll(filepath.Join(configDir(), "history"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir(), "history", "chat.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := NewStudio().ExportAllDataBase64()
+	if err == nil || !strings.Contains(err.Error(), "config.yaml") {
+		t.Fatalf("result=%+v error=%v, want missing-config rejection", result, err)
+	}
+}
+
 func TestImportAllDataBase64_RoundTrip(t *testing.T) {
 	_ = withTempHistoryDir(t)
 	cfgDir := configDir()
@@ -191,6 +208,50 @@ func TestImportAllDataBase64_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestImportAllDataBase64_ConsecutiveSameSecondImportsUseDistinctPaths(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	cfgDir := configDir()
+	seedConfigDirForArchive(t, cfgDir)
+	s := NewStudio()
+	exported, err := s.ExportAllDataBase64()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fixed := time.Date(2026, 8, 12, 12, 34, 56, 0, time.UTC)
+	previousNow := archivePathNow
+	archivePathNow = func() time.Time { return fixed }
+	t.Cleanup(func() { archivePathNow = previousNow })
+	legacyStaging := filepath.Join(filepath.Dir(cfgDir), ".gokin-studio.import-staging-"+fixed.Format("20060102-150405"))
+	if err := os.Mkdir(legacyStaging, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(legacyStaging, "owned-by-another-process")
+	if err := os.WriteFile(marker, []byte("preserve"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := s.ImportAllDataBase64(exported.Base64)
+	if err != nil {
+		t.Fatalf("first import: %v", err)
+	}
+	second, err := s.ImportAllDataBase64(exported.Base64)
+	if err != nil {
+		t.Fatalf("second same-second import: %v", err)
+	}
+	if first.PreBackupPath == second.PreBackupPath {
+		t.Fatalf("same-second imports collided at %q", first.PreBackupPath)
+	}
+	for _, snapshot := range []string{first.PreBackupPath, second.PreBackupPath} {
+		if _, err := os.Stat(filepath.Join(snapshot, "config.yaml")); err != nil {
+			t.Fatalf("safety snapshot %q is incomplete: %v", snapshot, err)
+		}
+	}
+	if got, err := os.ReadFile(marker); err != nil || string(got) != "preserve" {
+		t.Fatalf("import removed another process's staging dir: content=%q err=%v", got, err)
+	}
+}
+
 func TestImportAllDataBase64_EmptyPayload(t *testing.T) {
 	_ = withTempHistoryDir(t)
 	s := NewStudio()
@@ -201,6 +262,28 @@ func TestImportAllDataBase64_EmptyPayload(t *testing.T) {
 	_, err = s.ImportAllDataBase64("   \n\t  ")
 	if err == nil {
 		t.Error("whitespace-only payload accepted")
+	}
+}
+
+func TestValidateImportArchiveEncodedSize(t *testing.T) {
+	const maxDecoded = 8
+	maxEncoded := base64.StdEncoding.EncodedLen(maxDecoded)
+	if err := validateImportArchiveEncodedSize(maxEncoded, maxDecoded); err != nil {
+		t.Fatalf("exact encoded limit rejected: %v", err)
+	}
+	if err := validateImportArchiveEncodedSize(maxEncoded+1, maxDecoded); err == nil || !strings.Contains(err.Error(), "archive too large") {
+		t.Fatalf("oversized encoded payload error=%v, want archive-too-large preflight", err)
+	}
+
+	exact := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{'x'}, maxDecoded))
+	if raw, err := decodeImportArchiveBase64(exact, maxDecoded); err != nil || len(raw) != maxDecoded {
+		t.Fatalf("exact decoded limit: len=%d err=%v", len(raw), err)
+	}
+	// Eight bytes encode to 12 base64 bytes, as do nine bytes. This reaches the
+	// exact post-decode check and proves padding cannot bypass the hard limit.
+	overDecoded := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{'x'}, maxDecoded+1))
+	if _, err := decodeImportArchiveBase64(overDecoded, maxDecoded); err == nil || !strings.Contains(err.Error(), "archive too large") {
+		t.Fatalf("oversized decoded payload error=%v, want archive-too-large check", err)
 	}
 }
 
@@ -273,6 +356,60 @@ func TestImportAllDataBase64_PathTraversalRejected(t *testing.T) {
 	_, err := s.ImportAllDataBase64(encoded)
 	if err == nil || !strings.Contains(err.Error(), "unsafe path") {
 		t.Errorf("err=%v, want 'unsafe path' rejection", err)
+	}
+}
+
+func TestImportAllDataBase64_RejectsEntryCountBombAndPreservesCurrentData(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	cfgPath := filepath.Join(configDir(), "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("current-data\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	config := []byte("imported-data\n")
+	if err := tw.WriteHeader(&tar.Header{Name: "config.yaml", Mode: 0o600, Size: int64(len(config)), Typeflag: tar.TypeReg}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(config); err != nil {
+		t.Fatal(err)
+	}
+	// Together with config.yaml, the final header crosses the entry cap. Link
+	// entries are intentionally content-free, demonstrating why the byte limit
+	// alone cannot bound this archive.
+	for i := 0; i < ImportArchiveMaxEntries; i++ {
+		if err := tw.WriteHeader(&tar.Header{
+			Name:     fmt.Sprintf("links/%05d", i),
+			Mode:     0o600,
+			Typeflag: tar.TypeSymlink,
+			Linkname: "config.yaml",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := NewStudio().ImportAllDataBase64(base64.StdEncoding.EncodeToString(buf.Bytes()))
+	if err == nil || !strings.Contains(err.Error(), "too many entries") {
+		t.Fatalf("entry-count bomb error=%v, want bounded rejection", err)
+	}
+	current, readErr := os.ReadFile(cfgPath)
+	if readErr != nil || string(current) != "current-data\n" {
+		t.Fatalf("current config changed after rejected import: content=%q err=%v", current, readErr)
+	}
+	staging, globErr := filepath.Glob(filepath.Join(filepath.Dir(configDir()), ".gokin-studio.import-staging-*"))
+	if globErr != nil {
+		t.Fatal(globErr)
+	}
+	if len(staging) != 0 {
+		t.Fatalf("rejected import leaked staging dirs: %v", staging)
 	}
 }
 

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { AppWindow, Loader2, Maximize2, Minimize2, ShieldCheck } from 'lucide-react'
 import type { MCPAppPayload } from '../../stores/chatStore'
 import { CallMCPAppTool } from '../../../wailsjs/go/studio/Studio'
@@ -45,19 +45,64 @@ function currentTheme(): 'dark' | 'light' {
   return 'dark'
 }
 
+function isRPCID(value: unknown): value is string | number {
+  if (typeof value === 'string') return value.length <= 128
+  return typeof value === 'number' && Number.isFinite(value) && Math.abs(value) <= Number.MAX_SAFE_INTEGER
+}
+
+function postToolData(target: Window, payload: MCPAppPayload) {
+  target.postMessage({
+    jsonrpc: '2.0',
+    method: 'ui/notifications/tool-input',
+    params: { arguments: payload.toolArgs || {} },
+  }, '*')
+  target.postMessage({
+    jsonrpc: '2.0',
+    method: 'ui/notifications/tool-result',
+    params: payload.toolResult || {},
+  }, '*')
+}
+
 export function MCPAppView({ payload }: { payload: MCPAppPayload }) {
   const iframeRef = useRef<HTMLIFrameElement>(null)
-  const initializedRef = useRef(false)
-  const toolCallInFlightRef = useRef(false)
   const documentGenerationRef = useRef(0)
+  const initializeGenerationRef = useRef<number | null>(null)
+  const initializedGenerationRef = useRef<number | null>(null)
+  const toolCallSequenceRef = useRef(0)
+  const toolCallRef = useRef<{ generation: number; request: number } | null>(null)
   const [theme, setTheme] = useState<'dark' | 'light'>(currentTheme)
   const [height, setHeight] = useState(320)
   const [fullscreen, setFullscreen] = useState(false)
   const [appCallStatus, setAppCallStatus] = useState<string | null>(null)
   const srcDoc = useMemo(() => buildMCPAppDocument(payload, theme), [payload, theme])
-  const externalOrigins = (payload.csp?.connectDomains?.length || 0) +
-    (payload.csp?.resourceDomains?.length || 0) +
-    (payload.csp?.frameDomains?.length || 0)
+  const payloadRef = useRef(payload)
+  const themeRef = useRef(theme)
+  const iframeIdentityRef = useRef({
+    key: 0,
+    srcDoc,
+    instanceID: payload.instanceID,
+    resourceURI: payload.resourceURI,
+    toolName: payload.toolName,
+  })
+  const iframeIdentity = iframeIdentityRef.current
+  if (
+    iframeIdentity.srcDoc !== srcDoc ||
+    iframeIdentity.instanceID !== payload.instanceID ||
+    iframeIdentity.resourceURI !== payload.resourceURI ||
+    iframeIdentity.toolName !== payload.toolName
+  ) {
+    iframeIdentityRef.current = {
+      key: iframeIdentity.key + 1,
+      srcDoc,
+      instanceID: payload.instanceID,
+      resourceURI: payload.resourceURI,
+      toolName: payload.toolName,
+    }
+  }
+  const iframeKey = iframeIdentityRef.current.key
+  const externalOrigins = safeOrigins(payload.csp?.connectDomains, true).length +
+    safeOrigins(payload.csp?.resourceDomains).length +
+    safeOrigins(payload.csp?.frameDomains).length
 
   useEffect(() => {
     const observer = new MutationObserver(() => setTheme(currentTheme()))
@@ -65,47 +110,57 @@ export function MCPAppView({ payload }: { payload: MCPAppPayload }) {
     return () => observer.disconnect()
   }, [])
 
+  useLayoutEffect(() => {
+    // Message handlers must see only committed props. Updating these refs
+    // during render would expose an abandoned concurrent render to the live
+    // iframe before React commits its replacement.
+    payloadRef.current = payload
+    themeRef.current = theme
+  }, [payload, theme])
+
+  useLayoutEffect(() => {
+    documentGenerationRef.current += 1
+    initializeGenerationRef.current = null
+    initializedGenerationRef.current = null
+    toolCallRef.current = null
+    setAppCallStatus(null)
+    return () => {
+      documentGenerationRef.current += 1
+      initializeGenerationRef.current = null
+      initializedGenerationRef.current = null
+      toolCallRef.current = null
+    }
+  }, [iframeKey])
+
   useEffect(() => {
-    const respond = (id: string | number, result?: unknown, error?: { code: number; message: string }) => {
-      const target = iframeRef.current?.contentWindow
-      if (!target) return
+    const respond = (target: Window, id: string | number, result?: unknown, error?: { code: number; message: string }) => {
       target.postMessage(error
         ? { jsonrpc: '2.0', id, error }
         : { jsonrpc: '2.0', id, result: result ?? {} }, '*')
     }
-    const notifyToolData = () => {
-      const target = iframeRef.current?.contentWindow
-      if (!target || !initializedRef.current) return
-      target.postMessage({
-        jsonrpc: '2.0',
-        method: 'ui/notifications/tool-input',
-        params: { arguments: payload.toolArgs || {} },
-      }, '*')
-      target.postMessage({
-        jsonrpc: '2.0',
-        method: 'ui/notifications/tool-result',
-        params: payload.toolResult || {},
-      }, '*')
-    }
     const onMessage = (event: MessageEvent) => {
-      if (event.source !== iframeRef.current?.contentWindow) return
+      const target = iframeRef.current?.contentWindow
+      if (!target || event.source !== target) return
+      const generation = documentGenerationRef.current
+      const activePayload = payloadRef.current
       const message = event.data
       if (!message || typeof message !== 'object' || message.jsonrpc !== '2.0') return
-      const method = typeof message.method === 'string' ? message.method : ''
-      const id = typeof message.id === 'string' || typeof message.id === 'number' ? message.id : null
+      const method = typeof message.method === 'string' && message.method.length <= 128 ? message.method : ''
+      const id = isRPCID(message.id) ? message.id : null
       if ((method === 'ui/initialize' || method === 'initialize') && id !== null) {
-        initializedRef.current = false
-        respond(id, {
+        initializeGenerationRef.current = generation
+        initializedGenerationRef.current = null
+        respond(target, id, {
           protocolVersion: '2026-01-26',
-          hostCapabilities: payload.instanceID ? {
+          hostCapabilities: activePayload.instanceID ? {
             serverTools: { listChanged: false },
           } : {},
           hostInfo: { name: 'gokin-studio', version: '2.0.0' },
           hostContext: {
             toolInfo: {
-              tool: { name: payload.toolName, inputSchema: { type: 'object' } },
+              tool: { name: activePayload.toolName, inputSchema: { type: 'object' } },
             },
-            theme,
+            theme: themeRef.current,
             displayMode: 'inline',
             availableDisplayModes: ['inline'],
             containerDimensions: { maxWidth: 960, maxHeight: 720 },
@@ -122,77 +177,94 @@ export function MCPAppView({ payload }: { payload: MCPAppPayload }) {
         return
       }
       if (method === 'ui/notifications/initialized' || method === 'notifications/initialized') {
-        initializedRef.current = true
-        notifyToolData()
+        if (initializeGenerationRef.current !== generation) return
+        initializeGenerationRef.current = null
+        initializedGenerationRef.current = generation
+        postToolData(target, activePayload)
         return
       }
       if (method === 'ui/notifications/size-changed') {
+        if (initializedGenerationRef.current !== generation) return
         const requested = Number(message.params?.height)
         if (Number.isFinite(requested)) setHeight(Math.max(180, Math.min(720, Math.round(requested))))
         return
       }
       if (method === 'notifications/message') return
       if (method === 'ping' && id !== null) {
-        respond(id, {})
+        respond(target, id, {})
         return
       }
       if (method === 'ui/request-display-mode' && id !== null) {
         // App-originated fullscreen is deliberately denied; the surrounding
         // host button provides a user-gesture-only fullscreen path.
-        respond(id, { mode: 'inline' })
+        respond(target, id, { mode: 'inline' })
         return
       }
       if (method === 'tools/call' && id !== null) {
-        if (!initializedRef.current || !payload.instanceID) {
-          respond(id, undefined, { code: -32002, message: 'MCP App tool calls are not available for this view' })
+        if (initializedGenerationRef.current !== generation || !activePayload.instanceID) {
+          respond(target, id, undefined, { code: -32002, message: 'MCP App tool calls are not available for this view' })
           return
         }
-        if (toolCallInFlightRef.current) {
-          respond(id, undefined, { code: -32003, message: 'Another app action is already waiting or running' })
+        if (toolCallRef.current?.generation === generation) {
+          respond(target, id, undefined, { code: -32003, message: 'Another app action is already waiting or running' })
           return
         }
         const name = typeof message.params?.name === 'string' ? message.params.name.trim() : ''
         const args = message.params?.arguments
         if (!name || name.length > 128 || !args || typeof args !== 'object' || Array.isArray(args)) {
-          respond(id, undefined, { code: -32602, message: 'Invalid tools/call parameters' })
+          respond(target, id, undefined, { code: -32602, message: 'Invalid tools/call parameters' })
           return
         }
         let encodedSize = 0
         try {
           encodedSize = new TextEncoder().encode(JSON.stringify(args)).byteLength
         } catch {
-          respond(id, undefined, { code: -32602, message: 'Tool arguments must be JSON-serializable' })
+          respond(target, id, undefined, { code: -32602, message: 'Tool arguments must be JSON-serializable' })
           return
         }
         if (encodedSize > 256 * 1024) {
-          respond(id, undefined, { code: -32602, message: 'Tool arguments exceed the 256 KiB limit' })
+          respond(target, id, undefined, { code: -32602, message: 'Tool arguments exceed the 256 KiB limit' })
           return
         }
-        toolCallInFlightRef.current = true
+        const request = ++toolCallSequenceRef.current
+        toolCallRef.current = { generation, request }
         setAppCallStatus('Approval required')
-        const generation = documentGenerationRef.current
-        void CallMCPAppTool(payload.instanceID, name, args as Record<string, unknown>)
+        const ownsCall = () => (
+          documentGenerationRef.current === generation &&
+          iframeRef.current?.contentWindow === target &&
+          toolCallRef.current?.generation === generation &&
+          toolCallRef.current?.request === request
+        )
+        void CallMCPAppTool(activePayload.instanceID, name, args as Record<string, unknown>)
           .then((result) => {
-            if (generation === documentGenerationRef.current) respond(id, result)
+            if (ownsCall()) respond(target, id, result)
           })
           .catch((error: any) => {
-            if (generation !== documentGenerationRef.current) return
+            if (!ownsCall()) return
             const message = String(error?.message || error || 'MCP App action failed').slice(0, 500)
-            respond(id, undefined, { code: -32000, message })
+            respond(target, id, undefined, { code: -32000, message })
           })
           .finally(() => {
-            toolCallInFlightRef.current = false
-            if (generation === documentGenerationRef.current) setAppCallStatus(null)
+            if (!ownsCall()) return
+            toolCallRef.current = null
+            setAppCallStatus(null)
           })
         return
       }
       if (id !== null) {
-        respond(id, undefined, { code: -32601, message: 'Capability is not enabled by this host' })
+        respond(target, id, undefined, { code: -32601, message: 'Capability is not enabled by this host' })
       }
     }
     window.addEventListener('message', onMessage)
     return () => window.removeEventListener('message', onMessage)
-  }, [payload, theme])
+  }, [])
+
+  useEffect(() => {
+    const generation = documentGenerationRef.current
+    const target = iframeRef.current?.contentWindow
+    if (!target || initializedGenerationRef.current !== generation) return
+    postToolData(target, payload)
+  }, [payload.toolArgs, payload.toolResult])
 
   const view = (
     <div className={`mcp-app-card ${payload.prefersBorder ? 'prefers-border' : ''} ${fullscreen ? 'fullscreen' : ''}`} onClick={(e) => e.stopPropagation()}>
@@ -205,7 +277,7 @@ export function MCPAppView({ payload }: { payload: MCPAppPayload }) {
           {externalOrigins > 0 ? `${externalOrigins} declared origins` : 'offline sandbox'}
         </span>
         {appCallStatus && (
-          <span className="mcp-app-call-status">
+          <span className="mcp-app-call-status" role="status" aria-live="polite">
             <Loader2 size={10} className="spin" />
             {appCallStatus}
           </span>
@@ -213,12 +285,15 @@ export function MCPAppView({ payload }: { payload: MCPAppPayload }) {
         <button
           type="button"
           title={fullscreen ? 'Exit fullscreen' : 'Open fullscreen'}
+          aria-label={fullscreen ? 'Exit MCP App fullscreen' : 'Open MCP App fullscreen'}
+          aria-pressed={fullscreen}
           onClick={() => setFullscreen((value) => !value)}
         >
           {fullscreen ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
         </button>
       </div>
       <iframe
+        key={iframeKey}
         ref={iframeRef}
         className="mcp-app-frame"
         srcDoc={srcDoc}
@@ -227,8 +302,10 @@ export function MCPAppView({ payload }: { payload: MCPAppPayload }) {
         style={{ height: fullscreen ? 'calc(100vh - 86px)' : `${height}px` }}
         title={`MCP App ${payload.resourceURI}`}
         onLoad={() => {
-          initializedRef.current = false
           documentGenerationRef.current += 1
+          initializeGenerationRef.current = null
+          initializedGenerationRef.current = null
+          toolCallRef.current = null
           setAppCallStatus(null)
         }}
       />

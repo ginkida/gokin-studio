@@ -31,6 +31,7 @@ import { nextTranscriptMode, parseTranscriptMode, transcriptModeLabel, TRANSCRIP
 import { isInlineArtifactPath, isPreviewableFilePath, normalizeMarkdownDirectoryPath, normalizeMarkdownProjectPath } from '../../lib/previewFiles'
 import { WELCOME_METADATA_TIMEOUT_MS, welcomeMetadataReady } from '../../lib/welcomeLayout'
 import { normalizeExternalHTTPLink } from '../../lib/externalLinks'
+import { downloadBlob } from '../../lib/download'
 
 interface PullRequestCheckStatus {
   name: string
@@ -137,6 +138,7 @@ export function ChatPanel({
   sessionName,
   sessionPermissionMode,
   sessionWorktreeIsolated,
+  sessionIsolationSkippedReason,
   sessionWorktreePath,
   sessionWorktreeBranch,
   sessionWorktreeError,
@@ -149,6 +151,7 @@ export function ChatPanel({
   sessionName?: string
   sessionPermissionMode?: string
   sessionWorktreeIsolated?: boolean
+  sessionIsolationSkippedReason?: string
   sessionWorktreePath?: string
   sessionWorktreeBranch?: string
   sessionWorktreeError?: string
@@ -192,6 +195,7 @@ export function ChatPanel({
       sessionName={sessionName}
       sessionPermissionMode={sessionPermissionMode}
       sessionWorktreeIsolated={sessionWorktreeIsolated}
+      sessionIsolationSkippedReason={sessionIsolationSkippedReason}
       sessionWorktreePath={sessionWorktreePath}
       sessionWorktreeBranch={sessionWorktreeBranch}
       sessionWorktreeError={sessionWorktreeError}
@@ -210,6 +214,7 @@ function ChatPanelBody({
   sessionName,
   sessionPermissionMode,
   sessionWorktreeIsolated,
+  sessionIsolationSkippedReason,
   sessionWorktreePath,
   sessionWorktreeBranch,
   sessionWorktreeError,
@@ -224,6 +229,7 @@ function ChatPanelBody({
   sessionName?: string
   sessionPermissionMode?: string
   sessionWorktreeIsolated?: boolean
+  sessionIsolationSkippedReason?: string
   sessionWorktreePath?: string
   sessionWorktreeBranch?: string
   sessionWorktreeError?: string
@@ -1866,7 +1872,7 @@ function ChatPanelBody({
         if (pendingQ) {
           e.preventDefault()
           CancelQuestion(pendingQ.questionID).catch(() => {})
-          useChatStore.getState().setAskUser(chatKey, null)
+          useChatStore.getState().clearAskUser(chatKey, pendingQ.questionID)
           return
         }
       }
@@ -3529,16 +3535,11 @@ function ChatPanelBody({
     try {
       const md = await ExportChat(activeProjectId, currentSessionId)
       const blob = new Blob([md], { type: 'text/markdown' })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
       // Include session name in export filename so multiple exports from the
       // same project don't collide. Use the human-readable name when available,
       // falling back to the session ID for the 'default' session.
       const nameTag = sessionName && sessionName !== 'Chat 1' ? `-${sessionName.replace(/[^a-zA-Z0-9_\-]/g, '_')}` : currentSessionId === 'default' ? '' : `-${currentSessionId.slice(0, 8)}`
-      a.download = `${activeProject.name}${nameTag}-chat.md`
-      a.click()
-      URL.revokeObjectURL(url)
+      downloadBlob(blob, `${activeProject.name}${nameTag}-chat.md`)
     } catch (e: any) {
       console.error('ExportChat error:', e)
       useChatStore.getState().finalizeAssistant(chatKey, `Error: failed to export — ${String(e?.message || e)}`)
@@ -3552,13 +3553,8 @@ function ChatPanelBody({
     try {
       const json = await ExportSessionJSON(activeProjectId, currentSessionId)
       const blob = new Blob([json], { type: 'application/json' })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
       const nameTag = sessionName && sessionName !== 'Chat 1' ? `-${sessionName.replace(/[^a-zA-Z0-9_\-]/g, '_')}` : currentSessionId === 'default' ? '' : `-${currentSessionId.slice(0, 8)}`
-      a.download = `${activeProject.name}${nameTag}-session.json`
-      a.click()
-      URL.revokeObjectURL(url)
+      downloadBlob(blob, `${activeProject.name}${nameTag}-session.json`)
     } catch (e: any) {
       console.error('ExportSessionJSON error:', e)
       useChatStore.getState().finalizeAssistant(chatKey, `Error: failed to export session — ${String(e?.message || e)}`)
@@ -3595,13 +3591,8 @@ function ChatPanelBody({
     try {
       const md = await ExportProjectAllSessions(activeProjectId)
       const blob = new Blob([md], { type: 'text/markdown' })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
       const datestamp = new Date().toISOString().slice(0, 10) // YYYY-MM-DD
-      a.download = `${activeProject.name}-all-sessions-${datestamp}.md`
-      a.click()
-      URL.revokeObjectURL(url)
+      downloadBlob(blob, `${activeProject.name}-all-sessions-${datestamp}.md`)
     } catch (e: any) {
       console.error('ExportProjectAllSessions error:', e)
       useChatStore.getState().finalizeAssistant(chatKey, `Error: failed to export all sessions — ${String(e?.message || e)}`)
@@ -4033,6 +4024,11 @@ function ChatPanelBody({
               </span>
             )
           })()}
+          {!sessionWorktreeIsolated && !sessionWorktreeError && sessionIsolationSkippedReason && (
+            <span className="chat-header-worktree shared" title={sessionIsolationSkippedReason}>
+              <GitBranch size={10} /> shared checkout
+            </span>
+          )}
           {activeProject.thinkingActive && (
             <span className="chat-header-thinking" title={`Extended thinking ${activeProject.thinkingMode === 'enabled' ? 'enabled' : `on by default for ${activeProject.provider || 'glm'}`}${activeProject.thinkingBudgetEffective ? ` (${activeProject.thinkingBudgetEffective} tokens)` : ''}`}>
               <Brain size={10} /> thinking
@@ -6024,13 +6020,8 @@ function ChatPanelBody({
                       try {
                         const csv = await ExportProjectUsageCSV(activeProjectId)
                         const blob = new Blob([csv], { type: 'text/csv' })
-                        const url = URL.createObjectURL(blob)
-                        const a = document.createElement('a')
-                        a.href = url
                         const date = new Date().toISOString().slice(0, 10)
-                        a.download = `${activeProject.name.replace(/[^a-zA-Z0-9_\-]/g, '_')}-usage-${date}.csv`
-                        a.click()
-                        URL.revokeObjectURL(url)
+                        downloadBlob(blob, `${activeProject.name.replace(/[^a-zA-Z0-9_\-]/g, '_')}-usage-${date}.csv`)
                       } catch (e: any) {
                         console.error('ExportProjectUsageCSV failed:', e)
                       }
@@ -6560,7 +6551,7 @@ function ChatPanelBody({
             const idxFromEnd = msg.role === 'user' ? userIndexFromEnd.get(msg.id) ?? -1 : -1
             const canEdit = msg.role === 'user' && idxFromEnd >= 0 && canEditAny && !(msg.attachments?.length)
             let retrySource: ChatMessage | undefined
-            if (msg.role === 'assistant' && msg.content.startsWith('Error:') && canEditAny) {
+            if (msg.role === 'assistant' && (msg.isError || msg.content.startsWith('Error:')) && canEditAny) {
               const messageIndex = messages.findIndex((candidate) => candidate.id === msg.id)
               for (let j = messageIndex - 1; j >= 0; j--) {
                 if (messages[j].role === 'user') {
@@ -6656,7 +6647,7 @@ function ChatPanelBody({
               // Let errors propagate to AskUserCard so it can show them.
               // Only dismiss after confirmed success.
               await AnswerQuestion(askUserQ.questionID, answer)
-              useChatStore.getState().setAskUser(chatKey, null)
+              useChatStore.getState().clearAskUser(chatKey, askUserQ.questionID)
             }}
             onCancel={async () => {
               try {
@@ -6665,7 +6656,7 @@ function ChatPanelBody({
                 console.error('CancelQuestion error:', e)
               }
               // Always dismiss on cancel regardless of error.
-              useChatStore.getState().setAskUser(chatKey, null)
+              useChatStore.getState().clearAskUser(chatKey, askUserQ.questionID)
             }}
           />
         )}
@@ -7740,6 +7731,7 @@ function ChatPanelBody({
 
       {showFilePicker && (
         <FilePicker
+          key={`${activeProjectId.length}:${activeProjectId}${currentSessionId.length}:${currentSessionId}`}
           projectId={activeProjectId}
           sessionId={currentSessionId}
           onClose={() => { setShowFilePicker(false); inputRef.current?.focus() }}
@@ -8311,12 +8303,7 @@ function downloadChatAttachment(attachment: ChatAttachment, name: string) {
   for (let index = 0; index < binary.length; index += 1) {
     bytes[index] = binary.charCodeAt(index)
   }
-  const url = URL.createObjectURL(new Blob([bytes], { type: attachment.mimeType }))
-  const anchor = window.document.createElement('a')
-  anchor.href = url
-  anchor.download = name
-  anchor.click()
-  URL.revokeObjectURL(url)
+  downloadBlob(new Blob([bytes], { type: attachment.mimeType }), name)
 }
 
 function readFileAsBase64(file: File): Promise<string> {
@@ -8625,12 +8612,12 @@ function getToolIcon(name: string) {
   if (name === 'grep' || name === 'glob' || name === 'history_search') return <FolderSearch size={12} />
   if (name === 'web_fetch' || name === 'web_search') return <Search size={12} />
   if (name === 'memory' || name === 'memorize' || name === 'shared_memory' || name === 'pin_context' || name === 'update_scratchpad') return <Database size={12} />
-  if (name === 'ask_agent' || name === 'task' || name === 'coordinate') return <Bot size={12} />
+  if (name === 'delegate' || name === 'session_agent' || name === 'task' || name === 'coordinate') return <Bot size={12} />
   if (name === 'task_output' || name === 'task_stop') return <TerminalSquare size={12} />
   if (name === 'ask_user') return <MessageSquare size={12} />
   if (name === 'scheduled_task') return <CalendarClock size={12} />
   if (name === 'todo' || name.startsWith('enter_plan') || name.startsWith('update_plan') || name === 'get_plan_status' || name === 'exit_plan_mode') return <ListChecks size={12} />
-  if (name === 'request_tool' || name === 'tools_list') return <Download size={12} />
+  if (name === 'tools_list') return <Download size={12} />
   if (name === 'run_tests' || name === 'verify_code' || name === 'review_changes') return <FileText size={12} />
   if (name === 'check_impact') return <FolderSearch size={12} />
   return <Zap size={12} />
@@ -8718,7 +8705,8 @@ function getToolPrimary(name: string, args: Record<string, unknown> | undefined)
     case 'memory': return a.action ? `${a.action}${a.key ? ': ' + a.key : ''}` : null
     case 'memorize': return a.key || null
     case 'coordinate': return Array.isArray(a.tasks) ? `${a.tasks.length} task${a.tasks.length !== 1 ? 's' : ''}` : null
-    case 'ask_agent': return a.query ? String(a.query).slice(0, 60) : null
+    case 'delegate': return a.task || a.question || a.action || null
+    case 'session_agent': return a.message || a.action || null
     case 'shared_memory': return a.key || a.action || null
     case 'pin_context':
     case 'update_scratchpad': return a.content ? String(a.content).slice(0, 60) : null
@@ -8734,7 +8722,6 @@ function getToolPrimary(name: string, args: Record<string, unknown> | undefined)
     case 'update_plan_progress': return a.step_id != null ? `step ${a.step_id}${a.action ? ': ' + a.action : ''}` : null
     case 'exit_plan_mode': return a.reason ? String(a.reason).slice(0, 60) : null
     case 'get_plan_status': return null
-    case 'request_tool': return a.tool_name ? String(a.tool_name) : null
     case 'tools_list': return null
     case 'run_tests': return a.path || a.filter || null
     case 'verify_code': return a.path || null
@@ -8765,7 +8752,8 @@ function verbLabel(name: string): string | null {
     case 'glob':
     case 'web_search': return 'Searched'
     case 'web_fetch': return 'Fetched'
-    case 'ask_agent': return 'Asked'
+    case 'delegate': return 'Delegated'
+    case 'session_agent': return 'Coordinated'
     case 'task': return 'Dispatched'
     case 'scheduled_task': return 'Managed'
     default: return null
@@ -9477,7 +9465,7 @@ function MessageBubbleInner({ message, projectID, sessionID, onRerun, onRetryErr
   }
 
   // Error messages get a special card
-  const isError = message.role === 'assistant' && message.content.startsWith('Error:')
+  const isError = message.role === 'assistant' && (message.isError || message.content.startsWith('Error:'))
   if (isError) {
     const errorText = message.content.replace(/^Error:\s*/, '')
     const lowerError = errorText.toLowerCase()
@@ -9656,7 +9644,12 @@ function MessageBubbleInner({ message, projectID, sessionID, onRerun, onRetryErr
             {changedFiles.some(isInlineArtifactPath) && (
               <div className="inline-artifact-list">
                 {changedFiles.filter(isInlineArtifactPath).slice(0, 3).map((path) => (
-                  <InlineArtifactCard key={path} projectID={projectID} sessionID={sessionID} path={path} />
+                  <InlineArtifactCard
+                    key={`${projectID.length}:${projectID}${sessionID.length}:${sessionID}${path}`}
+                    projectID={projectID}
+                    sessionID={sessionID}
+                    path={path}
+                  />
                 ))}
               </div>
             )}

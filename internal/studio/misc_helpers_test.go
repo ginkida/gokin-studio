@@ -1,6 +1,7 @@
 package studio
 
 import (
+	"context"
 	"os/exec"
 	"strings"
 	"testing"
@@ -90,6 +91,44 @@ func TestToolSetsForProvider(t *testing.T) {
 	}
 	if containsSet(glmSets, tools.ToolSetOllamaCore) {
 		t.Error("GLM/Kimi tool sets unexpectedly include legacy Ollama core")
+	}
+}
+
+func TestStudioRegistryOmitsUnwiredEngineAgentTools(t *testing.T) {
+	reg := newStudioToolRegistry(t.TempDir())
+
+	for _, name := range []string{"task", "coordinate"} {
+		if _, ok := reg.Get(name); ok {
+			t.Fatalf("Studio registry exposes %s without an engine Runner adapter", name)
+		}
+	}
+	for _, name := range []string{"bash", "task_output", "task_stop"} {
+		if _, ok := reg.Get(name); !ok {
+			t.Fatalf("Studio registry lost working background-shell tool %q", name)
+		}
+	}
+
+	for _, declaration := range toolDeclarationsForRegistry(reg, "glm") {
+		if declaration != nil && (declaration.Name == "task" || declaration.Name == "coordinate") {
+			t.Fatalf("Studio provider schema advertises unwired %s tool", declaration.Name)
+		}
+	}
+
+	listed, ok := reg.Get("tools_list")
+	if !ok {
+		t.Fatal("tools_list is missing")
+	}
+	result, err := listed.Execute(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"task", "coordinate"} {
+		if strings.Contains(result.Content, "- **"+name+"**:") {
+			t.Fatalf("tools_list advertises unwired %s tool: %q", name, result.Content)
+		}
+	}
+	if prompt := defaultSystemPrompt(t.TempDir(), "test"); strings.Contains(prompt, "task for background processes") {
+		t.Fatal("Studio system prompt still recommends the unavailable task tool")
 	}
 }
 

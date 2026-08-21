@@ -3,6 +3,7 @@ package studio
 import (
 	"context"
 	"fmt"
+	"github.com/ginkida/gokin-studio/internal/engine/wsl"
 	"os/exec"
 	"strings"
 	"time"
@@ -96,6 +97,7 @@ func runGitErr(dir string, timeout time.Duration, args ...string) (string, error
 	defer cancel()
 	full := append([]string{"-C", dir}, args...)
 	cmd := exec.CommandContext(ctx, "git", full...)
+	wsl.ApplyGit(cmd, dir, append([]string{"git"}, full...))
 	cmd.WaitDelay = gitWaitDelay
 	output := &cappedCommandOutput{limit: maxGitOutputBytes}
 	// A shared writer preserves CombinedOutput's useful stdout+stderr behavior.

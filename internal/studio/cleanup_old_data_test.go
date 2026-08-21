@@ -1,9 +1,12 @@
 package studio
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -42,6 +45,44 @@ func seedPreImportDir(t *testing.T, parent, suffix string, age time.Duration) st
 		t.Fatal(err)
 	}
 	return full
+}
+
+func seedOldDelegationChild(t *testing.T, s *Studio, age time.Duration) (*Project, *ChatSession, DelegationRun) {
+	t.Helper()
+	completedAt := time.Now().Add(-age).UnixMilli()
+	project := NewProject(ProjectConfig{ID: "cleanup-target", Name: "Target", Directory: t.TempDir()})
+	project.studio = s
+	child := NewChatSession("Delegation · Caller · Jan 02 15:04")
+	child.ID = "delegation-child"
+	child.delegateChild = true
+	child.ArchivedAt = completedAt
+	child.lastUsedAt = completedAt - 2_000
+	if err := SaveNewHistoryWithMetadata(
+		projectSessionStorageKey(project.ID, child.ID), child.Name, "", nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	history := historyPath(projectSessionStorageKey(project.ID, child.ID))
+	beforeCompletion := time.UnixMilli(completedAt - 1_000)
+	if err := os.Chtimes(history, beforeCompletion, beforeCompletion); err != nil {
+		t.Fatal(err)
+	}
+	project.mu.Lock()
+	project.sessions[child.ID] = child
+	project.mu.Unlock()
+	s.mu.Lock()
+	s.projects[project.ID] = project
+	s.mu.Unlock()
+	run := DelegationRun{
+		ID: "cleanup-run", Kind: "ask", Status: "completed",
+		FromProjectID: "caller", FromSessionID: "default",
+		ToProjectID: project.ID, ToSessionID: child.ID,
+		Task: "old bounded question", StartedAt: completedAt - 60_000, CompletedAt: completedAt,
+	}
+	if _, err := appendDelegationRun(run); err != nil {
+		t.Fatal(err)
+	}
+	return project, child, run
 }
 
 func TestCleanupOldData_RemovesStaleReplays(t *testing.T) {
@@ -102,6 +143,312 @@ func TestCleanupOldData_DryRunPreservesFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(stale); err != nil {
 		t.Errorf("DryRun deleted the file (shouldn't): %v", err)
+	}
+}
+
+func TestCleanupOldData_FailedDeletesAreNotReportedAsRemoved(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	cfgDir := configDir()
+	stale := seedStaleReplay(t, filepath.Join(cfgDir, "history"), "blocked.replay.jsonl", 10*24*time.Hour)
+	snapshot := seedPreImportDir(t, filepath.Dir(cfgDir), "blocked", 31*24*time.Hour)
+
+	previousRemoveFile, previousRemoveTree := cleanupRemoveFile, cleanupRemoveTree
+	cleanupRemoveFile = func(string) error { return errors.New("injected file removal failure") }
+	cleanupRemoveTree = func(string) error { return errors.New("injected tree removal failure") }
+	t.Cleanup(func() {
+		cleanupRemoveFile, cleanupRemoveTree = previousRemoveFile, previousRemoveTree
+	})
+
+	s := NewStudio()
+	result, err := s.CleanupOldData(CleanupParams{ReplayAgeDays: 7, PreImportDays: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.StaleReplaysRemoved != 0 || result.PreImportDirsRemoved != 0 || result.BytesFreed != 0 {
+		t.Fatalf("failed deletes were counted as successful: %+v", result)
+	}
+	if len(result.Errors) != 2 {
+		t.Fatalf("cleanup errors=%v, want both failed operations", result.Errors)
+	}
+	if _, err := os.Stat(stale); err != nil {
+		t.Fatalf("failed replay delete did not preserve its file: %v", err)
+	}
+	if _, err := os.Stat(snapshot); err != nil {
+		t.Fatalf("failed snapshot delete did not preserve its directory: %v", err)
+	}
+	foundWarning := false
+	for _, entry := range s.GetRecentLogs() {
+		if entry.Source == "cleanup" && entry.Level == "warn" && strings.Contains(entry.Message, "2 warning") {
+			foundWarning = true
+			break
+		}
+	}
+	if !foundWarning {
+		t.Fatalf("failed cleanup was not written to the event log: %+v", s.GetRecentLogs())
+	}
+}
+
+func TestCleanupOldData_SerializesConcurrentSweeps(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	stale := seedStaleReplay(t, filepath.Join(configDir(), "history"), "concurrent.replay.jsonl", 10*24*time.Hour)
+	previousRemove := cleanupRemoveFile
+	var removeCalls atomic.Int32
+	removeStarted := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseRemove := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseRemove()
+	cleanupRemoveFile = func(path string) error {
+		if removeCalls.Add(1) == 1 {
+			close(removeStarted)
+			<-release
+		}
+		return previousRemove(path)
+	}
+	t.Cleanup(func() { cleanupRemoveFile = previousRemove })
+
+	type outcome struct {
+		result *CleanupResult
+		err    error
+	}
+	s := NewStudio()
+	params := CleanupParams{ReplayAgeDays: 7}
+	firstDone := make(chan outcome, 1)
+	go func() {
+		result, err := s.CleanupOldData(params)
+		firstDone <- outcome{result: result, err: err}
+	}()
+	<-removeStarted
+	secondStarted := make(chan struct{})
+	secondDone := make(chan outcome, 1)
+	go func() {
+		close(secondStarted)
+		result, err := s.CleanupOldData(params)
+		secondDone <- outcome{result: result, err: err}
+	}()
+	<-secondStarted
+	select {
+	case second := <-secondDone:
+		t.Fatalf("second cleanup bypassed sweep serialization: %+v, %v", second.result, second.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if calls := removeCalls.Load(); calls != 1 {
+		t.Fatalf("concurrent sweeps attempted the same removal %d times", calls)
+	}
+
+	releaseRemove()
+	first, second := <-firstDone, <-secondDone
+	if first.err != nil || second.err != nil {
+		t.Fatalf("concurrent cleanup errors: first=%v second=%v", first.err, second.err)
+	}
+	if first.result.StaleReplaysRemoved != 1 || second.result.StaleReplaysRemoved != 0 {
+		t.Fatalf("concurrent cleanup results: first=%+v second=%+v", first.result, second.result)
+	}
+	if len(first.result.Errors) != 0 || len(second.result.Errors) != 0 || removeCalls.Load() != 1 {
+		t.Fatalf("serialized cleanup produced duplicate work/errors: first=%+v second=%+v calls=%d", first.result, second.result, removeCalls.Load())
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("serialized cleanup did not remove the stale replay: %v", err)
+	}
+}
+
+func TestCleanupOldData_RemovesOldDelegationAfterChildChat(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	s := NewStudio()
+	project, child, run := seedOldDelegationChild(t, s, 31*24*time.Hour)
+
+	result, err := s.CleanupOldData(CleanupParams{DelegationAgeDays: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DelegationRunsRemoved != 1 || result.DelegationRunsSkipped != 0 {
+		t.Fatalf("unexpected delegation cleanup result: %+v", result)
+	}
+	if result.BytesFreed == 0 {
+		t.Error("delegation record removal should contribute durable-store bytes")
+	}
+	project.mu.RLock()
+	_, childExists := project.sessions[child.ID]
+	project.mu.RUnlock()
+	if childExists {
+		t.Fatal("child chat still exists after its delegation record was removed")
+	}
+	if _, exists := mustLoadDelegationRun(t, run.ID); exists {
+		t.Fatal("old delegation record still exists after child cleanup succeeded")
+	}
+	if _, err := os.Stat(historyPath(projectSessionStorageKey(project.ID, child.ID))); !os.IsNotExist(err) {
+		t.Fatalf("child history was not removed: %v", err)
+	}
+}
+
+func TestCleanupOldData_DelegationDryRunPreservesChatAndRecord(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	s := NewStudio()
+	project, child, run := seedOldDelegationChild(t, s, 31*24*time.Hour)
+
+	result, err := s.CleanupOldData(CleanupParams{DelegationAgeDays: 30, DryRun: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DelegationRunsRemoved != 1 || !result.DryRun {
+		t.Fatalf("dry-run did not report the safe delegation candidate: %+v", result)
+	}
+	project.mu.RLock()
+	_, childExists := project.sessions[child.ID]
+	project.mu.RUnlock()
+	if !childExists {
+		t.Fatal("dry-run deleted the child chat")
+	}
+	if _, exists := mustLoadDelegationRun(t, run.ID); !exists {
+		t.Fatal("dry-run deleted the delegation record")
+	}
+}
+
+func TestCleanupOldData_RetainsProtectedDelegationAndDurableLink(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	s := NewStudio()
+	project, child, run := seedOldDelegationChild(t, s, 31*24*time.Hour)
+	if err := s.SaveDraft(project.ID, child.ID, "keep this follow-up"); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := s.CleanupOldData(CleanupParams{DelegationAgeDays: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DelegationRunsRemoved != 0 || result.DelegationRunsSkipped != 1 {
+		t.Fatalf("protected delegation should be retained: %+v", result)
+	}
+	project.mu.RLock()
+	_, childExists := project.sessions[child.ID]
+	project.mu.RUnlock()
+	if !childExists {
+		t.Fatal("cleanup deleted a delegation chat with an unsent draft")
+	}
+	if _, exists := mustLoadDelegationRun(t, run.ID); !exists {
+		t.Fatal("cleanup dropped the durable link for a protected child chat")
+	}
+}
+
+func TestCleanupOldData_DoesNotStopActiveDelegationChat(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	s := NewStudio()
+	project, child, run := seedOldDelegationChild(t, s, 31*24*time.Hour)
+	child.mu.Lock()
+	child.active = true
+	child.mu.Unlock()
+
+	result, err := s.CleanupOldData(CleanupParams{DelegationAgeDays: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DelegationRunsRemoved != 0 || result.DelegationRunsSkipped != 1 {
+		t.Fatalf("active delegation should be retained: %+v", result)
+	}
+	child.mu.RLock()
+	stillActive := child.active
+	child.mu.RUnlock()
+	if !stillActive {
+		t.Fatal("cleanup stopped the active child chat")
+	}
+	if _, exists := mustLoadDelegationRun(t, run.ID); !exists {
+		t.Fatal("cleanup dropped the durable link for an active child chat")
+	}
+	project.mu.RLock()
+	_, childExists := project.sessions[child.ID]
+	project.mu.RUnlock()
+	if !childExists {
+		t.Fatal("cleanup deleted the active child chat")
+	}
+}
+
+func TestCleanupOldData_RetainsDelegationHistoryChangedAfterCompletion(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	s := NewStudio()
+	project, child, run := seedOldDelegationChild(t, s, 31*24*time.Hour)
+	// Simulate a restart (lastUsedAt is ephemeral) followed by later activity.
+	child.mu.Lock()
+	child.lastUsedAt = 0
+	child.mu.Unlock()
+	now := time.Now()
+	if err := os.Chtimes(historyPath(projectSessionStorageKey(project.ID, child.ID)), now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := s.CleanupOldData(CleanupParams{DelegationAgeDays: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DelegationRunsRemoved != 0 || result.DelegationRunsSkipped != 1 {
+		t.Fatalf("subsequently-used delegation should be retained: %+v", result)
+	}
+	if _, exists := mustLoadDelegationRun(t, run.ID); !exists {
+		t.Fatal("cleanup dropped the durable link after later chat activity")
+	}
+}
+
+func TestCleanupOldData_RetainsDelegationForArchivedProject(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	s := NewStudio()
+	s.config = defaultConfig()
+	project, child, run := seedOldDelegationChild(t, s, 31*24*time.Hour)
+	if err := s.ArchiveProject(project.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	preview, err := s.CleanupOldData(CleanupParams{DelegationAgeDays: 30, DryRun: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.DelegationRunsRemoved != 0 || preview.DelegationRunsSkipped != 1 {
+		t.Fatalf("archived target should be protected in preview: %+v", preview)
+	}
+	result, err := s.CleanupOldData(CleanupParams{DelegationAgeDays: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DelegationRunsRemoved != 0 || result.DelegationRunsSkipped != 1 {
+		t.Fatalf("archived target should be protected during cleanup: %+v", result)
+	}
+	if _, exists := mustLoadDelegationRun(t, run.ID); !exists {
+		t.Fatal("cleanup dropped the durable link for an archived project's child chat")
+	}
+	if _, err := os.Stat(historyPath(projectSessionStorageKey(project.ID, child.ID))); err != nil {
+		t.Fatalf("cleanup removed archived child history: %v", err)
+	}
+
+	if _, err := s.RestoreProject(project.ID); err != nil {
+		t.Fatal(err)
+	}
+	restored := s.projects[project.ID]
+	restored.mu.RLock()
+	_, childExists := restored.sessions[child.ID]
+	restored.mu.RUnlock()
+	if !childExists {
+		t.Fatal("delegation child chat did not survive archive, cleanup, and restore")
+	}
+}
+
+func TestCleanupOldData_RemovesOrphanedDelegationRecord(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	completedAt := time.Now().Add(-31 * 24 * time.Hour).UnixMilli()
+	if _, err := appendDelegationRun(DelegationRun{
+		ID: "orphaned-run", Kind: "run", Status: "error",
+		ToProjectID: "missing-project", ToSessionID: "missing-session",
+		Task: "old task", StartedAt: completedAt - 1_000, CompletedAt: completedAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s := NewStudio()
+	result, err := s.CleanupOldData(CleanupParams{DelegationAgeDays: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DelegationRunsRemoved != 1 {
+		t.Fatalf("orphaned durable row was not removed: %+v", result)
+	}
+	if _, exists := mustLoadDelegationRun(t, "orphaned-run"); exists {
+		t.Fatal("orphaned delegation record still exists")
 	}
 }
 
@@ -205,6 +552,10 @@ func TestCleanupOldData_ValidationRejectsNegative(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "preImportDays") {
 		t.Errorf("expected preImportDays validation error, got %v", err)
 	}
+	_, err = s.CleanupOldData(CleanupParams{DelegationAgeDays: -1})
+	if err == nil || !strings.Contains(err.Error(), "delegationAgeDays") {
+		t.Errorf("expected delegationAgeDays validation error, got %v", err)
+	}
 }
 
 func TestCleanupOldData_ZeroAgeSkipsCategory(t *testing.T) {
@@ -213,10 +564,11 @@ func TestCleanupOldData_ZeroAgeSkipsCategory(t *testing.T) {
 	histDir := filepath.Join(cfgDir, "history")
 	// Very old replay — should normally be deleted.
 	stale := seedStaleReplay(t, histDir, "x.replay.jsonl", 100*24*time.Hour)
+	snapshot := seedPreImportDir(t, filepath.Dir(cfgDir), "zero-disabled", 100*24*time.Hour)
 
 	s := NewStudio()
-	// ReplayAgeDays=0 → skip the replay category entirely.
-	result, err := s.CleanupOldData(CleanupParams{ReplayAgeDays: 0, PreImportDays: 7})
+	// Zero → skip both age-gated categories entirely.
+	result, err := s.CleanupOldData(CleanupParams{ReplayAgeDays: 0, PreImportDays: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,6 +577,12 @@ func TestCleanupOldData_ZeroAgeSkipsCategory(t *testing.T) {
 	}
 	if _, err := os.Stat(stale); err != nil {
 		t.Errorf("stale replay was removed despite ReplayAgeDays=0: %v", err)
+	}
+	if result.PreImportDirsRemoved != 0 {
+		t.Errorf("PreImportDays=0 should skip snapshots; got removed=%d", result.PreImportDirsRemoved)
+	}
+	if _, err := os.Stat(snapshot); err != nil {
+		t.Errorf("old snapshot was removed despite PreImportDays=0: %v", err)
 	}
 }
 

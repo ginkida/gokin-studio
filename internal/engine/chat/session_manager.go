@@ -21,7 +21,11 @@ type SessionManager struct {
 	lastSaveTime   time.Time
 	saveTimer      *time.Timer
 	stopChan       chan struct{}
+	stopDone       chan struct{}
 	asyncSaveCh    chan struct{} // Buffered channel for async save dedup
+	backgroundWG   sync.WaitGroup
+	started        bool
+	stopped        bool
 }
 
 // SessionManagerConfig configures session persistence behavior.
@@ -46,6 +50,9 @@ func DefaultSessionManagerConfig() SessionManagerConfig {
 
 // NewSessionManager creates a new session manager.
 func NewSessionManager(session *Session, config SessionManagerConfig) (*SessionManager, error) {
+	if session == nil {
+		return nil, fmt.Errorf("session is required")
+	}
 	historyMgr, err := NewHistoryManager()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create history manager: %w", err)
@@ -56,6 +63,7 @@ func NewSessionManager(session *Session, config SessionManagerConfig) (*SessionM
 		historyManager: historyMgr,
 		config:         config,
 		stopChan:       make(chan struct{}),
+		stopDone:       make(chan struct{}),
 	}
 
 	return sm, nil
@@ -68,22 +76,52 @@ func (sm *SessionManager) Start(ctx context.Context) {
 	}
 
 	sm.mu.Lock()
+	if sm.started || sm.stopped {
+		sm.mu.Unlock()
+		return
+	}
+	sm.started = true
 	sm.lastSaveTime = time.Now()
 	sm.asyncSaveCh = make(chan struct{}, 1)
-	// Start periodic save timer
-	sm.saveTimer = time.AfterFunc(sm.config.SaveInterval, func() {
-		sm.periodicSave()
-	})
+	interval := sm.config.SaveInterval
+	if interval <= 0 {
+		interval = DefaultSessionManagerConfig().SaveInterval
+		sm.config.SaveInterval = interval
+	}
+	timer := time.NewTimer(interval)
+	sm.saveTimer = timer
+	sm.backgroundWG.Add(3)
 	sm.mu.Unlock()
 
 	// Background async saver: deduplicates rapid save requests.
 	// Multiple SaveAfterMessage() calls within a short window produce one Save().
 	go func() {
+		defer sm.backgroundWG.Done()
+		defer timer.Stop()
 		for {
 			select {
 			case <-sm.asyncSaveCh:
 				// Debounce: wait briefly to coalesce rapid saves
-				time.Sleep(100 * time.Millisecond)
+				timer := time.NewTimer(100 * time.Millisecond)
+				select {
+				case <-timer.C:
+				case <-sm.stopChan:
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					return
+				case <-ctx.Done():
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					return
+				}
 				// Drain any extra signals that arrived during sleep
 				select {
 				case <-sm.asyncSaveCh:
@@ -92,6 +130,24 @@ func (sm *SessionManager) Start(ctx context.Context) {
 				if err := sm.Save(); err != nil {
 					logging.Debug("async save failed", "error", err)
 				}
+			case <-sm.stopChan:
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// Keep the periodic timer in the same lifecycle barrier as async saves, so
+	// Stop cannot return while its callback is still observing manager state.
+	go func() {
+		defer sm.backgroundWG.Done()
+		for {
+			select {
+			case <-timer.C:
+				sm.periodicSave()
+			case <-sm.stopChan:
+				return
 			case <-ctx.Done():
 				return
 			}
@@ -99,7 +155,10 @@ func (sm *SessionManager) Start(ctx context.Context) {
 	}()
 
 	// Clean up old sessions in background (outside lock)
-	go sm.CleanupOldSessions()
+	go func() {
+		defer sm.backgroundWG.Done()
+		_ = sm.CleanupOldSessions()
+	}()
 }
 
 // Note: Stop() is responsible for cleaning up the timer.
@@ -108,36 +167,45 @@ func (sm *SessionManager) Start(ctx context.Context) {
 
 // Stop gracefully shuts down the session manager.
 func (sm *SessionManager) Stop() {
-	// Stop the save timer first
 	sm.mu.Lock()
+	if sm.stopped {
+		done := sm.stopDone
+		sm.mu.Unlock()
+		<-done
+		return
+	}
+	sm.stopped = true
 	if sm.saveTimer != nil {
 		sm.saveTimer.Stop()
 		sm.saveTimer = nil
 	}
+	close(sm.stopChan)
+	done := sm.stopDone
 	sm.mu.Unlock()
-
-	// Close stop channel to signal any listeners
-	select {
-	case <-sm.stopChan:
-		// Already closed
-	default:
-		close(sm.stopChan)
-	}
+	defer close(done)
+	sm.backgroundWG.Wait()
 
 	// Final save on shutdown
-	if err := sm.Save(); err != nil {
+	if err := sm.save(true); err != nil {
 		logging.Warn("failed to save session on shutdown", "error", err)
 	}
 }
 
 // Save saves the current session state.
 func (sm *SessionManager) Save() error {
+	return sm.save(false)
+}
+
+func (sm *SessionManager) save(final bool) error {
 	if !sm.config.Enabled {
 		return nil
 	}
 
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	if sm.stopped && !final {
+		return nil
+	}
 
 	if err := sm.historyManager.SaveFull(sm.session); err != nil {
 		return fmt.Errorf("failed to save session: %w", err)
@@ -225,9 +293,13 @@ func (sm *SessionManager) SaveAfterMessage() error {
 
 	// Non-blocking async save: signals background goroutine.
 	// If a save is already pending, this is a no-op (dedup).
-	if sm.asyncSaveCh != nil {
+	sm.mu.Lock()
+	asyncSaveCh := sm.asyncSaveCh
+	stopped := sm.stopped
+	sm.mu.Unlock()
+	if asyncSaveCh != nil && !stopped {
 		select {
-		case sm.asyncSaveCh <- struct{}{}:
+		case asyncSaveCh <- struct{}{}:
 		default: // save already pending
 		}
 	}

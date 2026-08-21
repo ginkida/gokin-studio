@@ -36,6 +36,12 @@ type ChatSession struct {
 	queueWorker bool
 	queueHalt   bool
 
+	// incomingDelegation is the chain stamp for the turn that is about to run
+	// (or is running) in this session. It is set inside the same critical
+	// section that claims queueWorker, snapshotted at turn start, and cleared
+	// immediately afterwards so it can never leak into a later human turn.
+	incomingDelegation *delegationStamp
+
 	// execution* are ephemeral, session-scoped overrides used by scheduled
 	// task runs. They deliberately never mutate the parent Project: a Kimi
 	// scheduled run can execute alongside a normal GLM chat without either
@@ -46,6 +52,17 @@ type ChatSession struct {
 	executionSystemPrompt   string
 	executionAllowedTools   map[string]bool
 	pluginAgentChild        bool
+	// delegateChild marks a chat created to service a cross-project
+	// delegation. Like a scheduled or plugin-agent child it may not originate
+	// further cross-agent work, so a relay cannot be built out of children.
+	delegateChild bool
+
+	// deniedTools and mutatedThisTurn are per-turn observations the delegation
+	// monitor reads: a caller must be told when the target finished but some
+	// tool calls were blocked, and a cancelled delegation that already wrote
+	// something is not a rolled-back delegation.
+	deniedTools     []string
+	mutatedThisTurn bool
 
 	// permissionMode is an ephemeral user-selected override for this chat.
 	// Only "plan" is stored here: Manual/Accept edits/Auto/Skip remain durable folder
@@ -70,9 +87,13 @@ type ChatSession struct {
 	WorktreeBranch   string
 	WorktreeBaseHead string
 	WorktreeError    string
-	registry         *tools.Registry
-	taskManager      *tasks.Manager
-	planManager      *plan.Manager
+	// IsolationSkippedReason explains why this chat has no private checkout —
+	// currently only WSL projects, whose repository lives inside the distro
+	// while the worktree would land on the Windows drive.
+	IsolationSkippedReason string
+	registry               *tools.Registry
+	taskManager            *tasks.Manager
+	planManager            *plan.Manager
 
 	// historyEpoch changes when the transcript is explicitly cleared. An
 	// ephemeral side question captures the epoch with its context snapshot and
@@ -85,6 +106,11 @@ type queuedTurn struct {
 	Message         string
 	AttachmentParts []*genai.Part
 	QueuedAt        int64
+	// Delegation travels with the queued item, not with the session. Two
+	// delegated messages can sit in one session's queue; if the stamp lived
+	// only on the session, the first turn's start would clear it and the
+	// second would run as if a human had typed it — escaping the depth guard.
+	Delegation *delegationStamp
 }
 
 // Stop cancels any in-progress generation for this session.
@@ -126,16 +152,17 @@ type ChatSessionInfo struct {
 	// (non-forked) sessions; ParentName is filled in by ListChatSessions
 	// from a sibling-lookup so the UI can show "↳ <name>" without an extra
 	// RPC. ParentName falls back to "(deleted)" when the parent is gone.
-	ParentID         string `json:"parentID,omitempty"`
-	ParentName       string `json:"parentName,omitempty"`
-	Pinned           bool   `json:"pinned,omitempty"`
-	WorktreeIsolated bool   `json:"worktreeIsolated,omitempty"`
-	WorktreePath     string `json:"worktreePath,omitempty"`
-	WorktreeBranch   string `json:"worktreeBranch,omitempty"`
-	WorktreeError    string `json:"worktreeError,omitempty"`
-	PermissionMode   string `json:"permissionMode,omitempty"`
-	Archived         bool   `json:"archived,omitempty"`
-	ArchivedAt       int64  `json:"archivedAt,omitempty"`
+	ParentID               string `json:"parentID,omitempty"`
+	ParentName             string `json:"parentName,omitempty"`
+	Pinned                 bool   `json:"pinned,omitempty"`
+	WorktreeIsolated       bool   `json:"worktreeIsolated,omitempty"`
+	WorktreePath           string `json:"worktreePath,omitempty"`
+	WorktreeBranch         string `json:"worktreeBranch,omitempty"`
+	WorktreeError          string `json:"worktreeError,omitempty"`
+	PermissionMode         string `json:"permissionMode,omitempty"`
+	IsolationSkippedReason string `json:"isolationSkippedReason,omitempty"`
+	Archived               bool   `json:"archived,omitempty"`
+	ArchivedAt             int64  `json:"archivedAt,omitempty"`
 }
 
 // NewChatSession creates a new session with a generated ID.
@@ -161,21 +188,22 @@ func (s *ChatSession) Info() *ChatSessionInfo {
 		}
 	}
 	return &ChatSessionInfo{
-		ID:               s.ID,
-		Name:             s.Name,
-		Active:           s.active,
-		Messages:         msgCount,
-		CreatedAt:        s.CreatedAt.UnixMilli(),
-		LastUsedAt:       s.lastUsedAt,
-		ParentID:         s.ParentID,
-		Pinned:           s.Pinned,
-		WorktreeIsolated: s.WorktreePath != "",
-		WorktreePath:     s.WorktreeWorkDir,
-		WorktreeBranch:   s.WorktreeBranch,
-		WorktreeError:    s.WorktreeError,
-		PermissionMode:   s.permissionMode,
-		Archived:         s.ArchivedAt > 0,
-		ArchivedAt:       s.ArchivedAt,
+		ID:                     s.ID,
+		Name:                   s.Name,
+		Active:                 s.active,
+		Messages:               msgCount,
+		CreatedAt:              s.CreatedAt.UnixMilli(),
+		LastUsedAt:             s.lastUsedAt,
+		ParentID:               s.ParentID,
+		Pinned:                 s.Pinned,
+		WorktreeIsolated:       s.WorktreePath != "",
+		WorktreePath:           s.WorktreeWorkDir,
+		WorktreeBranch:         s.WorktreeBranch,
+		WorktreeError:          s.WorktreeError,
+		IsolationSkippedReason: s.IsolationSkippedReason,
+		PermissionMode:         s.permissionMode,
+		Archived:               s.ArchivedAt > 0,
+		ArchivedAt:             s.ArchivedAt,
 		// ParentName is populated by ListChatSessions's sibling-lookup, not here.
 	}
 }

@@ -11,8 +11,9 @@ import (
 // installed-app client credentials. Studio doesn't expose Gemini as a
 // provider; this code is engine-level scaffolding kept for downstream
 // integrations. To enable Gemini OAuth, set both env vars before launch:
-//   GOKIN_GEMINI_OAUTH_CLIENT_ID
-//   GOKIN_GEMINI_OAUTH_CLIENT_SECRET
+//
+//	GOKIN_GEMINI_OAUTH_CLIENT_ID
+//	GOKIN_GEMINI_OAUTH_CLIENT_SECRET
 //
 // (Per Google's "Installed Apps" docs the secret is not considered
 // confidential, but GitHub Push Protection flags any GOCSPX-* pattern, and

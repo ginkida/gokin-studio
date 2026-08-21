@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/ginkida/gokin-studio/internal/engine/security"
+	"github.com/ginkida/gokin-studio/internal/engine/wsl"
 	"google.golang.org/genai"
 )
 
@@ -17,6 +19,27 @@ type GitPRTool struct {
 // NewGitPRTool creates a new GitPRTool instance.
 func NewGitPRTool(workDir string) *GitPRTool {
 	return &GitPRTool{workDir: workDir}
+}
+
+// runGH runs a gh invocation in the tool's work directory.
+//
+// For a WSL project the checkout lives inside the distro, so host gh would read
+// the distro's git config over the 9P share while authenticating as the Windows
+// user — a different `gh auth` identity than the one the user set up next to the
+// repo, and a different git. Routing puts gh where the repo is.
+//
+// wsl.DetectFor returns a host target for every non-WSL directory and ApplyExec
+// then leaves the command untouched, so this is byte-identical off Windows.
+func (t *GitPRTool) runGH(ctx context.Context, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "gh", args...)
+	// Dir must be final before ApplyExec, which deliberately CLEARS it: a UNC
+	// path is not a legal working directory for the wsl.exe process itself, and
+	// the distro-side directory travels in the plan instead. Restoring cmd.Dir
+	// afterwards would hand CreateProcess the illegal value again.
+	cmd.Dir = t.workDir
+	wsl.ApplyExec(cmd, wsl.DetectFor(t.workDir), append([]string{"gh"}, args...),
+		security.WorkspaceEnvironmentSnapshot())
+	return cmd.CombinedOutput()
 }
 
 func (t *GitPRTool) Name() string { return "git_pr" }
@@ -94,9 +117,15 @@ func (t *GitPRTool) Validate(args map[string]any) error {
 }
 
 func (t *GitPRTool) Execute(ctx context.Context, args map[string]any) (ToolResult, error) {
-	// Check if gh is available
-	if _, err := exec.LookPath("gh"); err != nil {
-		return NewErrorResult("gh CLI is not installed. Install it from https://cli.github.com/"), nil
+	// Ask where the command will actually run. A host exec.LookPath cannot see a
+	// gh installed inside the distro — WSL interop pushes the Windows PATH in,
+	// never the distro's PATH out — so a host-only check would reject exactly
+	// the projects whose gh sits next to the repo, and would do it before any
+	// routing could happen.
+	target := wsl.DetectFor(t.workDir)
+	if err := wsl.LookPathFor(ctx, target, "gh"); err != nil {
+		return NewErrorResult(wsl.MissingCommandHint(target, "gh",
+			"gh CLI is not installed. Install it from https://cli.github.com/")), nil
 	}
 
 	action, _ := GetString(args, "action")
@@ -163,9 +192,7 @@ func (t *GitPRTool) createPR(ctx context.Context, args map[string]any) (ToolResu
 		cmdArgs = append(cmdArgs, "--draft")
 	}
 
-	cmd := exec.CommandContext(ctx, "gh", cmdArgs...)
-	cmd.Dir = t.workDir
-	output, err := cmd.CombinedOutput()
+	output, err := t.runGH(ctx, cmdArgs...)
 	if err != nil {
 		return NewErrorResult(fmt.Sprintf("failed to create PR: %s\n%s", err, string(output))), nil
 	}
@@ -174,9 +201,7 @@ func (t *GitPRTool) createPR(ctx context.Context, args map[string]any) (ToolResu
 }
 
 func (t *GitPRTool) listPRs(ctx context.Context, _ map[string]any) (ToolResult, error) {
-	cmd := exec.CommandContext(ctx, "gh", "pr", "list", "--limit", "20")
-	cmd.Dir = t.workDir
-	output, err := cmd.CombinedOutput()
+	output, err := t.runGH(ctx, "pr", "list", "--limit", "20")
 	if err != nil {
 		return NewErrorResult(fmt.Sprintf("failed to list PRs: %s\n%s", err, string(output))), nil
 	}
@@ -190,9 +215,7 @@ func (t *GitPRTool) listPRs(ctx context.Context, _ map[string]any) (ToolResult, 
 
 func (t *GitPRTool) viewPR(ctx context.Context, args map[string]any) (ToolResult, error) {
 	prNum, _ := GetString(args, "pr_number")
-	cmd := exec.CommandContext(ctx, "gh", "pr", "view", prNum)
-	cmd.Dir = t.workDir
-	output, err := cmd.CombinedOutput()
+	output, err := t.runGH(ctx, "pr", "view", prNum)
 	if err != nil {
 		return NewErrorResult(fmt.Sprintf("failed to view PR: %s\n%s", err, string(output))), nil
 	}
@@ -201,9 +224,7 @@ func (t *GitPRTool) viewPR(ctx context.Context, args map[string]any) (ToolResult
 
 func (t *GitPRTool) checksPR(ctx context.Context, args map[string]any) (ToolResult, error) {
 	prNum, _ := GetString(args, "pr_number")
-	cmd := exec.CommandContext(ctx, "gh", "pr", "checks", prNum)
-	cmd.Dir = t.workDir
-	output, err := cmd.CombinedOutput()
+	output, err := t.runGH(ctx, "pr", "checks", prNum)
 	if err != nil {
 		// Checks command may exit non-zero if checks are failing
 		return NewSuccessResult(fmt.Sprintf("PR #%s checks:\n%s", prNum, strings.TrimSpace(string(output)))), nil
@@ -213,9 +234,7 @@ func (t *GitPRTool) checksPR(ctx context.Context, args map[string]any) (ToolResu
 
 func (t *GitPRTool) mergePR(ctx context.Context, args map[string]any) (ToolResult, error) {
 	prNum, _ := GetString(args, "pr_number")
-	cmd := exec.CommandContext(ctx, "gh", "pr", "merge", prNum, "--merge")
-	cmd.Dir = t.workDir
-	output, err := cmd.CombinedOutput()
+	output, err := t.runGH(ctx, "pr", "merge", prNum, "--merge")
 	if err != nil {
 		return NewErrorResult(fmt.Sprintf("failed to merge PR: %s\n%s", err, string(output))), nil
 	}
@@ -224,9 +243,7 @@ func (t *GitPRTool) mergePR(ctx context.Context, args map[string]any) (ToolResul
 
 func (t *GitPRTool) closePR(ctx context.Context, args map[string]any) (ToolResult, error) {
 	prNum, _ := GetString(args, "pr_number")
-	cmd := exec.CommandContext(ctx, "gh", "pr", "close", prNum)
-	cmd.Dir = t.workDir
-	output, err := cmd.CombinedOutput()
+	output, err := t.runGH(ctx, "pr", "close", prNum)
 	if err != nil {
 		return NewErrorResult(fmt.Sprintf("failed to close PR: %s\n%s", err, string(output))), nil
 	}

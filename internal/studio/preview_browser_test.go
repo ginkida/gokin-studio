@@ -34,6 +34,45 @@ func TestPreviewBrowserToolRoutesSessionAndReturnsVisionEvidence(t *testing.T) {
 	}
 }
 
+func TestPreviewBrowserRegistrySerializesEachExactFrame(t *testing.T) {
+	registry := newPreviewBrowserRegistry()
+	first := &previewBrowserPending{projectID: "project", sessionID: "chat", configuration: "web", bridgeToken: "token-one"}
+	if _, err := registry.register("first", first); err != nil {
+		t.Fatalf("register first frame action: %v", err)
+	}
+	if _, err := registry.register("parallel", &previewBrowserPending{projectID: "project", sessionID: "chat", configuration: "web", bridgeToken: "token-one"}); err == nil || !strings.Contains(err.Error(), "already in progress") {
+		t.Fatalf("same-frame parallel action was not rejected: %v", err)
+	}
+	if _, err := registry.register("replacement", &previewBrowserPending{projectID: "project", sessionID: "chat", configuration: "web", bridgeToken: "token-two"}); err != nil {
+		t.Fatalf("replacement frame action rejected: %v", err)
+	}
+	if _, err := registry.register("other-chat", &previewBrowserPending{projectID: "project", sessionID: "other", configuration: "web", bridgeToken: "token-one"}); err != nil {
+		t.Fatalf("independent chat action rejected: %v", err)
+	}
+	if _, err := registry.register("first", &previewBrowserPending{projectID: "other-project", sessionID: "chat", configuration: "web", bridgeToken: "token"}); err == nil || !strings.Contains(err.Error(), "identity already exists") {
+		t.Fatalf("duplicate request identity was not rejected: %v", err)
+	}
+	registry.cleanup("first", first)
+	if _, err := registry.register("after-cleanup", &previewBrowserPending{projectID: "project", sessionID: "chat", configuration: "web", bridgeToken: "token-one"}); err != nil {
+		t.Fatalf("frame remained locked after cleanup: %v", err)
+	}
+	old := &previewBrowserPending{projectID: "old", sessionID: "chat", configuration: "web", bridgeToken: "old-token"}
+	if _, err := registry.register("reused", old); err != nil {
+		t.Fatalf("register old identity owner: %v", err)
+	}
+	if !registry.resolve("reused", `{"error":"done"}`) {
+		t.Fatal("resolve old identity owner")
+	}
+	replacement := &previewBrowserPending{projectID: "new", sessionID: "chat", configuration: "web", bridgeToken: "new-token"}
+	if _, err := registry.register("reused", replacement); err != nil {
+		t.Fatalf("reuse released identity: %v", err)
+	}
+	registry.cleanup("reused", old)
+	if _, err := registry.register("probe", &previewBrowserPending{projectID: replacement.projectID, sessionID: replacement.sessionID, configuration: replacement.configuration, bridgeToken: replacement.bridgeToken}); err == nil || !strings.Contains(err.Error(), "already in progress") {
+		t.Fatalf("stale cleanup removed the replacement owner: %v", err)
+	}
+}
+
 func TestPreviewBrowserToolPrefersVisibleStaticFileOverRunningDevServer(t *testing.T) {
 	s := NewStudio()
 	s.ctx = context.Background()
@@ -68,7 +107,10 @@ func TestPreviewBrowserToolValidatesConstrainedActions(t *testing.T) {
 	invalid := []map[string]any{
 		{"action": "navigate", "url": "https://example.com"},
 		{"action": "click", "x": 1},
+		{"action": "click", "x": -1, "y": 2},
+		{"action": "click", "x": 1, "y": 10001},
 		{"action": "fill", "x": 1, "y": 2, "text": ""},
+		{"action": "fill", "x": 10001, "y": 2, "text": "value"},
 		{"action": "scroll", "deltaY": 9000},
 		{"action": "key", "key": "CMD+Q"},
 	}
@@ -81,6 +123,20 @@ func TestPreviewBrowserToolValidatesConstrainedActions(t *testing.T) {
 		if err := tool.Validate(args); err != nil {
 			t.Fatalf("rejected valid action %#v: %v", args, err)
 		}
+	}
+}
+
+func TestResolvePreviewBrowserRequestRejectsNullPayload(t *testing.T) {
+	s := NewStudio()
+	pending := &previewBrowserPending{projectID: "project", sessionID: "chat", configuration: "web", bridgeToken: "token"}
+	if _, err := s.previewBrowser.register("request", pending); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ResolvePreviewBrowserRequest("request", `null`); err == nil || !strings.Contains(err.Error(), "invalid JSON") {
+		t.Fatalf("null payload was accepted: %v", err)
+	}
+	if !s.previewBrowser.resolve("request", `{"error":"cleanup"}`) {
+		t.Fatal("invalid payload consumed the pending request")
 	}
 }
 

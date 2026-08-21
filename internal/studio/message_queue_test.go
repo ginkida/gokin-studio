@@ -1,6 +1,7 @@
 package studio
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -117,6 +118,35 @@ func TestMessageQueueRemoveAndStopClearPending(t *testing.T) {
 	ev, ok := cleared[0].data.(ChatQueueEvent)
 	if !ok || len(ev.IDs) != 1 || ev.IDs[0] != "q2" {
 		t.Fatalf("queue-cleared event = %#v", cleared[0].data)
+	}
+}
+
+func TestStopBetweenQueueClaimAndAgentStartPreventsFirstProviderCall(t *testing.T) {
+	mc := &mockClient{responses: []mockResp{{text: "must not run"}}}
+	p, _ := newTestProject(t, mc, tools.NewRegistry())
+	session := p.GetSession("default")
+
+	// Reproduce the synchronous claim made by startMessage before its worker
+	// goroutine begins. In this window cancelFn does not exist yet.
+	session.mu.Lock()
+	session.queueWorker = true
+	session.queueHalt = false
+	session.mu.Unlock()
+	session.Stop()
+
+	p.SendMessage(context.Background(), "already stopped", Settings{
+		DefaultProvider: "glm", DefaultModel: "glm-5.2",
+	}, "default")
+
+	mc.mu.Lock()
+	calls := mc.callCount
+	mc.mu.Unlock()
+	session.mu.RLock()
+	active := session.active
+	history := append([]*genai.Content(nil), session.history...)
+	session.mu.RUnlock()
+	if calls != 0 || active || len(history) != 0 {
+		t.Fatalf("stopped micro-phase reached provider: calls=%d active=%v history=%#v", calls, active, history)
 	}
 }
 

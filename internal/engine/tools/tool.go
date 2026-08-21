@@ -27,18 +27,6 @@ type Tool interface {
 	Validate(args map[string]any) error
 }
 
-// ToolRequester is an interface for components that can add tools dynamically.
-// Implemented by agent.Agent.
-type ToolRequester interface {
-	RequestTool(name string) error
-}
-
-// Messenger is an interface for inter-agent communication.
-type Messenger interface {
-	SendMessage(msgType string, toRole string, content string, data map[string]any) (string, error)
-	ReceiveResponse(ctx context.Context, messageID string) (string, error)
-}
-
 // MultimodalPart represents binary data (image, etc.) to be sent to the LLM
 // alongside the text response for visual analysis.
 type MultimodalPart struct {
@@ -91,6 +79,17 @@ func NewSuccessResultWithData(content string, data any) ToolResult {
 func NewErrorResult(errMsg string) ToolResult {
 	return ToolResult{
 		Error:   errMsg,
+		Success: false,
+	}
+}
+
+// NewErrorResultWithData creates a failed tool result that still carries
+// structured data — used when the failure is a caller mistake and the data
+// tells the model how to correct it (e.g. the list of valid targets).
+func NewErrorResultWithData(errMsg string, data any) ToolResult {
+	return ToolResult{
+		Error:   errMsg,
+		Data:    data,
 		Success: false,
 	}
 }

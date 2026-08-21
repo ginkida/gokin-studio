@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Brain, AlertOctagon, AlertTriangle, Loader2, WifiOff, RefreshCw, KeyRound } from 'lucide-react'
 import { useProjectStore } from '../../stores/projectStore'
+import { useDelegationStore, isTerminalDelegation } from '../../stores/delegationStore'
 import { useChatStore } from '../../stores/chatStore'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { CheckProviderHealth, RecentErrorCount, RecentErrors } from '../../../wailsjs/go/studio/Studio'
@@ -28,11 +29,17 @@ type ProviderHealth = {
   recommendedModel?: string
 }
 
-export function StatusBar() {
+export function StatusBar({ onOpenDelegations }: { onOpenDelegations?: () => void } = {}) {
   const activeProject = useProjectStore((s) =>
     s.projects.find((p) => p.id === s.activeProjectId)
   )
   const activeProjectId = useProjectStore((s) => s.activeProjectId)
+  // Delegated work runs in ANOTHER project, so it is invisible in this chat's
+  // own status. Surfacing the count here is the only place the user sees that
+  // money is being spent on their behalf somewhere else.
+  const activeDelegations = useDelegationStore(
+    (s) => Object.values(s.runs).filter((run) => !isTerminalDelegation(run.status)).length,
+  )
   const settings = useSettingsStore((s) => s.settings)
   const setProviderCapability = useSettingsStore((s) => s.setProviderCapability)
   // Derive "any session active" from the chat store instead of the stored
@@ -243,6 +250,21 @@ export function StatusBar() {
 
   return (
     <div className="status-bar" role="status" aria-live="polite">
+      {onOpenDelegations && (
+        <button
+          className={activeDelegations > 0 ? 'status-delegations' : 'status-delegations idle'}
+          onClick={onOpenDelegations}
+          title="Show cross-project delegations"
+        >
+          {/* Always reachable: past runs hold the answers, and hiding the only
+              entry point whenever nothing is live would strand them. */}
+          {activeDelegations === 0
+            ? 'Delegations'
+            : activeDelegations === 1
+              ? '1 agent working elsewhere'
+              : `${activeDelegations} agents working elsewhere`}
+        </button>
+      )}
       <div className="status-left">
         <span className={`status-dot ${anyActive ? 'active' : activeProject && !providerIssue && providerHealth?.ok ? 'connected' : ''} ${providerIssue ? 'issue' : ''} ${pendingAttention ? 'attention' : ''}`} />
         {activeProject ? (

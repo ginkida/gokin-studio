@@ -2,12 +2,14 @@ package studio
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"sync"
 
 	"github.com/creack/pty"
 	"github.com/ginkida/gokin-studio/internal/engine/security"
+	"github.com/ginkida/gokin-studio/internal/engine/wsl"
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
@@ -37,13 +39,13 @@ func NewTerminal(wailsCtx context.Context, projectDir, projectID, termID string)
 // don't leak while the terminal panel stays open. Pass nil for either when
 // not wired (early bring-up, tests).
 func newTerminalWithLogger(wailsCtx context.Context, projectDir, projectID, termID string, logFn func(level, source, message string), onExit func(termID string)) (*Terminal, error) {
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/bash"
+	name, args, dir, err := terminalShellCommand(hostGOOS, projectDir, wsl.DetectFor(projectDir))
+	if err != nil {
+		return nil, err
 	}
 
-	cmd := exec.Command(shell)
-	cmd.Dir = projectDir
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
 	cmd.Env = security.MergeWorkspaceEnvironment(append(os.Environ(), "TERM=xterm-256color"))
 
 	ptmx, err := pty.Start(cmd)
@@ -136,4 +138,38 @@ func (t *Terminal) Close() {
 		_ = t.cmd.Process.Kill()
 		_ = t.cmd.Wait() // reap zombie — use cmd.Wait not Process.Wait
 	}
+}
+
+// terminalShellCommand decides what shell to start for a project.
+//
+// Pure so the Windows and WSL branches are testable from any platform: the
+// caller supplies goos and the already-detected target rather than having this
+// probe the machine.
+func terminalShellCommand(goos, projectDir string, target wsl.Target) (string, []string, string, error) {
+	if target.IsWSL() {
+		// A shell inside the distro, started in the project directory. This is
+		// the whole point of a WSL project: the user's own nvm/pyenv/asdf
+		// toolchain, not whatever Windows happens to have.
+		args := []string{"-d", target.Distro}
+		if target.Caps.SupportsCD && target.LinuxDir != "" {
+			args = append(args, "--cd", target.LinuxDir)
+		}
+		args = append(args, "--exec", "bash", "-l")
+		// cmd.Dir stays empty: a UNC path is not a legal working directory for
+		// CreateProcess, and --cd already carries the real one.
+		return target.Exe, args, "", nil
+	}
+	if goos == "windows" {
+		// creack/pty has no Windows implementation, so pty.Start would fail
+		// with a bare "not supported" that tells the user nothing. Say what is
+		// actually true and what they can do about it.
+		return "", nil, "", fmt.Errorf(
+			"the integrated terminal is not available for Windows-drive projects yet; " +
+				"a project inside a WSL distro (\\\\wsl.localhost\\<Distro>\\...) opens a distro shell instead")
+	}
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/bash"
+	}
+	return shell, nil, projectDir, nil
 }

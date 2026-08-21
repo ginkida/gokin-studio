@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"google.golang.org/genai"
@@ -47,14 +48,12 @@ type SerializedFunc struct {
 // GetState returns the current state of the agent for serialization.
 func (a *Agent) GetState() *AgentState {
 	a.stateMu.RLock()
-	defer a.stateMu.RUnlock()
-
 	history := make([]SerializedContent, len(a.history))
 	for i, content := range a.history {
 		history[i] = serializeContent(content)
 	}
-
-	return &AgentState{
+	activePlan := a.activePlan
+	state := &AgentState{
 		ID:         a.ID,
 		Type:       a.Type,
 		Model:      a.Model,
@@ -64,12 +63,18 @@ func (a *Agent) GetState() *AgentState {
 		EndTime:    a.endTime,
 		MaxTurns:   a.maxTurns,
 		TurnCount:  len(a.history) / 2, // Approximate turn count
-		ActivePlan: a.activePlan,
+		LastPrompt: a.originalPrompt,
 	}
+	a.stateMu.RUnlock()
+	state.ActivePlan = clonePlanTreeSnapshot(activePlan)
+	return state
 }
 
 // RestoreHistory restores the conversation history from a saved state.
 func (a *Agent) RestoreHistory(state *AgentState) error {
+	if state == nil {
+		return fmt.Errorf("cannot restore nil agent state")
+	}
 	history := make([]*genai.Content, len(state.History))
 	for i, sc := range state.History {
 		content, err := deserializeContent(sc)
@@ -78,6 +83,7 @@ func (a *Agent) RestoreHistory(state *AgentState) error {
 		}
 		history[i] = content
 	}
+	activePlan := clonePlanTreeSnapshot(state.ActivePlan)
 
 	a.stateMu.Lock()
 	defer a.stateMu.Unlock()
@@ -85,7 +91,9 @@ func (a *Agent) RestoreHistory(state *AgentState) error {
 	a.status = state.Status
 	a.startTime = state.StartTime
 	a.endTime = state.EndTime
-	a.activePlan = state.ActivePlan
+	a.originalPrompt = state.LastPrompt
+	a.activePlan = activePlan
+	a.planningMode = activePlan != nil
 	return nil
 }
 
@@ -118,7 +126,7 @@ func serializePart(part *genai.Part) SerializedPart {
 		sp.FunctionCall = &SerializedFunc{
 			ID:   part.FunctionCall.ID,
 			Name: part.FunctionCall.Name,
-			Args: part.FunctionCall.Args,
+			Args: cloneStringAnyMap(part.FunctionCall.Args),
 		}
 		return sp
 	}
@@ -128,7 +136,7 @@ func serializePart(part *genai.Part) SerializedPart {
 		sp.FunctionResp = &SerializedFunc{
 			ID:       part.FunctionResponse.ID,
 			Name:     part.FunctionResponse.Name,
-			Response: part.FunctionResponse.Response,
+			Response: cloneStringAnyMap(part.FunctionResponse.Response),
 		}
 		return sp
 	}
@@ -177,14 +185,14 @@ func deserializePart(sp SerializedPart) (*genai.Part, error) {
 			FunctionCall: &genai.FunctionCall{
 				ID:   sp.FunctionCall.ID,
 				Name: sp.FunctionCall.Name,
-				Args: sp.FunctionCall.Args,
+				Args: cloneStringAnyMap(sp.FunctionCall.Args),
 			},
 		}, nil
 	case "function_response":
 		if sp.FunctionResp == nil {
 			return genai.NewPartFromText(" "), nil
 		}
-		part := genai.NewPartFromFunctionResponse(sp.FunctionResp.Name, sp.FunctionResp.Response)
+		part := genai.NewPartFromFunctionResponse(sp.FunctionResp.Name, cloneStringAnyMap(sp.FunctionResp.Response))
 		part.FunctionResponse.ID = sp.FunctionResp.ID
 		return part, nil
 	default:
@@ -193,6 +201,48 @@ func deserializePart(sp SerializedPart) (*genai.Part, error) {
 			text = " " // Avoid empty text parts
 		}
 		return genai.NewPartFromText(text), nil
+	}
+}
+
+func cloneStringAnyMap(source map[string]any) map[string]any {
+	if source == nil {
+		return nil
+	}
+	cloned := make(map[string]any, len(source))
+	for key, value := range source {
+		cloned[key] = cloneJSONValue(value)
+	}
+	return cloned
+}
+
+func cloneJSONValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return cloneStringAnyMap(typed)
+	case map[string]string:
+		cloned := make(map[string]string, len(typed))
+		for key, nested := range typed {
+			cloned[key] = nested
+		}
+		return cloned
+	case []any:
+		cloned := make([]any, len(typed))
+		for index, nested := range typed {
+			cloned[index] = cloneJSONValue(nested)
+		}
+		return cloned
+	case []string:
+		return append([]string(nil), typed...)
+	case []byte:
+		return append([]byte(nil), typed...)
+	case []int:
+		return append([]int(nil), typed...)
+	case []float64:
+		return append([]float64(nil), typed...)
+	case []bool:
+		return append([]bool(nil), typed...)
+	default:
+		return value
 	}
 }
 

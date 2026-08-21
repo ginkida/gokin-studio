@@ -244,7 +244,6 @@ func TestRequiresUserApprovalDistinguishesReadAndMutatingOperations(t *testing.T
 		}}, true},
 		{"future_unknown_tool", nil, true},
 		{"web_fetch", nil, false},
-		{"request_tool", nil, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

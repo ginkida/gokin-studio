@@ -3,6 +3,8 @@ package studio
 import (
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -14,6 +16,9 @@ func TestAutoCleanupParams_Conservative(t *testing.T) {
 	}
 	if p.PreImportDays != 90 {
 		t.Errorf("PreImportDays=%d, want 90 (more conservative than manual 30)", p.PreImportDays)
+	}
+	if p.DelegationAgeDays != 90 {
+		t.Errorf("DelegationAgeDays=%d, want 90 (more conservative than manual 30)", p.DelegationAgeDays)
 	}
 	if p.DryRun {
 		t.Error("DryRun must be false for actual cleanup")
@@ -139,6 +144,62 @@ func TestRunAutoCleanupIfDue_ThrottleSkipsRecentRun(t *testing.T) {
 	}
 	if _, err := os.Stat(survivor); err != nil {
 		t.Errorf("100-day replay should survive when throttle skips run; err=%v", err)
+	}
+}
+
+func TestRunAutoCleanupIfDue_CoalescesConcurrentTriggers(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	stale := seedStaleReplay(t, filepath.Join(configDir(), "history"), "concurrent-auto.replay.jsonl", 35*24*time.Hour)
+	s := NewStudio()
+	s.config = defaultConfig()
+
+	previousRemove := cleanupRemoveFile
+	var removeCalls atomic.Int32
+	removeStarted := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseRemove := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseRemove()
+	cleanupRemoveFile = func(path string) error {
+		if removeCalls.Add(1) == 1 {
+			close(removeStarted)
+			<-release
+		}
+		return previousRemove(path)
+	}
+	t.Cleanup(func() { cleanupRemoveFile = previousRemove })
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- s.RunAutoCleanupIfDue() }()
+	<-removeStarted
+	secondStarted := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		close(secondStarted)
+		secondDone <- s.RunAutoCleanupIfDue()
+	}()
+	<-secondStarted
+	select {
+	case err := <-secondDone:
+		t.Fatalf("second auto-cleanup bypassed trigger serialization: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	releaseRemove()
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+	if calls := removeCalls.Load(); calls != 1 {
+		t.Fatalf("coalesced auto-cleanup attempted removal %d times", calls)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("auto-cleanup did not remove stale replay: %v", err)
+	}
+	if shouldRunAutoCleanup() {
+		t.Fatal("coalesced auto-cleanup did not advance the throttle sentinel")
 	}
 }
 

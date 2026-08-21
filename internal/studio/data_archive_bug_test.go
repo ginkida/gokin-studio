@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/base64"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -101,6 +103,29 @@ func TestWriteConfigArchive_SkipsUnreadableFiles(t *testing.T) {
 	}
 }
 
+func TestExportAllDataBase64_RejectsUnreadableRootInsteadOfPublishingEmptyArchive(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory mode permissions differ on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses directory mode checks")
+	}
+	cfgDir := t.TempDir()
+	t.Setenv("GOKIN_CONFIG_DIR", cfgDir)
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte("projects: []\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(cfgDir, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(cfgDir, 0o700) })
+
+	result, err := NewStudio().ExportAllDataBase64()
+	if err == nil {
+		t.Fatalf("unreadable config root produced a backup instead of failing: %+v", result)
+	}
+}
+
 // TestWriteConfigArchive_HeaderSizeMatchesContent verifies the iter 980+
 // fix where hdr.Size is set from the OPEN file's fstat, not the WalkDir
 // d.Info() result. Tests that for files that don't change, header sizes
@@ -159,4 +184,124 @@ func TestWriteConfigArchive_HeaderSizeMatchesContent(t *testing.T) {
 			t.Errorf("entry %q: header Size=%d but %d bytes followed", hdr.Name, hdr.Size, n)
 		}
 	}
+}
+
+func TestWriteConfigArchive_SkipsSymlinksOutsideConfigTree(t *testing.T) {
+	cfgDir := t.TempDir()
+	outsideDir := t.TempDir()
+	outsideSecret := filepath.Join(outsideDir, "outside-secret.txt")
+	if err := os.WriteFile(outsideSecret, []byte("must-never-enter-backup"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte("projects: []\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(cfgDir, "innocent-looking.txt")
+	if err := os.Symlink(outsideSecret, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	var archive bytes.Buffer
+	count, err := writeConfigArchive(&archive, cfgDir)
+	if err != nil {
+		t.Fatalf("writeConfigArchive: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("filesCount=%d, want only config.yaml", count)
+	}
+
+	gz, err := gzip.NewReader(bytes.NewReader(archive.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read archive: %v", err)
+		}
+		if hdr.Name == "innocent-looking.txt" {
+			t.Fatal("archive followed an external symlink")
+		}
+		body, err := io.ReadAll(tr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(body, []byte("must-never-enter-backup")) {
+			t.Fatalf("entry %q leaked external file contents", hdr.Name)
+		}
+	}
+}
+
+func TestWriteConfigArchiveWithLimits_BoundsPublishedArchiveResources(t *testing.T) {
+	cfgDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), bytes.Repeat([]byte("payload"), 100), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("compressed output", func(t *testing.T) {
+		var archive bytes.Buffer
+		_, err := writeConfigArchiveWithLimits(&archive, cfgDir, configArchiveLimits{
+			maxOutputBytes:   1,
+			maxExpandedBytes: 1 << 20,
+			maxContentBytes:  1 << 20,
+			maxEntries:       10,
+		})
+		if !errors.Is(err, errArchiveOutputLimit) {
+			t.Fatalf("error=%v, want output limit", err)
+		}
+		if archive.Len() > 1 {
+			t.Fatalf("bounded writer emitted %d bytes past 1-byte cap", archive.Len())
+		}
+	})
+
+	t.Run("expanded tar stream", func(t *testing.T) {
+		var archive bytes.Buffer
+		_, err := writeConfigArchiveWithLimits(&archive, cfgDir, configArchiveLimits{
+			maxOutputBytes:   1 << 20,
+			maxExpandedBytes: 1,
+			maxContentBytes:  1 << 20,
+			maxEntries:       10,
+		})
+		if !errors.Is(err, errArchiveExpandedLimit) {
+			t.Fatalf("error=%v, want expanded-stream limit", err)
+		}
+	})
+
+	t.Run("extracted content", func(t *testing.T) {
+		var archive bytes.Buffer
+		_, err := writeConfigArchiveWithLimits(&archive, cfgDir, configArchiveLimits{
+			maxOutputBytes:   1 << 20,
+			maxExpandedBytes: 1 << 20,
+			maxContentBytes:  10,
+			maxEntries:       10,
+		})
+		if err == nil || !strings.Contains(err.Error(), "archive contents exceed") {
+			t.Fatalf("error=%v, want content limit", err)
+		}
+	})
+
+	t.Run("entry count", func(t *testing.T) {
+		nestedDir := t.TempDir()
+		if err := os.Mkdir(filepath.Join(nestedDir, "history"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(nestedDir, "history", "chat.json"), []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var archive bytes.Buffer
+		_, err := writeConfigArchiveWithLimits(&archive, nestedDir, configArchiveLimits{
+			maxOutputBytes:   1 << 20,
+			maxExpandedBytes: 1 << 20,
+			maxContentBytes:  1 << 20,
+			maxEntries:       1,
+		})
+		if err == nil || !strings.Contains(err.Error(), "too many entries") {
+			t.Fatalf("error=%v, want entry limit", err)
+		}
+	})
 }

@@ -38,7 +38,15 @@ const (
 
 	EventDispatchComplete = "dispatch:complete"
 
-	EventAskUser = "chat:ask_user"
+	// Cross-project delegation. These carry status and bounded progress, never
+	// the task text or the full answer — the record is durable and backups
+	// bundle the config directory.
+	EventDelegationStarted  = "delegation:started"
+	EventDelegationProgress = "delegation:progress"
+	EventDelegationComplete = "delegation:complete"
+
+	EventAskUser       = "chat:ask_user"
+	EventAskUserClosed = "chat:ask_user_closed"
 
 	EventQuickEntry       = "quick-entry:show"
 	EventDeepLink         = "deep-link:open"
@@ -48,6 +56,36 @@ const (
 
 	EventSpeechDictation = "speech-dictation:event"
 )
+
+// DelegationEvent is the live view of a cross-project delegation. Task text and
+// the full answer are deliberately absent: this payload reaches the frontend
+// and the event log, while the body stays in the durable run record behind
+// FetchDelegationAnswer.
+type DelegationEvent struct {
+	RunID             string   `json:"runID"`
+	BatchID           string   `json:"batchID,omitempty"`
+	FromProjectID     string   `json:"fromProjectID"`
+	FromSessionID     string   `json:"fromSessionID"`
+	ToProjectID       string   `json:"toProjectID"`
+	ToProjectName     string   `json:"toProjectName,omitempty"`
+	ToSessionID       string   `json:"toSessionID,omitempty"`
+	Kind              string   `json:"kind"`
+	Goal              string   `json:"goal,omitempty"`
+	Status            string   `json:"status"`
+	ErrorType         string   `json:"errorType,omitempty"`
+	Error             string   `json:"error,omitempty"`
+	Summary           string   `json:"summary,omitempty"`
+	Tail              []string `json:"tail,omitempty"`
+	LastTool          string   `json:"lastTool,omitempty"`
+	DeniedTools       []string `json:"deniedTools,omitempty"`
+	MutatedBeforeStop bool     `json:"mutatedBeforeStop,omitempty"`
+	ElapsedMs         int64    `json:"elapsedMs,omitempty"`
+	EstimatedCostUSD  float64  `json:"estimatedCostUSD,omitempty"`
+	// LegacyDispatch marks a run that ALSO emits the older dispatch:complete
+	// event. Both carry the same completion, and both frontend handlers raise a
+	// desktop notification, so one of them has to stand down.
+	LegacyDispatch bool `json:"legacyDispatch,omitempty"`
+}
 
 // SideChatEvent belongs to an ephemeral, read-only side question. Side-chat
 // messages are intentionally never folded into ChatSession.history; the
@@ -260,6 +298,15 @@ type AskUserEvent struct {
 	Tool       string               `json:"tool,omitempty"`
 	Scope      string               `json:"scope,omitempty"` // current_turn, current_turn_or_project_tool, or single_action
 	Details    []ToolApprovalDetail `json:"details,omitempty"`
+}
+
+// AskUserClosedEvent retires one exact question card. It is intentionally
+// question-owned: a completion/error from one concurrent operation must not
+// clear a newer approval belonging to the same chat.
+type AskUserClosedEvent struct {
+	ProjectID  string `json:"projectID"`
+	SessionID  string `json:"sessionID"`
+	QuestionID string `json:"questionID"`
 }
 
 // ToolApprovalDetail is an allowlisted, display-only summary of a mutating

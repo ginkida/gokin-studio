@@ -14,7 +14,38 @@ import (
 	"google.golang.org/genai"
 
 	"github.com/ginkida/gokin-studio/internal/engine/security"
+	"github.com/ginkida/gokin-studio/internal/engine/wsl"
 )
+
+// gopls has to run where the module is. For a WSL project the checkout, the
+// module cache and the toolchain are all inside the distro, so host gopls would
+// type-check over the 9P share against a Windows GOMODCACHE it cannot use — and
+// the shared -remote=auto daemon would be the wrong daemon.
+//
+// Off Windows DetectFor returns a host target, ApplyExec leaves the command
+// alone and LinuxPathFor declines, so both helpers are byte-identical there.
+func runGopls(ctx context.Context, workDir string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "gopls", args...)
+	// Dir must be final before ApplyExec, which clears it: a UNC path is not a
+	// legal working directory for wsl.exe, and the distro-side directory travels
+	// in the plan instead.
+	cmd.Dir = workDir
+	wsl.ApplyExec(cmd, wsl.DetectFor(workDir), append([]string{"gopls"}, args...),
+		security.WorkspaceEnvironmentSnapshot())
+	// cmd.Stderr stays nil so Output() keeps populating ExitError.Stderr, which
+	// both callers read to surface gopls's own message.
+	return cmd.Output()
+}
+
+// goplsPosition renders file:line:col in the spelling gopls will see. Inside the
+// distro a UNC path names nothing, so an absolute host path has to be
+// translated; a relative one already resolves against the translated cwd.
+func goplsPosition(target wsl.Target, file string, line, col int) string {
+	if linux, ok := wsl.LinuxPathFor(target, file); ok {
+		file = linux
+	}
+	return fmt.Sprintf("%s:%d:%d", file, line, max(col, 1))
+}
 
 // GoToDefinitionTool finds the definition of a symbol using gopls (LSP).
 // Falls back to AST-based search for Go files when gopls is unavailable.
@@ -111,13 +142,11 @@ func (t *GoToDefinitionTool) Execute(ctx context.Context, args map[string]any) (
 }
 
 func (t *GoToDefinitionTool) definitionViaGopls(ctx context.Context, file, symbol string, line, col int) (ToolResult, error) {
-	pos := fmt.Sprintf("%s:%d:%d", file, line, max(col, 1))
+	pos := goplsPosition(wsl.DetectFor(t.workDir), file, line, col)
 	// -remote=auto: reuse (or start) a shared gopls daemon — a one-shot gopls
 	// re-type-checks the whole module from scratch on EVERY call (seconds on a
 	// module this size); the daemon's warm cache makes repeat lookups ~instant.
-	cmd := exec.CommandContext(ctx, "gopls", "-remote=auto", "definition", pos)
-	cmd.Dir = t.workDir
-	output, err := cmd.Output()
+	output, err := runGopls(ctx, t.workDir, "-remote=auto", "definition", pos)
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			if stderr := strings.TrimSpace(string(exitErr.Stderr)); stderr != "" {
@@ -351,12 +380,9 @@ func (t *FindReferencesTool) referencesViaGopls(ctx context.Context, file, symbo
 	if includeDef {
 		goplsArgs = append(goplsArgs, "-d")
 	}
-	pos := fmt.Sprintf("%s:%d:%d", file, line, max(col, 1))
-	goplsArgs = append(goplsArgs, pos)
+	goplsArgs = append(goplsArgs, goplsPosition(wsl.DetectFor(t.workDir), file, line, col))
 
-	cmd := exec.CommandContext(ctx, "gopls", goplsArgs...)
-	cmd.Dir = t.workDir
-	output, err := cmd.Output()
+	output, err := runGopls(ctx, t.workDir, goplsArgs...)
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			if stderr := strings.TrimSpace(string(exitErr.Stderr)); stderr != "" {

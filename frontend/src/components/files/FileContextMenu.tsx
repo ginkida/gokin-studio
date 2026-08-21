@@ -19,6 +19,7 @@ interface FileActions {
 }
 
 interface MenuRequest {
+  generation: number
   projectID: string
   sessionID: string
   path: string
@@ -50,14 +51,24 @@ export function FileContextMenuHost() {
   const menuRef = useRef<HTMLDivElement>(null)
   const requestSequenceRef = useRef(0)
 
-  const close = (restoreFocus = true) => {
+  const ownsRequest = (generation: number, projectID: string) => (
+    requestSequenceRef.current === generation &&
+    useProjectStore.getState().activeProjectId === projectID
+  )
+
+  const close = (restoreFocus = true, expectedGeneration?: number) => {
+    if (expectedGeneration !== undefined && requestSequenceRef.current !== expectedGeneration) return false
     const trigger = request?.trigger
-    requestSequenceRef.current += 1
+    const closedGeneration = ++requestSequenceRef.current
     setRequest(null)
     setActions(null)
+    setLoading(false)
     setError(null)
     setBusy('')
-    if (restoreFocus && trigger?.isConnected) requestAnimationFrame(() => trigger.focus())
+    if (restoreFocus && trigger?.isConnected) requestAnimationFrame(() => {
+      if (requestSequenceRef.current === closedGeneration && trigger.isConnected) trigger.focus()
+    })
+    return true
   }
 
   useEffect(() => {
@@ -66,7 +77,12 @@ export function FileContextMenuHost() {
       const projectID = detail.projectID || useProjectStore.getState().activeProjectId
       if (!projectID || typeof detail.path !== 'string' || !detail.path.trim()) return
       const sessionID = detail.sessionID || useChatStore.getState().activeSession[projectID] || 'default'
+      // Invalidate both an older resolver and an older native action before
+      // React commits the replacement menu. Promise callbacks can otherwise
+      // run in the gap and close or mutate the new request.
+      const generation = ++requestSequenceRef.current
       setRequest({
+        generation,
         projectID,
         sessionID,
         path: detail.path,
@@ -75,27 +91,35 @@ export function FileContextMenuHost() {
         trigger: detail.trigger instanceof HTMLElement ? detail.trigger : null,
       })
       setActions(null)
+      setLoading(true)
       setError(null)
       setBusy('')
     }
     window.addEventListener('gokin:file-context-menu', open)
-    return () => window.removeEventListener('gokin:file-context-menu', open)
+    return () => {
+      window.removeEventListener('gokin:file-context-menu', open)
+      requestSequenceRef.current += 1
+    }
   }, [])
 
   useEffect(() => {
     if (!request) return
-    const sequence = ++requestSequenceRef.current
+    const { generation, projectID } = request
     setLoading(true)
     ListSessionPathActions(request.projectID, request.sessionID, request.path)
       .then((raw: any) => {
-        if (sequence !== requestSequenceRef.current) return
+        if (!ownsRequest(generation, projectID)) return
         setActions(raw as FileActions)
-        requestAnimationFrame(() => menuRef.current?.querySelector<HTMLButtonElement>('button:not([disabled])')?.focus())
+        requestAnimationFrame(() => {
+          if (ownsRequest(generation, projectID)) {
+            menuRef.current?.querySelector<HTMLButtonElement>('button[role="menuitem"]:not([disabled])')?.focus()
+          }
+        })
       })
       .catch((reason: any) => {
-        if (sequence === requestSequenceRef.current) setError(String(reason?.message || reason))
+        if (ownsRequest(generation, projectID)) setError(String(reason?.message || reason))
       })
-      .finally(() => { if (sequence === requestSequenceRef.current) setLoading(false) })
+      .finally(() => { if (ownsRequest(generation, projectID)) setLoading(false) })
   }, [request])
 
   useEffect(() => {
@@ -135,12 +159,16 @@ export function FileContextMenuHost() {
 
   const run = async (key: string, action: () => Promise<unknown>, closeAfter = true) => {
     if (busy) return
+    const { generation, projectID } = request
     setBusy(key)
     setError(null)
     try {
       await action()
-      if (closeAfter) close(false)
+      if (!ownsRequest(generation, projectID)) return
+      if (closeAfter) close(false, generation)
+      else setBusy('')
     } catch (reason: any) {
+      if (!ownsRequest(generation, projectID)) return
       setError(String(reason?.message || reason))
       setBusy('')
     }
@@ -153,6 +181,7 @@ export function FileContextMenuHost() {
       style={{ left, top }}
       role="menu"
       aria-label={`Path actions for ${request.path}`}
+      aria-busy={loading || !!busy}
       onContextMenu={(event) => { event.preventDefault(); close(true) }}
       onKeyDown={(event) => {
         if (event.key === 'Tab') {
@@ -160,7 +189,7 @@ export function FileContextMenuHost() {
           return
         }
         if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return
-        const items = Array.from(menuRef.current?.querySelectorAll<HTMLButtonElement>('button:not([disabled])') || [])
+        const items = Array.from(menuRef.current?.querySelectorAll<HTMLButtonElement>('button[role="menuitem"]:not([disabled])') || [])
         if (!items.length) return
         event.preventDefault()
         const current = items.indexOf(document.activeElement as HTMLButtonElement)
@@ -174,13 +203,13 @@ export function FileContextMenuHost() {
       <div className="file-context-menu-title"><span title={request.path}>{request.path}</span><button onClick={() => close(true)} aria-label="Close file actions"><X size={11} /></button></div>
       {loading ? <div className="file-context-menu-status"><Loader2 size={12} className="spin" /> Resolving session path…</div> : actions && <>
         {actions.isDirectory ? (
-          <button role="menuitem" onClick={() => {
+          <button role="menuitem" disabled={!!busy} onClick={() => {
             window.dispatchEvent(new CustomEvent('gokin:open-session-terminal', {
               detail: { projectID: request.projectID, sessionID: request.sessionID, path: actions.path },
             }))
             close(false)
           }}><TerminalSquare size={12} /><span>Open in terminal</span></button>
-        ) : <button role="menuitem" onClick={() => {
+        ) : <button role="menuitem" disabled={!!busy} onClick={() => {
           window.dispatchEvent(new CustomEvent('gokin:compose-in-chat', {
             detail: { text: `${formatFileMention(actions.path)} `, mode: 'append', sessionID: request.sessionID },
           }))

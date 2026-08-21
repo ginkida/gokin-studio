@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AlertTriangle, ChevronRight, Download, ExternalLink, Loader2, PanelsTopLeft } from 'lucide-react'
 import { ReadSessionArtifactContent } from '../../../wailsjs/go/studio/Studio'
 import {
@@ -6,6 +6,7 @@ import {
   type ArtifactDocument,
 } from './ArtifactPreview'
 import { requestFileContextMenu } from './FileContextMenu'
+import { downloadBlob } from '../../lib/download'
 
 function formatBytes(value: number) {
   if (value < 1024) return `${value} B`
@@ -40,25 +41,84 @@ export function InlineArtifactCard({
   const [artifact, setArtifact] = useState<ArtifactDocument | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const loadRequestRef = useRef(0)
+  const loadInFlightRef = useRef(false)
+  const scopeKey = `${projectID.length}:${projectID}${sessionID.length}:${sessionID}${path}`
+  const scopeRef = useRef({ generation: 0, mounted: false })
 
-  const load = async () => {
-    if (artifact || loading) return
-    setLoading(true)
+  useEffect(() => {
+    scopeRef.current.generation += 1
+    scopeRef.current.mounted = true
+    const generation = scopeRef.current.generation
+    setExpanded(false)
+    setArtifact(null)
+    setLoading(false)
     setError(null)
+    return () => {
+      if (scopeRef.current.generation === generation) {
+        scopeRef.current.mounted = false
+        scopeRef.current.generation += 1
+      }
+      loadRequestRef.current += 1
+      loadInFlightRef.current = false
+    }
+  }, [scopeKey])
+
+  const ownsScope = useCallback((generation: number) => (
+    scopeRef.current.mounted && scopeRef.current.generation === generation
+  ), [])
+
+  const load = useCallback(async (quiet = false, expectedScope = scopeRef.current.generation) => {
+    // Polls never supersede an explicit first load or retry. Scheduling the
+    // next poll after this promise settles keeps backend reads sequential.
+    if (quiet && loadInFlightRef.current) return false
+    const request = ++loadRequestRef.current
+    loadInFlightRef.current = true
+    if (!quiet) {
+      setLoading(true)
+      setError(null)
+    }
     try {
       const result: any = await ReadSessionArtifactContent(projectID, sessionID, path)
+      if (!ownsScope(expectedScope) || loadRequestRef.current !== request) return false
       setArtifact(result as ArtifactDocument)
+      setError(null)
+      return true
     } catch (e: any) {
-      setError(String(e?.message || e || 'Preview unavailable'))
+      if (!ownsScope(expectedScope) || loadRequestRef.current !== request) return false
+      // A transient live-refresh failure should not blank a usable preview.
+      if (!quiet) setError(String(e?.message || e || 'Preview unavailable'))
+      return false
     } finally {
-      setLoading(false)
+      if (ownsScope(expectedScope) && loadRequestRef.current === request) {
+        loadInFlightRef.current = false
+        if (!quiet) setLoading(false)
+      }
     }
-  }
+  }, [ownsScope, path, projectID, sessionID])
+
+  useEffect(() => {
+    if (!expanded) return
+    const scope = scopeRef.current.generation
+    let stopped = false
+    let timer: number | undefined
+    const poll = async () => {
+      if (stopped || !ownsScope(scope)) return
+      if (window.document.visibilityState !== 'hidden') await load(true, scope)
+      if (stopped || !ownsScope(scope)) return
+      timer = window.setTimeout(() => { void poll() }, 2500)
+    }
+    timer = window.setTimeout(() => { void poll() }, 2500)
+    return () => {
+      stopped = true
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
+  }, [expanded, load, ownsScope])
 
   const toggle = () => {
     const next = !expanded
     setExpanded(next)
-    if (next) void load()
+    if (next) void load(Boolean(artifact))
   }
 
   const srcDoc = useMemo(
@@ -77,16 +137,11 @@ export function InlineArtifactCard({
     const blob = new Blob([content], {
       type: artifact.dataBase64 ? artifact.mimeType : `${artifact.mimeType};charset=utf-8`,
     })
-    const url = URL.createObjectURL(blob)
-    const anchor = window.document.createElement('a')
-    anchor.href = url
-    anchor.download = artifact.name
-    anchor.click()
-    URL.revokeObjectURL(url)
+    downloadBlob(blob, artifact.name)
   }
 
   return (
-    <section className={`inline-artifact ${expanded ? 'expanded' : ''}`}>
+    <section className={`inline-artifact ${expanded ? 'expanded' : ''}`} aria-busy={expanded && loading}>
       <div
         className="inline-artifact-header"
         onContextMenu={(event) => {

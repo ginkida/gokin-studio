@@ -17,6 +17,7 @@ import (
 	"github.com/ginkida/gokin-studio/internal/engine/logging"
 	"github.com/ginkida/gokin-studio/internal/engine/security"
 	"github.com/ginkida/gokin-studio/internal/engine/tasks"
+	"github.com/ginkida/gokin-studio/internal/engine/wsl"
 
 	"google.golang.org/genai"
 )
@@ -94,6 +95,11 @@ type BashSession struct {
 	workDir string            // persistent working directory
 	env     map[string]string // environment variables set during session
 	mu      sync.Mutex        // for thread safety
+	// workDirUnverified marks workDir as adopted from a Linux `pwd` that could
+	// not be stat'd through the 9P share. It lives here rather than on the tool
+	// so it is written under the same mutex as workDir; the two must never
+	// disagree about which directory the flag describes.
+	workDirUnverified bool
 }
 
 // NewBashSession creates a new BashSession with the given initial working directory.
@@ -116,6 +122,24 @@ func (s *BashSession) SetWorkDir(dir string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.workDir = dir
+	s.workDirUnverified = false
+}
+
+// adoptUnverifiedWorkDir records a directory the shell reported but that the
+// host could not stat. See sessionWorkDir for why it is not simply trusted.
+func (s *BashSession) adoptUnverifiedWorkDir(dir string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.workDir = dir
+	s.workDirUnverified = true
+}
+
+// workDirState returns both halves together; reading them separately would let
+// a concurrent SetWorkDir pair a new directory with the old flag.
+func (s *BashSession) workDirState() (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.workDir, s.workDirUnverified
 }
 
 // SetEnv sets an environment variable in the session.
@@ -548,6 +572,12 @@ func (t *BashTool) updateSessionFromPWD(detectedDir string) {
 	if detectedDir == "" {
 		return
 	}
+	// `pwd -P` inside a distro reports a Linux path. On Windows filepath.Clean
+	// turns /home/me/api into \\home\\me\\api, os.Stat then fails, and the session
+	// working directory silently never advances after a cd — with no error
+	// anywhere. Rebuild the UNC spelling first; for a host target this returns
+	// the input unchanged and the code below is exactly what it always was.
+	detectedDir, rebuilt := hostPathForDetectedPWD(t.workspaceRoot, detectedDir)
 	detectedDir = filepath.Clean(detectedDir)
 	if t.workspaceBoundaryEnabled && !t.isWithinWorkspace(detectedDir) {
 		logging.Debug("bash session attempted to leave workspace boundary", "detected_dir", detectedDir, "workspace_root", t.workspaceRoot)
@@ -556,7 +586,71 @@ func (t *BashTool) updateSessionFromPWD(detectedDir string) {
 	}
 	if info, err := os.Stat(detectedDir); err == nil && info.IsDir() {
 		t.session.SetWorkDir(detectedDir)
+		return
 	}
+	if !rebuilt {
+		return
+	}
+	// The host could not stat it, but the host is not the authority here: the
+	// next command reaches this directory as `wsl.exe --cd <linux path>`, and
+	// that Linux path comes from pure string translation, never from the share.
+	// Plenty of directories the distro enters fine cannot be named on Windows
+	// at all — `logs/2026-08-11T09:00:00` is legal in Linux and impossible in a
+	// Windows path component — and 9P attribute caching lags a fresh mkdir on
+	// top of that. Refusing to follow the shell would strand the session in the
+	// wrong directory while the model believes it moved.
+	//
+	// So adopt it, and mark it unverified rather than re-litigating with stat:
+	// if the directory really is gone, `--cd` fails before the payload runs, no
+	// pwd marker comes back, and recoverUnverifiedWorkDir below unwinds it.
+	t.session.adoptUnverifiedWorkDir(detectedDir)
+}
+
+// recoverUnverifiedWorkDir handles the one case the adoption above cannot: the
+// shell reported a directory that has since been deleted. `wsl.exe --cd
+// <missing>` then fails before the payload runs, so the command produces no pwd
+// marker and updateSessionFromPWD never runs again — without this the session
+// would be wedged in that directory for the rest of its life.
+//
+// Only a command that both FAILED and produced no marker is evidence of that; a
+// failing command whose payload ran still emits its marker. Nothing sets the
+// unverified flag off Windows, so this is a no-op everywhere else.
+func (t *BashTool) recoverUnverifiedWorkDir() {
+	if _, unverified := t.session.workDirState(); !unverified {
+		return
+	}
+	if t.workspaceRoot == "" {
+		return
+	}
+	logging.Debug("bash session could not enter its working directory; returning to the workspace root",
+		"workspace_root", t.workspaceRoot)
+	t.session.SetWorkDir(t.workspaceRoot)
+}
+
+// hostPathForDetectedPWD converts a Linux `pwd` reported by a command running
+// inside a distro back to the Windows spelling everything else uses.
+//
+// Pure, and inert for a non-WSL workspace root: it returns its input and false,
+// so the caller keeps today's exact behaviour.
+func hostPathForDetectedPWD(workspaceRoot, pwd string) (string, bool) {
+	if pwd == "" || !strings.HasPrefix(pwd, "/") {
+		return pwd, false
+	}
+	location, ok := wsl.ParseWindowsPath(workspaceRoot)
+	if !ok {
+		return pwd, false
+	}
+	rebuilt := wsl.Location{Distro: location.Distro, LinuxPath: pwd, Host: location.Host}
+	return rebuilt.WindowsPath(), true
+}
+
+// workspaceRootForShell renders the workspace root as the running shell sees
+// it. Inside a distro that is the Linux path; everywhere else it is unchanged.
+func workspaceRootForShell(workspaceRoot string) string {
+	if location, ok := wsl.ParseWindowsPath(workspaceRoot); ok {
+		return location.LinuxPath
+	}
+	return workspaceRoot
 }
 
 // updateSessionAfterCommandLegacy is the original heuristic cd-tracking.
@@ -721,8 +815,24 @@ func (t *BashTool) executeForeground(
 	cmd := exec.CommandContext(execCtx, "bash", "-c", wrappedCommand)
 	cmd.Dir = workDir
 
+	// A project inside a WSL distro must run its own toolchain. Off Windows,
+	// and for ordinary Windows directories, DetectFor returns a host target and
+	// ApplyShell leaves the command byte-identical to what was just built.
+	//
 	// Use sanitized environment with session env vars injected
 	cmd.Env = t.buildSessionEnv()
+
+	// ORDER MATTERS, and getting it wrong is silent. ApplyShell must run AFTER
+	// cmd.Dir and cmd.Env are set, because it owns both: it clears Dir (a UNC
+	// path is not a legal CreateProcess working directory; --cd carries the
+	// real one) and replaces Env with the inherited Windows environment plus
+	// the WSLENV overlay. Assigning cmd.Env afterwards would drop WSLENV — the
+	// only channel by which the injected variables reach the distro — and hand
+	// wsl.exe a POSIX-shaped allowlist with no SystemRoot.
+	//
+	// It must still run BEFORE setBashProcAttr, which would otherwise overwrite
+	// the console-hiding process attributes.
+	wsl.ApplyShell(cmd, wsl.DetectFor(workDir), wrappedCommand, security.WorkspaceEnvironmentSnapshot())
 
 	// Set up process group for proper cleanup of child processes
 	setBashProcAttr(cmd)
@@ -885,6 +995,8 @@ func (t *BashTool) executeForeground(
 			t.updateSessionFromPWD(detectedDir)
 		} else if cmdErr == nil {
 			t.updateSessionAfterCommand(command)
+		} else {
+			t.recoverUnverifiedWorkDir()
 		}
 
 		if cmdErr != nil {
@@ -959,6 +1071,8 @@ func (t *BashTool) executeForeground(
 		t.updateSessionFromPWD(detectedDir)
 	} else if finalErr == nil {
 		t.updateSessionAfterCommand(command)
+	} else {
+		t.recoverUnverifiedWorkDir()
 	}
 
 	// Handle command error
@@ -1251,7 +1365,11 @@ func (t *BashTool) isWithinWorkspace(path string) bool {
 }
 
 func (t *BashTool) wrapManagedWorkspaceCommand(command string) string {
-	root := shellSingleQuote(t.workspaceRoot)
+	// The assertion below compares against `pwd -P`, which inside a distro is a
+	// Linux path. Interpolating the Windows spelling would make every cd look
+	// like a boundary violation. With a host target this is t.workspaceRoot
+	// verbatim, so the emitted script is byte-identical to before.
+	root := shellSingleQuote(workspaceRootForShell(t.workspaceRoot))
 	return fmt.Sprintf(`workspace_root=%s
 __gokin_assert_workspace() {
   current_dir="$(pwd -P)"

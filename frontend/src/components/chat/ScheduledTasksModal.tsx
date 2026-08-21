@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AlertTriangle, CalendarClock, Check, Clock3, History, Loader2, MessageSquare, Pencil, Play, Plus, Trash2, X } from 'lucide-react'
 import {
   DeleteScheduledTaskWithData,
@@ -27,6 +27,7 @@ type ScheduledTask = {
   createdAt: number
   nextRunAt?: number
   lastRunAt?: number
+  lastRunID?: string
   lastStatus?: string
   lastError?: string
   provider: 'glm' | 'kimi'
@@ -136,29 +137,64 @@ export function ScheduledTasksModal({
   const [form, setForm] = useState(() => emptyForm(provider, model))
   const [historyTaskID, setHistoryTaskID] = useState<string | null>(null)
   const [runs, setRuns] = useState<ScheduledTaskRun[]>([])
+  const [runsLoading, setRunsLoading] = useState(false)
+  const [runsError, setRunsError] = useState<string | null>(null)
+  const [historyRefresh, setHistoryRefresh] = useState(0)
   const [loading, setLoading] = useState(true)
+  const [tasksError, setTasksError] = useState<string | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<ScheduledTaskDeleteTarget | null>(null)
+  const taskLoadRequestRef = useRef(0)
+  const historyRequestRef = useRef(0)
+  const scopeKey = `${projectID}\u0000${sessionID}`
+  const scopeRef = useRef({ key: scopeKey, generation: 0, mounted: false })
 
-  const load = async () => {
+  useEffect(() => {
+    // A Wails RPC cannot be aborted once sent. Give every response an exact
+    // workspace generation so an A → B → A switch cannot revive the first A.
+    scopeRef.current.key = scopeKey
+    scopeRef.current.generation += 1
+    scopeRef.current.mounted = true
+    const generation = scopeRef.current.generation
+    return () => {
+      if (scopeRef.current.generation === generation) {
+        scopeRef.current.mounted = false
+        scopeRef.current.generation += 1
+      }
+      taskLoadRequestRef.current += 1
+      historyRequestRef.current += 1
+    }
+  }, [scopeKey])
+
+  const ownsScope = useCallback((generation: number) => (
+    scopeRef.current.mounted && scopeRef.current.generation === generation
+  ), [])
+
+  const load = useCallback(async () => {
+    const scope = scopeRef.current.generation
+    const request = ++taskLoadRequestRef.current
     setLoading(true)
+    setTasksError(null)
     try {
       const result: any = await ListScheduledTasks(projectID)
+      if (!ownsScope(scope) || taskLoadRequestRef.current !== request) return false
       setTasks((result || []) as ScheduledTask[])
-      setError(null)
+      return true
     } catch (e: any) {
-      setError(String(e?.message || e || 'Failed to load scheduled tasks'))
+      if (ownsScope(scope) && taskLoadRequestRef.current === request) {
+        setTasksError(String(e?.message || e || 'Failed to load scheduled tasks'))
+      }
+      return false
     } finally {
-      setLoading(false)
+      if (ownsScope(scope) && taskLoadRequestRef.current === request) setLoading(false)
     }
-  }
+  }, [ownsScope, projectID])
 
   useEffect(() => {
     void load()
-    // The modal is remounted for each project/session.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectID])
+    return () => { taskLoadRequestRef.current += 1 }
+  }, [load, sessionID])
 
   const editing = useMemo(() => tasks.find((task) => task.id === form.id), [tasks, form.id])
   const selectedProvider = providers.find((item) => item.id === form.provider)
@@ -226,8 +262,9 @@ export function ScheduledTasksModal({
       setDeleteTarget(null)
       return
     }
-    if (await confirmDiscardDraft()) onClose()
-  }, [busy, deleteTarget, confirmDiscardDraft, onClose])
+    const scope = scopeRef.current.generation
+    if (await confirmDiscardDraft() && ownsScope(scope)) onClose()
+  }, [busy, deleteTarget, confirmDiscardDraft, onClose, ownsScope])
 
   useEffect(() => {
     const handler = () => { void requestClose() }
@@ -253,6 +290,7 @@ export function ScheduledTasksModal({
       setError(`Connect ${form.provider === 'kimi' ? 'Kimi' : 'GLM'} before enabling this task, or turn off “Enabled after save” to keep it as a draft.`)
       return
     }
+    const scope = scopeRef.current.generation
     setBusy('save')
     setError(null)
     try {
@@ -277,12 +315,14 @@ export function ScheduledTasksModal({
         approvalMode: form.approvalMode,
       }
       await SaveScheduledTask(payload)
+      if (!ownsScope(scope)) return
       await load()
+      if (!ownsScope(scope)) return
       resetForm()
     } catch (e: any) {
-      setError(String(e?.message || e || 'Failed to save scheduled task'))
+      if (ownsScope(scope)) setError(String(e?.message || e || 'Failed to save scheduled task'))
     } finally {
-      setBusy(null)
+      if (ownsScope(scope)) setBusy(null)
     }
   }
 
@@ -312,17 +352,20 @@ export function ScheduledTasksModal({
       setError(`${task.model} is not available for the tested ${task.provider.toUpperCase()} key. Edit the task and choose an available model before enabling it.`)
       return
     }
+    const scope = scopeRef.current.generation
     setBusy(task.id)
+    setError(null)
     try {
       await SaveScheduledTask({ ...task, enabled: !task.enabled } as any)
+      if (!ownsScope(scope)) return
       await load()
-      if (form.id === task.id) {
+      if (ownsScope(scope) && form.id === task.id) {
         setForm((current) => ({ ...current, enabled: !task.enabled }))
       }
     } catch (e: any) {
-      setError(String(e?.message || e || 'Failed to update scheduled task'))
+      if (ownsScope(scope)) setError(String(e?.message || e || 'Failed to update scheduled task'))
     } finally {
-      setBusy(null)
+      if (ownsScope(scope)) setBusy(null)
     }
   }
 
@@ -335,84 +378,131 @@ export function ScheduledTasksModal({
       setError(`${task.model} is not available for the tested ${task.provider.toUpperCase()} key. Edit the task and choose an available model before running it.`)
       return
     }
+    const scope = scopeRef.current.generation
     setBusy(`run:${task.id}`)
     setError(null)
     try {
       const run: any = await RunScheduledTaskNow(projectID, task.id)
+      if (!ownsScope(scope)) return
       await load()
-      if (run?.sessionID) await openRun(run.sessionID)
+      if (ownsScope(scope) && run?.sessionID) await openRun(run.sessionID, scope)
     } catch (e: any) {
-      setError(String(e?.message || e || 'Failed to run scheduled task'))
+      if (!ownsScope(scope)) return
+      const message = String(e?.message || e || 'Failed to run scheduled task')
       await load()
+      if (ownsScope(scope)) setError(message)
     } finally {
-      setBusy(null)
+      if (ownsScope(scope)) setBusy(null)
     }
   }
 
-  const loadRuns = async (taskID: string) => {
-    try {
-      const result: any = await ListScheduledTaskRuns(projectID, taskID)
-      setRuns((result || []) as ScheduledTaskRun[])
-      setHistoryTaskID(taskID)
-    } catch (e: any) {
-      setError(String(e?.message || e || 'Failed to load run history'))
-    }
-  }
+  const openRunHistory = useCallback((taskID: string) => {
+    historyRequestRef.current += 1
+    setHistoryTaskID(taskID)
+    setHistoryRefresh((value) => value + 1)
+    setRuns([])
+    setRunsLoading(true)
+    setRunsError(null)
+  }, [])
+
+  const closeRunHistory = useCallback(() => {
+    historyRequestRef.current += 1
+    setHistoryTaskID(null)
+    setRuns([])
+    setRunsLoading(false)
+    setRunsError(null)
+  }, [])
 
   useEffect(() => {
     if (!historyTaskID) return
-    const timer = window.setInterval(() => { void loadRuns(historyTaskID) }, 2000)
-    return () => window.clearInterval(timer)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [historyTaskID, projectID])
+    const taskID = historyTaskID
+    const scope = scopeRef.current.generation
+    const request = ++historyRequestRef.current
+    let stopped = false
+    let timer: number | undefined
 
-  const openRun = async (runSessionID: string) => {
+    const poll = async (initial: boolean) => {
+      if (initial) {
+        setRunsLoading(true)
+        setRunsError(null)
+      }
+      try {
+        const result: any = await ListScheduledTaskRuns(projectID, taskID)
+        if (stopped || !ownsScope(scope) || historyRequestRef.current !== request) return
+        setRuns((result || []) as ScheduledTaskRun[])
+        setRunsError(null)
+      } catch (e: any) {
+        if (stopped || !ownsScope(scope) || historyRequestRef.current !== request) return
+        setRunsError(String(e?.message || e || 'Failed to load run history'))
+      } finally {
+        if (stopped || !ownsScope(scope) || historyRequestRef.current !== request) return
+        setRunsLoading(false)
+        // Schedule only after the RPC settles so a slow backend can never
+        // accumulate overlapping history reads.
+        timer = window.setTimeout(() => { void poll(false) }, 2000)
+      }
+    }
+
+    void poll(true)
+    return () => {
+      stopped = true
+      if (historyRequestRef.current === request) historyRequestRef.current += 1
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
+  }, [historyRefresh, historyTaskID, ownsScope, projectID])
+
+  const openRun = async (runSessionID: string, expectedScope = scopeRef.current.generation) => {
     if (!(await confirmDiscardDraft())) return
+    if (!ownsScope(expectedScope)) return
     onClose()
     window.dispatchEvent(new CustomEvent('gokin:sessions-changed'))
     window.dispatchEvent(new CustomEvent('gokin:switch-tab', { detail: runSessionID }))
   }
 
   const remove = async (task: ScheduledTask) => {
+    const scope = scopeRef.current.generation
     setBusy(`preview-delete:${task.id}`)
     setError(null)
     try {
       const result: any = await GetScheduledTaskDeletionPreview(projectID, task.id)
+      if (!ownsScope(scope)) return
       setDeleteTarget({
         task,
         preview: result as ScheduledTaskDeletionPreview,
         deleteRunData: false,
       })
     } catch (e: any) {
-      setError(String(e?.message || e || 'Failed to inspect scheduled task data'))
+      if (ownsScope(scope)) setError(String(e?.message || e || 'Failed to inspect scheduled task data'))
     } finally {
-      setBusy(null)
+      if (ownsScope(scope)) setBusy(null)
     }
   }
 
   const confirmDelete = async () => {
     if (!deleteTarget) return
     const { task, deleteRunData } = deleteTarget
+    const scope = scopeRef.current.generation
     setBusy(`delete:${task.id}`)
     setError(null)
     try {
       await DeleteScheduledTaskWithData(projectID, task.id, deleteRunData)
+      if (!ownsScope(scope)) return
       setTasks((current) => current.filter((item) => item.id !== task.id))
       if (form.id === task.id) resetForm()
       if (historyTaskID === task.id) {
-        setHistoryTaskID(null)
-        setRuns([])
+        closeRunHistory()
       }
       setDeleteTarget(null)
       if (deleteRunData) {
         window.dispatchEvent(new CustomEvent('gokin:sessions-changed'))
       }
     } catch (e: any) {
+      if (!ownsScope(scope)) return
       const message = String(e?.message || e || 'Failed to delete scheduled task')
       await load()
-      setError(message)
+      if (ownsScope(scope)) setError(message)
     } finally {
-      setBusy(null)
+      if (ownsScope(scope)) setBusy(null)
     }
   }
 
@@ -429,13 +519,20 @@ export function ScheduledTasksModal({
         </div>
 
         <div className="scheduled-body">
-          <section className="scheduled-list">
+          <section className="scheduled-list" aria-busy={loading}>
             <div className="scheduled-section-title">
               <span>Tasks</span>
               <span>{tasks.length}/64</span>
             </div>
+            {tasksError && (
+              <div className="scheduled-list-error" role="alert">
+                <AlertTriangle size={12} />
+                <span>{tasksError}</span>
+                <button type="button" onClick={() => void load()} disabled={loading}>Retry</button>
+              </div>
+            )}
             {loading && <div className="scheduled-empty"><Loader2 size={15} className="spin" /> Loading…</div>}
-            {!loading && tasks.length === 0 && (
+            {!loading && !tasksError && tasks.length === 0 && (
               <div className="scheduled-empty">
                 <CalendarClock size={22} />
                 <span>No recurring prompts yet.</span>
@@ -494,7 +591,7 @@ export function ScheduledTasksModal({
                     {busy === `run:${task.id}` ? <Loader2 size={12} className="spin" /> : <Play size={12} />}
                   </button>
                   <button onClick={() => edit(task)} disabled={busy !== null} title="Edit" aria-label={`Edit ${task.name || 'scheduled task'}`}><Pencil size={12} /></button>
-                  <button onClick={() => void loadRuns(task.id)} disabled={busy !== null} title="Run history" aria-label={`View run history for ${task.name || 'scheduled task'}`}><History size={12} /></button>
+                  <button onClick={() => openRunHistory(task.id)} disabled={busy !== null} title="Run history" aria-label={`View run history for ${task.name || 'scheduled task'}`}><History size={12} /></button>
                   <button className="danger" onClick={() => void remove(task)} disabled={busy !== null} title="Delete" aria-label={`Delete ${task.name || 'scheduled task'}`}>
                     {busy === `delete:${task.id}` || busy === `preview-delete:${task.id}` ? <Loader2 size={12} className="spin" /> : <Trash2 size={12} />}
                   </button>
@@ -503,12 +600,14 @@ export function ScheduledTasksModal({
               )
             })}
             {historyTaskID && (
-              <div className="scheduled-runs">
+              <div className="scheduled-runs" aria-busy={runsLoading}>
                 <div className="scheduled-section-title">
                   <span>Run history</span>
-                  <button onClick={() => { setHistoryTaskID(null); setRuns([]) }}>Close</button>
+                  <button onClick={closeRunHistory}>Close</button>
                 </div>
-                {runs.length === 0 && <div className="scheduled-run-empty">No runs yet.</div>}
+                {runsLoading && <div className="scheduled-run-empty"><Loader2 size={12} className="spin" /> Loading history…</div>}
+                {runsError && <div className="scheduled-runs-error" role="alert"><AlertTriangle size={12} /> {runsError} Retrying…</div>}
+                {!runsLoading && !runsError && runs.length === 0 && <div className="scheduled-run-empty">No runs yet.</div>}
                 {runs.map((run) => (
                   <button className="scheduled-run" key={run.id} onClick={() => void openRun(run.sessionID)}>
                     <span className={`scheduled-run-status ${run.status}`}>
@@ -714,7 +813,7 @@ export function ScheduledTasksModal({
               <AlertTriangle size={12} />
               <span>Every run gets its own chat and selected model. A manual-only routine never auto-runs or keeps the computer awake. Manual approval waits before mutations; Auto allows reviewed project-local edits; Skip still hard-gates deletion, computer use, SSH, and MCP.</span>
             </div>
-            {error && <div className="scheduled-error"><AlertTriangle size={12} /> {error}</div>}
+            {error && <div className="scheduled-error" role="alert"><AlertTriangle size={12} /> {error}</div>}
             <button className="btn-primary scheduled-save" onClick={() => void save()} disabled={busy !== null || !form.prompt.trim() || selectedModelUnavailable || enabledScheduleNeedsCredential}>
               {busy === 'save' ? <><Loader2 size={12} className="spin" /> Saving…</> : <><Plus size={13} /> {editing ? 'Save changes' : 'Create task'}</>}
             </button>

@@ -28,6 +28,8 @@ import (
 // the budget without hard-coding the magic number.
 const maxTruncationContinuations = 3
 
+const backgroundTaskCloseTimeout = 5 * time.Second
+
 // truncationContinuationPrompt is the user-role nudge appended to history
 // when auto-continuing a truncated response. The model must resume without
 // repeating already-emitted text and must call the next tool if one is needed.
@@ -43,10 +45,13 @@ type Project struct {
 	SystemPrompt        string
 	Temperature         float32
 	MaxTokens           int
-	ThinkingMode        string // "" = auto, "enabled", "disabled"
-	ThinkingBudget      int32  // 0 = use the selected model's tuned default
-	PermissionMode      string // auto = reviewed; manual = confirm; skip = bypass ordinary gates
-	ComputerUseEnabled  bool   // opt-in OS screen access; computer_* tools always ask
+	ThinkingMode        string   // "" = auto, "enabled", "disabled"
+	ThinkingBudget      int32    // 0 = use the selected model's tuned default
+	PermissionMode      string   // auto = reviewed; manual = confirm; skip = bypass ordinary gates
+	Description         string   // shown to other projects' agents in delegate list
+	Capabilities        []string // short "good for" hints, user-authored
+	DelegationPolicy    string   // any (default) | group | off
+	ComputerUseEnabled  bool     // opt-in OS screen access; computer_* tools always ask
 	ComputerAllowedApps []string
 	ComputerBlockedApps []string
 	ToolPermissions     []ToolPermissionRule
@@ -197,6 +202,9 @@ func NewProject(pc ProjectConfig) *Project {
 		ThinkingMode:        pc.ThinkingMode,
 		ThinkingBudget:      pc.ThinkingBudget,
 		PermissionMode:      pc.PermissionMode,
+		Description:         pc.Description,
+		DelegationPolicy:    normalizeDelegationPolicy(pc.DelegationPolicy),
+		Capabilities:        append([]string(nil), pc.Capabilities...),
 		ComputerUseEnabled:  pc.ComputerUseEnabled,
 		ComputerAllowedApps: append([]string(nil), pc.ComputerAllowedApps...),
 		ComputerBlockedApps: append([]string(nil), pc.ComputerBlockedApps...),
@@ -530,7 +538,25 @@ func (p *Project) initMemoryAndPlan(reg *tools.Registry) {
 				searchTool.SetHandler(p.studio.makeSessionAgentHandler())
 			}
 		}
+		if t, ok := reg.Get("delegate"); ok {
+			if delegateTool, ok := t.(*tools.DelegateTool); ok {
+				delegateTool.SetHandler(p.studio.makeDelegateHandler())
+			}
+		}
 	}
+}
+
+// newStudioToolRegistry returns the desktop agent's actual capability
+// surface. The generic engine registry also contains task and coordinate,
+// whose execution adapters are wired by the engine Runner. Studio has its own
+// session/delegation execution model and never installs those adapters, so it
+// does not advertise them. task_output and task_stop remain available for
+// background shell commands started by bash.
+func newStudioToolRegistry(workDir string) *tools.Registry {
+	reg := tools.DefaultRegistry(workDir)
+	reg.Unregister("task")
+	reg.Unregister("coordinate")
+	return reg
 }
 
 // registryForSession returns the tool registry and working directory for one
@@ -557,7 +583,7 @@ func (p *Project) registryForSession(session *ChatSession, provider string) (*to
 		return session.registry, workDir, nil
 	}
 
-	reg := tools.DefaultRegistry(workDir)
+	reg := newStudioToolRegistry(workDir)
 	// Dynamic tools are workspace-independent and already connected/wired on
 	// the project registry. Reuse only those instances; all path-bound tools
 	// above are fresh constructors rooted in the worktree.
@@ -582,11 +608,6 @@ func (p *Project) registryForSession(session *ChatSession, provider string) (*to
 		p.studio.registerCodeReviewTool(reg, p.ID)
 	}
 	if p.studio != nil {
-		if askAgent, ok := reg.Get("ask_agent"); ok {
-			if agentTool, ok := askAgent.(*tools.AskAgentTool); ok {
-				agentTool.SetMessenger(NewStudioMessenger(p.studio, p.ID))
-			}
-		}
 		if p.studio.ctx != nil {
 			if askUser, ok := reg.Get("ask_user"); ok {
 				if userTool, ok := askUser.(*tools.AskUserTool); ok {
@@ -808,7 +829,7 @@ func (p *Project) initClient(settings Settings) error {
 	}
 
 	// Set available tools on the client, filtered by provider capability.
-	reg := tools.DefaultRegistry(p.Directory)
+	reg := newStudioToolRegistry(p.Directory)
 	enabledPlugins := enabledPluginNames()
 	if len(enabledPlugins) > 0 {
 		reg.MustRegister(tools.NewPluginResourceTool(pluginsDir(), enabledPlugins))
@@ -832,13 +853,8 @@ func (p *Project) initClient(settings Settings) error {
 	p.registry = reg
 	p.client = c
 
-	// Wire messenger for inter-project agent coordination.
+	// Wire user questions to the exact project/session frontend route.
 	if p.studio != nil {
-		if askAgent, ok := reg.Get("ask_agent"); ok {
-			if aat, ok := askAgent.(*tools.AskAgentTool); ok {
-				aat.SetMessenger(NewStudioMessenger(p.studio, p.ID))
-			}
-		}
 		// Wire ask_user so the agent's clarification questions bubble up as
 		// chat:ask_user events the frontend can render as an interactive card.
 		// The handler reads project/session from the per-turn context.
@@ -1093,14 +1109,27 @@ func (p *Project) sendMessage(wailsCtx context.Context, message string, attachme
 		})
 		return
 	}
-	session.mu.RLock()
+	// Write lock: the delegation stamp is consumed here. Reading and clearing
+	// it in one critical section is what stops a stamp from leaking into the
+	// next, possibly human-initiated, turn in this session.
+	session.mu.Lock()
 	executionProvider := session.executionProvider
 	executionModel := session.executionModel
 	executionPermissionMode := session.executionPermissionMode
 	executionSystemPrompt := session.executionSystemPrompt
 	executionAllowedTools := cloneBoolMap(session.executionAllowedTools)
 	pluginAgentChild := session.pluginAgentChild
-	session.mu.RUnlock()
+	delegationParent := session.incomingDelegation
+	session.incomingDelegation = nil
+	haltedBeforeStart := session.queueHalt
+	session.mu.Unlock()
+	// The queue worker owns clearing queueHalt in its defer. Exit before client
+	// initialization (which may allocate transports or start MCP children) when
+	// Stop already won the claim→goroutine micro-phase. The second check at the
+	// idle→active transition below closes a Stop racing during initialization.
+	if haltedBeforeStart {
+		return
+	}
 	var sessionPermissionMode string
 	// iter 1040+: strict budget enforcement. Opt-in via Project.EnforceBudget.
 	// Pre-flight check refuses new turns once cumulative cost across every
@@ -1179,6 +1208,16 @@ func (p *Project) sendMessage(wailsCtx context.Context, message string, attachme
 		return
 	}
 	session.mu.Lock()
+	// Stop may land after startMessage synchronously claims queueWorker but
+	// before this goroutine establishes cancelFn. In that micro-phase Stop has
+	// no context to cancel, so queueHalt is the durable hand-off bit: refusing
+	// the idle→active transition here guarantees the first provider request is
+	// never sent after the user (or task deletion) already stopped the session.
+	if session.queueHalt {
+		session.mu.Unlock()
+		p.mu.RUnlock()
+		return
+	}
 	if session.active {
 		session.mu.Unlock()
 		p.mu.RUnlock()
@@ -1882,6 +1921,10 @@ outer:
 					})
 					notSuccess := false
 					replay.Append(ReplayEvent{Type: "tool_result", Tool: fc.Name, Success: &notSuccess, Text: denial})
+					// A delegation caller must be told when the target finished
+					// but some calls were blocked, so the answer can be read as
+					// possibly incomplete rather than authoritative.
+					recordDeniedTool(session, fc.Name)
 					continue
 				}
 				if validationErr := tool.Validate(callArgs); validationErr != nil {
@@ -1914,6 +1957,9 @@ outer:
 				// this session (prevents blind grep-based edits clobbering context).
 				toolCtx := withAskUserRouting(ctx, p.ID, sid)
 				toolCtx = context.WithValue(toolCtx, tools.ReadTrackerCtxKey{}, readTracker)
+				// Cross-agent tools read this back out to judge whether one more
+				// hop is allowed.
+				toolCtx = context.WithValue(toolCtx, tools.DelegationDepthCtxKey{}, delegationParent.toolContext())
 				toolCtx = context.WithValue(toolCtx, tools.HistoryGetterCtxKey{}, func() []*genai.Content {
 					session.mu.RLock()
 					defer session.mu.RUnlock()
@@ -1946,7 +1992,14 @@ outer:
 				denial := "Tool execution denied by the user for this turn"
 				var computerTarget *tools.ComputerApplication
 				permission := permissionForTool(permMode, fc.Name, callArgs)
-				if permission == permissionDeny {
+				// The hop guard runs before every gate, including Skip, so a
+				// structurally refused delegation is never something the user
+				// is asked to approve and never something a permissive mode
+				// can wave through.
+				if refusal := delegationHopGuard(fc.Name, callArgs, delegationParent, p.ID); refusal != "" {
+					callApproved = false
+					denial = refusal
+				} else if permission == permissionDeny {
 					callApproved = false
 					denial = fmt.Sprintf("%s is unavailable in Plan mode because it may modify workspace, process, memory, external, or desktop state", fc.Name)
 				} else if alwaysAsk {
@@ -2002,6 +2055,10 @@ outer:
 							permission = permissionAskAction
 						}
 					}
+					// Turn opaque cross-project IDs into names the user can
+					// recognise. Must happen here, not in toolApprovalDetails,
+					// which is pure and has no access to the studio registry.
+					approvalArgs = p.decorateApprovalTargets(approvalArgs, callArgs)
 					if preHook.ForceAsk {
 						permission = permissionAskAction
 					}
@@ -2027,6 +2084,15 @@ outer:
 					}
 				}
 				if !callApproved {
+					// Every ordinary refusal lands here — a Deny click on an
+					// approval card, a Plan-mode block, the delegation hop
+					// guard, a computer/browser target refusal. Recording it is
+					// what makes delegateStatus and the delegations panel warn
+					// that "N tool call(s) were blocked, so the answer may be
+					// incomplete". Wiring only the plugin-hook branch above left
+					// DeniedTools empty for every user-facing denial, so the
+					// caller consumed a partial answer as if it were complete.
+					recordDeniedTool(session, fc.Name)
 					denial = appendPluginHookContext(denial, preHook.AdditionalContext)
 					funcParts = append(funcParts, &genai.Part{FunctionResponse: &genai.FunctionResponse{
 						ID: fc.ID, Name: fc.Name, Response: map[string]any{"error": denial},
@@ -2149,6 +2215,14 @@ outer:
 						if fp, _ := callArgs["file_path"].(string); fp != "" {
 							writeTracker.Record(fp)
 						}
+					}
+					// Remember that this turn changed something. A cancelled
+					// delegation that had already written is not a rolled-back
+					// delegation, and the run card has to say so.
+					if toolMutatesWorkspace(fc.Name) {
+						session.mu.Lock()
+						session.mutatedThisTurn = true
+						session.mu.Unlock()
 					}
 				}
 
@@ -2525,9 +2599,48 @@ func (p *Project) Stop() map[string][]string {
 // stdio MCP children and clear the cached references.
 func (p *Project) Close() {
 	p.Stop()
+	p.closeBackgroundTaskManagers()
 	p.mu.Lock()
 	p.resetClientLocked()
 	p.mu.Unlock()
+}
+
+// closeBackgroundTaskManagers is the permanent counterpart to Stop's
+// reusable cancellation. It closes the start gates and waits for every
+// process/output/observer barrier before the project can release path-bound
+// resources.
+func (p *Project) closeBackgroundTaskManagers() {
+	p.mu.RLock()
+	managers := make(map[*tasks.Manager]struct{}, len(p.sessions)+1)
+	if p.taskManager != nil {
+		managers[p.taskManager] = struct{}{}
+	}
+	for _, session := range p.sessions {
+		session.mu.RLock()
+		manager := session.taskManager
+		session.mu.RUnlock()
+		if manager != nil {
+			managers[manager] = struct{}{}
+		}
+	}
+	p.mu.RUnlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), backgroundTaskCloseTimeout)
+	defer cancel()
+	for manager := range managers {
+		if err := manager.Close(ctx); err != nil && p.studio != nil {
+			p.studio.logf("warn", "tasks", "timed out settling background tasks for project %q: %v", p.ID, err)
+		}
+	}
+}
+
+func closeBackgroundTaskManager(manager *tasks.Manager) error {
+	if manager == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), backgroundTaskCloseTimeout)
+	defer cancel()
+	return manager.Close(ctx)
 }
 
 // StopSession cancels generation for a specific session only.
@@ -2684,6 +2797,9 @@ func (p *Project) ToConfig() ProjectConfig {
 		ThinkingMode:        p.ThinkingMode,
 		ThinkingBudget:      p.ThinkingBudget,
 		PermissionMode:      p.PermissionMode,
+		Description:         p.Description,
+		DelegationPolicy:    p.DelegationPolicy,
+		Capabilities:        append([]string(nil), p.Capabilities...),
 		ComputerUseEnabled:  p.ComputerUseEnabled,
 		ComputerAllowedApps: append([]string(nil), p.ComputerAllowedApps...),
 		ComputerBlockedApps: append([]string(nil), p.ComputerBlockedApps...),
@@ -2858,7 +2974,7 @@ func defaultSystemPrompt(directory, name string) string {
 	return `You are a senior software engineer working inside the project "` + name + `" at ` + directory + `.
 
 # Tool use is mandatory
-You have access to file tools (read, write, edit, copy, move, delete, mkdir, diff, list_dir, tree, glob, grep), professional document generation (document_create for native DOCX, XLSX, PPTX, and PDF), shell (bash, run_tests for smart test execution, task for background processes), git (git_status, git_diff, git_log, git_blame, git_add, git_commit, git_branch, git_pr, review_changes), web (web_fetch, web_search), task tracking (todo), local routines (scheduled_task), planning (enter_plan_mode, update_plan_progress, get_plan_status, exit_plan_mode), persistent memory (memory, memorize, pin_context, history_search), inter-session context (search_session_transcripts, session_agent), inter-project coordination (ask_agent, coordinate), and clarification (ask_user).
+You have access to file tools (read, write, edit, copy, move, delete, mkdir, diff, list_dir, tree, glob, grep), professional document generation (document_create for native DOCX, XLSX, PPTX, and PDF), shell (bash, including background commands managed with task_output/task_stop, plus run_tests for smart test execution), git (git_status, git_diff, git_log, git_blame, git_add, git_commit, git_branch, git_pr, review_changes), web (web_fetch, web_search), task tracking (todo), local routines (scheduled_task), planning (enter_plan_mode, update_plan_progress, get_plan_status, exit_plan_mode), persistent memory (memory, memorize, pin_context, history_search), inter-session context (search_session_transcripts, session_agent), inter-project delegation (delegate), and clarification (ask_user).
 
 Prefer run_tests over bare "bash go test ./..." — run_tests auto-detects the framework, parses JSON output, surfaces only failed test names and their file:line assertion locations.
 Prefer review_changes over bare "git diff" — review_changes also shows untracked (newly-created) files in the same view and truncates sensibly for long diffs.
@@ -3667,27 +3783,43 @@ func isToolApprovalGranted(answer, allowOption string) bool {
 func toolApprovalDetails(toolName string, args map[string]any) []ToolApprovalDetail {
 	details := []ToolApprovalDetail{{Label: "Tool", Value: previewApprovalText(toolName, 160)}}
 	labels := map[string]string{
-		"file_path":     "File",
-		"path":          "Path",
-		"source":        "Source",
-		"destination":   "Destination",
-		"new_path":      "New path",
-		"command":       "Command",
-		"action":        "Action",
-		"branch":        "Branch",
-		"name":          "Name",
-		"target":        "Target",
-		"session_id":    "Session",
-		"task_id":       "Task",
-		"prompt":        "Prompt",
-		"schedule":      "Schedule",
-		"time_of_day":   "Local time",
-		"provider":      "Provider",
-		"model":         "Model",
-		"approval_mode": "Approval mode",
-		"subagent_type": "Agent type",
+		// Cross-agent keys first: approving a spend in another project is not
+		// meaningful unless the card names that project and shows what is
+		// actually being sent. The _target_* keys are resolved at the call
+		// site (decorateApprovalTargets) because this function is pure and
+		// cannot map an opaque ID to a user-visible name.
+		"_target_project_name": "Target project",
+		"_target_session_name": "Target chat",
+		"project_id":           "Target project ID",
+		"goal":                 "Goal",
+		"task":                 "Task",
+		"message":              "Message",
+		"query":                "Question",
+		"context":              "Context",
+		"run_id":               "Delegation run",
+		"file_path":            "File",
+		"path":                 "Path",
+		"source":               "Source",
+		"destination":          "Destination",
+		"new_path":             "New path",
+		"command":              "Command",
+		"action":               "Action",
+		"branch":               "Branch",
+		"name":                 "Name",
+		"target":               "Target",
+		"session_id":           "Session",
+		"task_id":              "Task",
+		"prompt":               "Prompt",
+		"schedule":             "Schedule",
+		"time_of_day":          "Local time",
+		"provider":             "Provider",
+		"model":                "Model",
+		"approval_mode":        "Approval mode",
+		"subagent_type":        "Agent type",
 	}
 	for _, key := range []string{
+		"_target_project_name", "_target_session_name", "project_id",
+		"goal", "task", "message", "query", "context", "run_id",
 		"file_path", "path", "source", "destination", "new_path",
 		"command", "action", "branch", "name", "target", "session_id",
 		"task_id", "prompt", "schedule", "time_of_day", "provider", "model",
@@ -3698,10 +3830,9 @@ func toolApprovalDetails(toolName string, args map[string]any) []ToolApprovalDet
 			continue
 		}
 		limit := 512
-		if key == "command" {
-			limit = 1000
-		}
-		if key == "prompt" {
+		switch key {
+		case "command", "prompt", "task", "message", "query", "goal", "context":
+			// The payload the user is actually being asked to authorise.
 			limit = 1000
 		}
 		details = append(details, ToolApprovalDetail{

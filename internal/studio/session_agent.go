@@ -128,9 +128,21 @@ func (s *Studio) makeSessionAgentHandler() tools.SessionAgentHandler {
 				sourceSession.mu.RLock()
 				sourceSessionName := sourceSession.Name
 				sourceSession.mu.RUnlock()
+				// Depth and cycle are judged before anything is delivered, so a
+				// relay cannot be built out of repeated legal-looking hops.
+				parentStamp := stampFromToolContext(tools.DelegationFromContext(ctx))
+				hop := delegationHop{
+					Applies:       true,
+					TargetProject: targetProjectID,
+					CrossProject:  targetProjectID != sourceProjectID,
+				}
+				if errType, refusal := delegationHopAllowed(parentStamp, sourceProjectID, hop); errType != "" {
+					return tools.NewErrorResult(refusal), nil
+				}
+				childStamp := nextDelegationStamp(parentStamp, uuid.NewString(), sourceProjectID, targetProjectID)
 				message := strings.TrimSpace(stringArg(args, "message"))
 				incoming := attributedSessionMessage(sourceProjectName, sourceSessionName, sourceProjectID, sourceSessionID, message)
-				state, deliveryErr := s.deliverSessionAgentMessage(targetProject, targetSession, incoming)
+				state, deliveryErr := s.deliverSessionAgentMessage(targetProject, targetSession, incoming, childStamp)
 				if deliveryErr != nil {
 					return tools.NewErrorResult("cross-session delivery failed: " + deliveryErr.Error()), nil
 				}
@@ -356,8 +368,11 @@ func formatSessionAgentTranscript(projectName, sessionName string, entries []ses
 func sessionAgentMayCoordinate(session *ChatSession, label string) error {
 	session.mu.RLock()
 	defer session.mu.RUnlock()
-	if session.executionProvider != "" || session.pluginAgentChild {
-		return fmt.Errorf("%s session is an unattended scheduled or specialist-agent run; cross-session delivery is disabled", label)
+	// A chat created to service someone else's request is not allowed to
+	// originate cross-agent work of its own. Without this, a two-hop limit
+	// becomes an unbounded relay: each child starts a fresh chain.
+	if session.executionProvider != "" || session.pluginAgentChild || session.delegateChild {
+		return fmt.Errorf("%s session is an unattended scheduled, specialist-agent, or delegated run; cross-session delivery is disabled", label)
 	}
 	return nil
 }
@@ -383,7 +398,7 @@ func attributedSessionMessage(projectName, sessionName, projectID, sessionID, me
 	)
 }
 
-func (s *Studio) deliverSessionAgentMessage(project *Project, session *ChatSession, message string) (string, error) {
+func (s *Studio) deliverSessionAgentMessage(project *Project, session *ChatSession, message string, delegation *delegationStamp) (string, error) {
 	queueID := "session-" + uuid.NewString()
 	for attempt := 0; attempt < 3; attempt++ {
 		session.mu.RLock()
@@ -391,7 +406,7 @@ func (s *Studio) deliverSessionAgentMessage(project *Project, session *ChatSessi
 		projectID, sessionID := project.ID, session.ID
 		session.mu.RUnlock()
 		if running {
-			if err := s.QueueMessage(projectID, message, sessionID, queueID); err == nil {
+			if err := s.queueMessageWithDelegation(projectID, message, nil, sessionID, queueID, delegation); err == nil {
 				project.emitEvent(s.ctx, EventChatQueueAdded, ChatQueueEvent{
 					ProjectID: projectID, SessionID: sessionID, ID: queueID, Text: message,
 				})
@@ -402,7 +417,7 @@ func (s *Studio) deliverSessionAgentMessage(project *Project, session *ChatSessi
 		}
 		if err := s.startMessageWithQueueEvent(projectID, message, nil, sessionID, &ChatQueueEvent{
 			ID: queueID, Text: message,
-		}); err == nil {
+		}, delegation); err == nil {
 			return "started", nil
 		}
 		// A user turn may have claimed the target between observation and start.

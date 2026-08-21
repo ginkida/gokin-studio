@@ -1,11 +1,16 @@
 package agent
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/ginkida/gokin-studio/internal/engine/fileutil"
 )
 
 // AgentType defines the type of agent and its capabilities.
@@ -38,10 +43,10 @@ func (t AgentType) AllowedTools() []string {
 	case AgentTypeExplore:
 		return []string{
 			"read", "glob", "grep", "tree", "list_dir",
-			"tools_list", "request_tool", "ask_agent",
+			"tools_list",
 		}
 	case AgentTypeBash:
-		return []string{"bash", "read", "glob", "tools_list", "request_tool", "ask_agent"}
+		return []string{"bash", "read", "glob", "tools_list"}
 	case AgentTypeGeneral:
 		return nil // nil means all tools allowed
 	case AgentTypePlan:
@@ -49,14 +54,14 @@ func (t AgentType) AllowedTools() []string {
 		return []string{
 			"read", "glob", "grep", "tree", "list_dir", "diff",
 			"todo", "web_fetch", "web_search", "ask_user", "env",
-			"tools_list", "request_tool", "ask_agent",
+			"tools_list",
 			// Planning tools
 			"enter_plan_mode", "exit_plan_mode",
 			"update_plan_progress", "get_plan_status",
 		}
 	case AgentTypeGuide:
 		// Documentation/search focused
-		return []string{"glob", "grep", "read", "web_fetch", "web_search", "tools_list", "request_tool", "ask_agent"}
+		return []string{"glob", "grep", "read", "web_fetch", "web_search", "tools_list"}
 	default:
 		return []string{}
 	}
@@ -67,9 +72,11 @@ func (t AgentType) String() string {
 	return string(t)
 }
 
-// ParseAgentType parses a string into an AgentType.
+// ParseAgentType parses a built-in agent type. Unknown values return the zero
+// value so callers must choose an explicit fallback instead of accidentally
+// granting general-agent capabilities.
 func ParseAgentType(s string) AgentType {
-	switch s {
+	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "explore":
 		return AgentTypeExplore
 	case "bash":
@@ -81,7 +88,7 @@ func ParseAgentType(s string) AgentType {
 	case "claude-code-guide":
 		return AgentTypeGuide
 	default:
-		return AgentTypeGeneral
+		return ""
 	}
 }
 
@@ -122,25 +129,30 @@ type AgentOutputWriter struct {
 	filePath   string
 	totalBytes int64
 	truncated  bool
+	fileFailed bool
 }
 
-const maxAgentMemoryOutput = 2 * 1024 * 1024 // 2 MB in-memory cap for agent output
+const (
+	maxAgentMemoryOutput    = 2 * 1024 * 1024 // 2 MB in-memory cap for agent output
+	maxAgentOutputReadBytes = 1 * 1024 * 1024 // 1 MB per incremental read
+)
 
 // NewAgentOutputWriter creates a file-backed output writer for an agent.
-// The file is created at .gokin/agent-output/{agentID}.log under workDir.
+// The preferred file is .gokin/agent-output/{agentID}.log under workDir; a
+// private sibling is selected if that name already exists.
 func NewAgentOutputWriter(workDir, agentID string) *AgentOutputWriter {
 	w := &AgentOutputWriter{}
-	dir := filepath.Join(workDir, ".gokin", "agent-output")
-	if err := os.MkdirAll(dir, 0750); err != nil {
-		return w // proceed without file backing
-	}
-	path := filepath.Join(dir, agentID+".log")
-	f, err := os.Create(path)
-	if err != nil {
+	if !fileutil.SafeFilenameComponent(agentID) {
 		return w
 	}
+	dir := filepath.Join(workDir, ".gokin", "agent-output")
+	path := filepath.Join(dir, agentID+".log")
+	f, actualPath, err := fileutil.CreatePrivateOutputFile(path)
+	if err != nil {
+		return w // proceed without file backing
+	}
 	w.file = f
-	w.filePath = path
+	w.filePath = actualPath
 	return w
 }
 
@@ -149,8 +161,17 @@ func (w *AgentOutputWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	var writeErr error
 	if w.file != nil {
-		w.file.Write(p)
+		n, err := w.file.Write(p)
+		if err != nil {
+			writeErr = err
+		} else if n != len(p) {
+			writeErr = io.ErrShortWrite
+		}
+		if writeErr != nil {
+			w.fileFailed = true
+		}
 	}
 	w.totalBytes += int64(len(p))
 
@@ -159,12 +180,13 @@ func (w *AgentOutputWriter) Write(p []byte) (int, error) {
 	} else if !w.truncated {
 		w.truncated = true
 	}
-	return len(p), nil
+	return len(p), writeErr
 }
 
 // WriteString appends a string to the output.
-func (w *AgentOutputWriter) WriteString(s string) {
-	w.Write([]byte(s))
+func (w *AgentOutputWriter) WriteString(s string) error {
+	_, err := w.Write([]byte(s))
+	return err
 }
 
 // String returns the in-memory portion of the output.
@@ -173,8 +195,12 @@ func (w *AgentOutputWriter) String() string {
 	defer w.mu.Unlock()
 	s := string(w.buf)
 	if w.truncated {
-		s += fmt.Sprintf("\n\n[Output truncated: %d bytes total. Full output in: %s]",
-			w.totalBytes, w.filePath)
+		if w.filePath != "" && !w.fileFailed {
+			s += fmt.Sprintf("\n\n[Output truncated: %d bytes total. Full output in: %s]",
+				w.totalBytes, w.filePath)
+		} else {
+			s += fmt.Sprintf("\n\n[Output truncated: %d bytes total. Full file output is unavailable.]", w.totalBytes)
+		}
 	}
 	return s
 }
@@ -196,6 +222,9 @@ func (w *AgentOutputWriter) TotalBytes() int64 {
 // ReadFrom reads output from the file starting at the given offset.
 // Returns the content and the new offset.
 func (w *AgentOutputWriter) ReadFrom(offset int64) (string, int64, error) {
+	if offset < 0 {
+		return "", offset, fmt.Errorf("invalid negative output offset")
+	}
 	w.mu.Lock()
 	path := w.filePath
 	w.mu.Unlock()
@@ -206,45 +235,77 @@ func (w *AgentOutputWriter) ReadFrom(offset int64) (string, int64, error) {
 		if offset >= int64(len(s)) {
 			return "", int64(len(s)), nil
 		}
-		return s[offset:], int64(len(s)), nil
-	}
-
-	f, err := os.Open(path)
-	if err != nil {
-		return "", offset, err
-	}
-	defer f.Close()
-
-	// Use actual file size for accurate reads (total may be stale snapshot)
-	fi, err := f.Stat()
-	if err != nil {
-		return "", offset, err
-	}
-	fileSize := fi.Size()
-
-	if offset >= fileSize {
-		return "", offset, nil // No new data
-	}
-
-	if offset > 0 {
-		if _, err := f.Seek(offset, 0); err != nil {
-			return "", offset, err
+		end := offset + maxAgentOutputReadBytes
+		if end > int64(len(s)) {
+			end = int64(len(s))
 		}
+		return s[offset:end], end, nil
 	}
 
-	buf := make([]byte, fileSize-offset)
-	n, _ := f.Read(buf)
-	return string(buf[:n]), offset + int64(n), nil
+	data, nextOffset, _, err := fileutil.ReadRegularFileRange(path, offset, maxAgentOutputReadBytes)
+	return string(data), nextOffset, err
 }
 
 // Close closes the output file.
-func (w *AgentOutputWriter) Close() {
+func (w *AgentOutputWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.file != nil {
-		w.file.Close()
+		err := errors.Join(w.file.Sync(), w.file.Close())
+		if err != nil {
+			w.fileFailed = true
+		}
 		w.file = nil
+		return err
 	}
+	return nil
+}
+
+// agentOutputBuffer is the execution loop's bounded output accumulator. The
+// previous strings.Builder mirror retained the entire response in memory and
+// only copied it to AgentOutputWriter after completion, defeating both the
+// memory cap and incremental file reads.
+type agentOutputBuffer struct {
+	writer *AgentOutputWriter
+	err    error
+}
+
+func newAgentOutputBuffer(writer *AgentOutputWriter) *agentOutputBuffer {
+	return &agentOutputBuffer{writer: writer}
+}
+
+func (b *agentOutputBuffer) WriteString(value string) {
+	if b == nil || b.writer == nil {
+		return
+	}
+	if err := b.writer.WriteString(value); err != nil && b.err == nil {
+		b.err = err
+	}
+}
+
+func (b *agentOutputBuffer) String() string {
+	if b == nil || b.writer == nil {
+		return ""
+	}
+	return b.writer.String()
+}
+
+func (b *agentOutputBuffer) Len() int {
+	if b == nil || b.writer == nil {
+		return 0
+	}
+	total := b.writer.TotalBytes()
+	if total > int64(^uint(0)>>1) {
+		return int(^uint(0) >> 1)
+	}
+	return int(total)
+}
+
+func (b *agentOutputBuffer) Err() error {
+	if b == nil {
+		return nil
+	}
+	return b.err
 }
 
 // AgentTask represents a task to be executed by an agent.

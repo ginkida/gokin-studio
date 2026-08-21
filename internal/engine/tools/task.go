@@ -3,10 +3,20 @@ package tools
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
 	"google.golang.org/genai"
+)
+
+const (
+	defaultTaskMaxTurns = 30
+
+	// MaxTaskTurns is the public task-tool ceiling and the agent loop's absolute
+	// safety limit. Keeping one value prevents the tool from accepting a budget
+	// that the runner will silently truncate later.
+	MaxTaskTurns = 100
 )
 
 // AgentProgress represents progress information from an agent.
@@ -99,7 +109,7 @@ func (t *TaskTool) Declaration() *genai.FunctionDeclaration {
 				},
 				"max_turns": {
 					Type:        genai.TypeInteger,
-					Description: "Maximum number of agentic turns (API round-trips) before stopping. Default: 30.",
+					Description: "Maximum number of agentic turns (API round-trips) before stopping. Range: 1-100. Default: 30.",
 				},
 				"model": {
 					Type:        genai.TypeString,
@@ -128,45 +138,124 @@ func (t *TaskTool) Declaration() *genai.FunctionDeclaration {
 
 func (t *TaskTool) Validate(args map[string]any) error {
 	prompt, ok := GetString(args, "prompt")
-	if !ok || prompt == "" {
+	if !ok || strings.TrimSpace(prompt) == "" {
 		return NewValidationError("prompt", "is required")
 	}
 
-	// If resuming, we don't need subagent_type
+	for _, key := range []string{"description", "resume"} {
+		if _, exists := args[key]; exists {
+			if _, ok := GetString(args, key); !ok {
+				return NewValidationError(key, "must be a string")
+			}
+		}
+	}
+	if _, exists := args["run_in_background"]; exists {
+		if _, ok := GetBool(args, "run_in_background"); !ok {
+			return NewValidationError("run_in_background", "must be a boolean")
+		}
+	}
+	if _, err := taskMaxTurns(args); err != nil {
+		return err
+	}
+	if err := validateTaskEnum(args, "model", "flash", "pro"); err != nil {
+		return err
+	}
+	if err := validateTaskEnum(args, "thoroughness", "quick", "normal", "thorough"); err != nil {
+		return err
+	}
+	if err := validateTaskEnum(args, "output_style", "concise", "normal", "detailed"); err != nil {
+		return err
+	}
+
+	agentType, hasAgentType := GetString(args, "subagent_type")
+	if _, exists := args["subagent_type"]; exists && !hasAgentType {
+		return NewValidationError("subagent_type", "must be a string")
+	}
+	if hasAgentType && strings.TrimSpace(agentType) != "" {
+		switch strings.ToLower(strings.TrimSpace(agentType)) {
+		case "explore", "bash", "general", "plan", "claude-code-guide":
+			// Valid type.
+		default:
+			return NewValidationError("subagent_type", "must be 'explore', 'bash', 'general', 'plan', or 'claude-code-guide'")
+		}
+	}
+
+	// If resuming, subagent_type may be omitted.
 	resume, _ := GetString(args, "resume")
-	if resume != "" {
+	if strings.TrimSpace(resume) != "" {
 		return nil
 	}
-
-	agentType, ok := GetString(args, "subagent_type")
-	if !ok || agentType == "" {
+	if !hasAgentType || strings.TrimSpace(agentType) == "" {
 		return NewValidationError("subagent_type", "is required when not resuming")
 	}
-
-	switch agentType {
-	case "explore", "bash", "general", "plan", "claude-code-guide":
-		// Valid types
-	default:
-		return NewValidationError("subagent_type", "must be 'explore', 'bash', 'general', 'plan', or 'claude-code-guide'")
-	}
-
 	return nil
 }
 
+func validateTaskEnum(args map[string]any, key string, allowed ...string) error {
+	raw, exists := args[key]
+	if !exists {
+		return nil
+	}
+	value, ok := raw.(string)
+	if !ok {
+		return NewValidationError(key, "must be a string")
+	}
+	value = strings.ToLower(strings.TrimSpace(value))
+	for _, candidate := range allowed {
+		if value == candidate {
+			return nil
+		}
+	}
+	return NewValidationError(key, "must be one of: "+strings.Join(allowed, ", "))
+}
+
+func taskMaxTurns(args map[string]any) (int, error) {
+	raw, exists := args["max_turns"]
+	if !exists {
+		return defaultTaskMaxTurns, nil
+	}
+
+	var value int64
+	switch number := raw.(type) {
+	case int:
+		value = int64(number)
+	case int64:
+		value = number
+	case float64:
+		if math.IsNaN(number) || math.IsInf(number, 0) || math.Trunc(number) != number ||
+			number < 1 || number > MaxTaskTurns {
+			return 0, NewValidationError("max_turns", fmt.Sprintf("must be an integer between 1 and %d", MaxTaskTurns))
+		}
+		value = int64(number)
+	default:
+		return 0, NewValidationError("max_turns", fmt.Sprintf("must be an integer between 1 and %d", MaxTaskTurns))
+	}
+	if value < 1 || value > MaxTaskTurns {
+		return 0, NewValidationError("max_turns", fmt.Sprintf("must be an integer between 1 and %d", MaxTaskTurns))
+	}
+	return int(value), nil
+}
+
 func (t *TaskTool) Execute(ctx context.Context, args map[string]any) (ToolResult, error) {
+	if err := t.Validate(args); err != nil {
+		return NewErrorResult("validation error: " + err.Error()), nil
+	}
 	if t.runner == nil {
 		return NewErrorResult("task runner not initialized"), nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	prompt, _ := GetString(args, "prompt")
-	agentType, _ := GetString(args, "subagent_type")
+	agentType := strings.ToLower(strings.TrimSpace(GetStringDefault(args, "subagent_type", "")))
 	description := GetStringDefault(args, "description", "")
 	runInBackground := GetBoolDefault(args, "run_in_background", false)
-	maxTurns := GetIntDefault(args, "max_turns", 30)
-	model := GetStringDefault(args, "model", "")
-	resume := GetStringDefault(args, "resume", "")
-	thoroughnessStr := GetStringDefault(args, "thoroughness", "")
-	outputStyleStr := GetStringDefault(args, "output_style", "")
+	maxTurns, _ := taskMaxTurns(args)
+	model := strings.ToLower(strings.TrimSpace(GetStringDefault(args, "model", "")))
+	resume := strings.TrimSpace(GetStringDefault(args, "resume", ""))
+	thoroughnessStr := strings.ToLower(strings.TrimSpace(GetStringDefault(args, "thoroughness", "")))
+	outputStyleStr := strings.ToLower(strings.TrimSpace(GetStringDefault(args, "output_style", "")))
 
 	// Inject thoroughness into context
 	if thoroughnessStr != "" {
@@ -197,6 +286,9 @@ func (t *TaskTool) executeForeground(ctx context.Context, agentType, prompt, des
 	agentID, err := t.runner.Spawn(ctx, agentType, prompt, maxTurns, model)
 	if err != nil {
 		return NewErrorResult(fmt.Sprintf("Agent failed: %s", err)), nil
+	}
+	if strings.TrimSpace(agentID) == "" {
+		return NewErrorResult("Agent failed: runner returned an empty agent ID"), nil
 	}
 
 	result, ok := t.runner.GetResult(agentID)
@@ -255,6 +347,9 @@ func (t *TaskTool) executeBackground(ctx context.Context, agentType, prompt, des
 		// Use standard async spawn
 		agentID = t.runner.SpawnAsync(ctx, agentType, prompt, maxTurns, model)
 	}
+	if strings.TrimSpace(agentID) == "" {
+		return NewErrorResult("Agent failed: runner returned an empty agent ID"), nil
+	}
 
 	var output strings.Builder
 	output.WriteString("Agent spawned in background.\n\n")
@@ -280,6 +375,9 @@ func (t *TaskTool) executeResumeForeground(ctx context.Context, agentID, prompt,
 	resumedID, err := t.runner.Resume(ctx, agentID, prompt)
 	if err != nil {
 		return NewErrorResult(fmt.Sprintf("Failed to resume agent: %s", err)), nil
+	}
+	if strings.TrimSpace(resumedID) == "" {
+		return NewErrorResult("Failed to resume agent: runner returned an empty agent ID"), nil
 	}
 
 	result, ok := t.runner.GetResult(resumedID)
@@ -322,6 +420,9 @@ func (t *TaskTool) executeResumeBackground(ctx context.Context, agentID, prompt,
 	resumedID, err := t.runner.ResumeAsync(ctx, agentID, prompt)
 	if err != nil {
 		return NewErrorResult(fmt.Sprintf("Failed to resume agent: %s", err)), nil
+	}
+	if strings.TrimSpace(resumedID) == "" {
+		return NewErrorResult("Failed to resume agent: runner returned an empty agent ID"), nil
 	}
 
 	var output strings.Builder

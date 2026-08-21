@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
 import { EventsOn } from '../../wailsjs/runtime/runtime'
-import { useChatStore } from '../stores/chatStore'
+import { useDelegationStore, type DelegationEvent } from '../stores/delegationStore'
+import { latestTurnHasMarkedError, useChatStore } from '../stores/chatStore'
 import { useProjectStore } from '../stores/projectStore'
 import { isProjectMuted } from '../lib/mutedProjects'
 
@@ -75,10 +76,6 @@ export function useWailsEvents() {
         // (which doesn't flow through appendStreamText).
         store.setRetrying(key, null)
         store.setStreamStatus(key, null)
-        // Clear any stale ask_user card. If the agent goroutine's ctx was
-        // cancelled while the user was deliberating, the handler returned
-        // without resolving the question — the card would otherwise linger.
-        store.setAskUser(key, null)
         // Flush any thinking buffer that never got a final chat:thinking
         // close signal (e.g. provider returned text but no trailing thinking
         // close event) so it doesn't leak into the next turn's live chip.
@@ -128,6 +125,9 @@ export function useWailsEvents() {
             }
           }
         }
+        const completedTurnFailed = latestTurnHasMarkedError(
+          useChatStore.getState().messages[key] || [],
+        )
 
         store.setSessionActive(key, false)
         // Per-project active flag is derived from sessionActive in Sidebar
@@ -142,7 +142,7 @@ export function useWailsEvents() {
         const activeProj = useProjectStore.getState().activeProjectId
         const activeSid = store.activeSession[data.projectID || '']
         const sessionMatches = activeProj === data.projectID && activeSid === (data.sessionID || 'default')
-        if ((!sessionMatches || !document.hasFocus()) && !isProjectMuted(data.projectID)) {
+        if (!completedTurnFailed && (!sessionMatches || !document.hasFocus()) && !isProjectMuted(data.projectID)) {
           store.bumpUnread(key)
         }
 
@@ -161,7 +161,7 @@ export function useWailsEvents() {
         // project means silencing OS notifications too, not just toasts +
         // unread badges + chime. The OS notification fires from a different
         // gate (window-blurred), but the same mute should apply.
-        if (!isProjectMuted(data.projectID)) {
+        if (!completedTurnFailed && !isProjectMuted(data.projectID)) {
           notifyIfBlurred(`${name} -- done`, preview || 'Agent finished.')
         }
       }),
@@ -189,9 +189,6 @@ export function useWailsEvents() {
         const store = useChatStore.getState()
         store.setRetrying(key, null)
         store.setStreamStatus(key, null)
-        // Same stale-card protection as chat:complete — a fatal error aborts
-        // the agent before it can resolve a pending ask_user question.
-        store.setAskUser(key, null)
         // Flush the reasoning buffer into a thinking message so the user
         // still sees what the model was thinking when it blew up. Without
         // this, a crash mid-reasoning left a ghost "Reasoning..." chip
@@ -211,7 +208,7 @@ export function useWailsEvents() {
         // re-adding our own, so we don't end up with doubled prefixes.
         let text = String(data.text || '')
         text = text.replace(/^Error:\s*/i, '')
-        store.finalizeAssistant(key, `Error: ${text}`)
+        store.finalizeAssistant(key, `Error: ${text}`, true)
         store.setSessionActive(key, false)
         // Don't touch project.active — it's derived from sessionActive elsewhere.
         // Bump unread for background sessions so the user sees that something
@@ -231,8 +228,10 @@ export function useWailsEvents() {
       EventsOn('chat:ask_user', (data: any) => {
         const key = chatKey(data); if (!key) return
         const store = useChatStore.getState()
+        const questionID = typeof data?.questionID === 'string' ? data.questionID : ''
+        if (!questionID || store.askUser[key]?.questionID === questionID) return
         store.setAskUser(key, {
-          questionID: data.questionID,
+          questionID,
           question: data.question,
           options: data.options || [],
           default: data.default || '',
@@ -261,6 +260,12 @@ export function useWailsEvents() {
             approval ? 'The agent is waiting for permission.' : 'The agent is waiting for your answer.',
           )
         }
+      }),
+      EventsOn('chat:ask_user_closed', (data: any) => {
+        const key = chatKey(data); if (!key) return
+        const questionID = typeof data?.questionID === 'string' ? data.questionID : ''
+        if (!questionID) return
+        useChatStore.getState().clearAskUser(key, questionID)
       }),
       EventsOn('chat:retry', (data: any) => {
         const key = chatKey(data); if (!key) return
@@ -334,6 +339,35 @@ export function useWailsEvents() {
         // changed if the agent ran git checkout / git switch).
         if (!active && data.gitBranch !== undefined) {
           useProjectStore.getState().updateProject(data.id, { gitBranch: data.gitBranch })
+        }
+      }),
+      // Cross-project delegation. The chat card and the delegations panel both
+      // read the store these events feed; the legacy dispatch:complete handler
+      // below still runs for runs started through the old Dispatch binding.
+      EventsOn('delegation:started', (data: any) => {
+        if (!data?.runID) return
+        useDelegationStore.getState().applyEvent(data as DelegationEvent)
+      }),
+      EventsOn('delegation:progress', (data: any) => {
+        if (!data?.runID) return
+        useDelegationStore.getState().applyEvent(data as DelegationEvent)
+      }),
+      EventsOn('delegation:complete', (data: any) => {
+        if (!data?.runID) return
+        useDelegationStore.getState().applyEvent(data as DelegationEvent)
+        // Notify on the SOURCE project, the one the user delegated FROM —
+        // that is the project whose mute setting expresses their intent.
+        const target = data.toProjectName || data.toProjectID || 'another project'
+        const ok = data.status === 'completed'
+        // A legacy dispatch also emits dispatch:complete below, and that
+        // handler notifies too — without this check one completion raised two
+        // desktop notifications.
+        if (data.legacyDispatch) return
+        if (data.fromProjectID && !isProjectMuted(data.fromProjectID)) {
+          notifyIfBlurred(
+            ok ? `Delegation to ${target} finished` : `Delegation to ${target} ${data.status}`,
+            String(data.summary || data.error || '').slice(0, 120),
+          )
         }
       }),
       EventsOn('dispatch:complete', (data: any) => {

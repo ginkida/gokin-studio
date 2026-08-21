@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle,
   Check,
@@ -37,6 +37,7 @@ import { ClipboardSetText } from '../../../wailsjs/runtime/runtime'
 import { composeInChat, formatFileMention } from '../../lib/composeInChat'
 import { useConfirmDialog } from '../common/AppDialog'
 import { requestFileContextMenu } from './FileContextMenu'
+import { downloadBlob } from '../../lib/download'
 
 export type ArtifactDocument = {
   path: string
@@ -156,33 +157,84 @@ export function ArtifactPreview({
   const latestRef = useRef<ArtifactDocument | null>(null)
   const viewingVersionRef = useRef<string | null>(null)
   const activeRef = useRef(active)
+  const loadRequestRef = useRef(0)
+  const loadInFlightRef = useRef(false)
+  const versionsRequestRef = useRef(0)
+  const snapshotRequestRef = useRef(0)
+  const versionActionRequestRef = useRef(0)
+  const restoreInFlightRef = useRef(false)
+  const copyRequestRef = useRef(0)
+  const copyTimerRef = useRef<number | null>(null)
+  const scopeKey = `${projectID.length}:${projectID}${(sessionID || '').length}:${sessionID || ''}${path}`
+  const scopeRef = useRef({ generation: 0, mounted: false })
 
-  const refreshVersions = async () => {
+  useEffect(() => {
+    scopeRef.current.generation += 1
+    scopeRef.current.mounted = true
+    const generation = scopeRef.current.generation
+    return () => {
+      if (scopeRef.current.generation === generation) {
+        scopeRef.current.mounted = false
+        scopeRef.current.generation += 1
+      }
+      loadRequestRef.current += 1
+      loadInFlightRef.current = false
+      versionsRequestRef.current += 1
+      snapshotRequestRef.current += 1
+      versionActionRequestRef.current += 1
+      restoreInFlightRef.current = false
+      copyRequestRef.current += 1
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current)
+        copyTimerRef.current = null
+      }
+    }
+  }, [scopeKey])
+
+  const ownsScope = useCallback((generation: number) => (
+    scopeRef.current.mounted && scopeRef.current.generation === generation
+  ), [])
+
+  const refreshVersions = useCallback(async (expectedScope = scopeRef.current.generation) => {
+    const request = ++versionsRequestRef.current
     const result: any = sessionID
       ? await ListSessionArtifactVersions(projectID, sessionID, path)
       : await ListArtifactVersions(projectID, path)
+    if (!ownsScope(expectedScope) || versionsRequestRef.current !== request) return false
     setVersions((result || []) as ArtifactVersion[])
-  }
+    return true
+  }, [ownsScope, path, projectID, sessionID])
 
-  const snapshotVersion = async () => {
+  const snapshotVersion = useCallback(async (expectedScope: number) => {
+    const request = ++snapshotRequestRef.current
+    versionsRequestRef.current += 1
     try {
       if (sessionID) await SaveSessionArtifactVersion(projectID, sessionID, path)
       else await SaveArtifactVersion(projectID, path)
-      await refreshVersions()
-      setHistoryError(null)
+      if (!ownsScope(expectedScope) || snapshotRequestRef.current !== request) return
+      await refreshVersions(expectedScope)
+      if (ownsScope(expectedScope) && snapshotRequestRef.current === request) setHistoryError(null)
     } catch (e: any) {
+      if (!ownsScope(expectedScope) || snapshotRequestRef.current !== request) return
       // Version history is additive: a storage failure must not blank or stop
       // the otherwise safe live preview.
       setHistoryError(String(e?.message || e || 'Failed to save artifact version'))
     }
-  }
+  }, [ownsScope, path, projectID, refreshVersions, sessionID])
 
-  const load = async (quiet = false) => {
+  const load = useCallback(async (quiet = false, expectedScope = scopeRef.current.generation) => {
+    if (restoreInFlightRef.current) return false
+    // A live poll must not supersede an explicit initial/retry/reload request;
+    // the next sequential poll will observe its result instead.
+    if (quiet && loadInFlightRef.current) return false
+    const request = ++loadRequestRef.current
+    loadInFlightRef.current = true
     if (!quiet) setLoading(true)
     try {
       const result: any = sessionID
         ? await ReadSessionArtifactContent(projectID, sessionID, path)
         : await ReadArtifactContent(projectID, path)
+      if (!ownsScope(expectedScope) || loadRequestRef.current !== request) return false
       const next = result as ArtifactDocument
       const previous = latestRef.current
       latestRef.current = next
@@ -192,24 +244,33 @@ export function ArtifactPreview({
       if (previous && changed) {
         setRevision((value) => value + 1)
       }
-      if (changed && next.previewKind === 'web') await snapshotVersion()
+      if (changed && next.previewKind === 'web') await snapshotVersion(expectedScope)
+      return true
     } catch (e: any) {
+      if (!ownsScope(expectedScope) || loadRequestRef.current !== request) return false
       // A transient polling failure should not blank a working preview. Only
       // an explicit/initial load replaces the document with an error state.
       if (!quiet) {
         setError(String(e?.message || e || 'Failed to load artifact'))
         setArtifact(null)
       }
+      return false
     } finally {
-      if (!quiet) setLoading(false)
+      if (ownsScope(expectedScope) && loadRequestRef.current === request) {
+        loadInFlightRef.current = false
+        if (!quiet) setLoading(false)
+      }
     }
-  }
+  }, [ownsScope, path, projectID, sessionID, snapshotVersion])
 
   useEffect(() => {
     latestRef.current = null
     viewingVersionRef.current = null
     setArtifact(null)
+    setError(null)
+    setLoading(true)
     setViewingVersion(null)
+    setVersionBusy(null)
     setVersions([])
     setHistoryError(null)
     setHistoryOpen(false)
@@ -218,9 +279,8 @@ export function ArtifactPreview({
     setRevision(0)
     setCopyStatus('idle')
     void load()
-    // load intentionally closes over the current project/path only.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectID, sessionID, path])
+    return () => { loadRequestRef.current += 1 }
+  }, [load])
 
   // Live refresh while GLM/Kimi edits the artifact. Polling the bounded,
   // worktree-rooted RPC avoids granting the iframe filesystem access.
@@ -228,24 +288,22 @@ export function ArtifactPreview({
     const becameActive = !activeRef.current && active
     activeRef.current = active
     if (!active || isNativeArtifactPath(path)) return
-    if (becameActive) void load(true)
+    const scope = scopeRef.current.generation
     let stopped = false
-    let inFlight = false
-    const timer = window.setInterval(async () => {
-      if (stopped || inFlight || window.document.visibilityState === 'hidden') return
-      inFlight = true
-      try {
-        await load(true)
-      } finally {
-        inFlight = false
-      }
-    }, 1500)
+    let timer: number | undefined
+    const poll = async () => {
+      if (stopped || !ownsScope(scope)) return
+      if (window.document.visibilityState !== 'hidden') await load(true, scope)
+      if (stopped || !ownsScope(scope)) return
+      timer = window.setTimeout(() => { void poll() }, 1500)
+    }
+    if (becameActive) void poll()
+    else timer = window.setTimeout(() => { void poll() }, 1500)
     return () => {
       stopped = true
-      window.clearInterval(timer)
+      if (timer !== undefined) window.clearTimeout(timer)
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectID, sessionID, path, active])
+  }, [active, load, ownsScope, path])
 
   const srcDoc = useMemo(
     () => buildSandboxedArtifactDocument(
@@ -268,40 +326,49 @@ export function ArtifactPreview({
     const blob = new Blob([content], {
       type: artifact.dataBase64 ? artifact.mimeType : `${artifact.mimeType};charset=utf-8`,
     })
-    const url = URL.createObjectURL(blob)
-    const anchor = window.document.createElement('a')
-    anchor.href = url
-    anchor.download = artifact.name
-    anchor.click()
-    URL.revokeObjectURL(url)
+    downloadBlob(blob, artifact.name)
   }
 
   const copy = async () => {
     if (!artifact) return
+    const scope = scopeRef.current.generation
+    const request = ++copyRequestRef.current
+    const content = artifact.content
     try {
-      await ClipboardSetText(artifact.content)
+      await ClipboardSetText(content)
+      if (!ownsScope(scope) || copyRequestRef.current !== request) return
       setCopyStatus('copied')
     } catch {
+      if (!ownsScope(scope) || copyRequestRef.current !== request) return
       setCopyStatus('error')
     }
-    window.setTimeout(() => setCopyStatus('idle'), 1800)
+    if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current)
+    copyTimerRef.current = window.setTimeout(() => {
+      if (ownsScope(scope) && copyRequestRef.current === request) setCopyStatus('idle')
+      copyTimerRef.current = null
+    }, 1800)
   }
 
   const viewVersion = async (version: ArtifactVersion) => {
+    const scope = scopeRef.current.generation
+    const request = ++versionActionRequestRef.current
     setVersionBusy(`view:${version.id}`)
     setHistoryError(null)
     try {
       const result: any = sessionID
         ? await ReadSessionArtifactVersion(projectID, sessionID, path, version.id)
         : await ReadArtifactVersion(projectID, path, version.id)
+      if (!ownsScope(scope) || versionActionRequestRef.current !== request) return
       viewingVersionRef.current = version.id
       setViewingVersion(version)
       setArtifact(result as ArtifactDocument)
       setRevision((value) => value + 1)
     } catch (e: any) {
-      setHistoryError(String(e?.message || e || 'Failed to load artifact version'))
+      if (ownsScope(scope) && versionActionRequestRef.current === request) {
+        setHistoryError(String(e?.message || e || 'Failed to load artifact version'))
+      }
     } finally {
-      setVersionBusy(null)
+      if (ownsScope(scope) && versionActionRequestRef.current === request) setVersionBusy(null)
     }
   }
 
@@ -313,29 +380,42 @@ export function ArtifactPreview({
   }
 
   const restoreVersion = async (version: ArtifactVersion) => {
-    if (!await requestConfirmation({
+    const scope = scopeRef.current.generation
+    const accepted = await requestConfirmation({
       title: 'Restore this version?',
       message: `Restore the version from ${formatVersionTime(version.createdAt)}. The current file is saved to history first, then the ${sessionID ? 'active chat worktree file' : 'project file'} is replaced.`,
       confirmLabel: 'Restore version',
       danger: true,
-    })) return
+    })
+    if (!accepted || !ownsScope(scope)) return
+    const request = ++versionActionRequestRef.current
+    restoreInFlightRef.current = true
+    loadRequestRef.current += 1
+    loadInFlightRef.current = false
+    versionsRequestRef.current += 1
     setVersionBusy(`restore:${version.id}`)
     setHistoryError(null)
     try {
       const result: any = sessionID
         ? await RestoreSessionArtifactVersion(projectID, sessionID, path, version.id)
         : await RestoreArtifactVersion(projectID, path, version.id)
+      if (!ownsScope(scope) || versionActionRequestRef.current !== request) return
       const next = result as ArtifactDocument
       latestRef.current = next
       viewingVersionRef.current = null
       setViewingVersion(null)
       setArtifact(next)
       setRevision((value) => value + 1)
-      await refreshVersions()
+      await refreshVersions(scope)
     } catch (e: any) {
-      setHistoryError(String(e?.message || e || 'Failed to restore artifact version'))
+      if (ownsScope(scope) && versionActionRequestRef.current === request) {
+        setHistoryError(String(e?.message || e || 'Failed to restore artifact version'))
+      }
     } finally {
-      setVersionBusy(null)
+      if (ownsScope(scope) && versionActionRequestRef.current === request) {
+        restoreInFlightRef.current = false
+        setVersionBusy(null)
+      }
     }
   }
 
@@ -372,7 +452,7 @@ export function ArtifactPreview({
               {allowNetwork ? 'Network on' : 'Isolated'}
             </button>
           )}
-          <button onClick={() => { setRevision((value) => value + 1); void load() }} title="Reload preview"><RefreshCw size={12} /></button>
+          <button onClick={() => { setRevision((value) => value + 1); void load() }} disabled={loading || versionBusy !== null} title="Reload preview"><RefreshCw size={12} /></button>
           {isWebPreview && (
             <>
               <button
@@ -482,7 +562,7 @@ export function ArtifactPreview({
               )}
             </div>
             {historyError && (
-              <div className="artifact-history-error">
+              <div className="artifact-history-error" role="alert">
                 <AlertTriangle size={11} />
                 <span>{historyError}</span>
               </div>

@@ -1,6 +1,7 @@
 package studio
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -115,6 +116,71 @@ func TestCleanupOldData_DryRunCountsAutoBackupsButPreserves(t *testing.T) {
 		if _, err := os.Stat(p); err != nil {
 			t.Errorf("dry-run should not delete; got err=%v", err)
 		}
+	}
+}
+
+func TestCleanupOldData_AutoBackupDeleteFailureIsReportedAndNotCounted(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	paths := seedAutoBackupBatch(t, AutoBackupRetention+1)
+	oldest := paths[0]
+	previousRemove := autoBackupRemoveFile
+	autoBackupRemoveFile = func(path string) error {
+		if path == oldest {
+			return errors.New("injected auto-backup removal failure")
+		}
+		return previousRemove(path)
+	}
+	t.Cleanup(func() { autoBackupRemoveFile = previousRemove })
+
+	result, err := NewStudio().CleanupOldData(CleanupParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.AutoBackupsRemoved != 0 || result.BytesFreed != 0 {
+		t.Fatalf("failed auto-backup delete was counted as successful: %+v", result)
+	}
+	if len(result.Errors) != 1 || !strings.Contains(result.Errors[0], "injected auto-backup") {
+		t.Fatalf("auto-backup failure was not surfaced: %v", result.Errors)
+	}
+	if _, err := os.Stat(oldest); err != nil {
+		t.Fatalf("failed auto-backup delete did not preserve its file: %v", err)
+	}
+}
+
+func TestCleanupOldData_RemovesOnlyAbandonedAutoBackupTemps(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	dir := autoBackupDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	oldTemp := filepath.Join(dir, autoBackupTempPrefix+"old"+autoBackupTempSuffix)
+	freshTemp := filepath.Join(dir, autoBackupTempPrefix+"fresh"+autoBackupTempSuffix)
+	for _, path := range []string{oldTemp, freshTemp} {
+		if err := os.WriteFile(path, []byte("partial"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-autoBackupTempGrace - time.Minute)
+	if err := os.Chtimes(oldTemp, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := NewStudio().CleanupOldData(CleanupParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.AutoBackupsRemoved != 1 || result.BytesFreed != int64(len("partial")) {
+		t.Fatalf("abandoned temp cleanup result: %+v", result)
+	}
+	if _, err := os.Stat(oldTemp); !os.IsNotExist(err) {
+		t.Fatalf("abandoned temp survived cleanup: %v", err)
+	}
+	if _, err := os.Stat(freshTemp); err != nil {
+		t.Fatalf("fresh temp may belong to another writer and must survive: %v", err)
+	}
+	listed, err := NewStudio().ListAutoBackups()
+	if err != nil || len(listed) != 0 {
+		t.Fatalf("temporary files leaked into the user-visible backup list: %+v, %v", listed, err)
 	}
 }
 

@@ -361,6 +361,7 @@ export function ArtifactLibrary({
             onChange={setArtifactListWidth}
           />
           <ArtifactPreview
+            key={`${activeProjectId}:${sessionID}:${selectedArtifact}`}
             projectID={activeProjectId}
             sessionID={sessionID}
             path={selectedArtifact}

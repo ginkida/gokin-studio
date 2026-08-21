@@ -22,16 +22,19 @@ type QuitWorkSummary struct {
 	RunningSessions int
 	QueuedTurns     int
 	SideQuestions   int
+	Delegations     int
 }
 
 func (summary QuitWorkSummary) hasWork() bool {
-	return summary.RunningSessions > 0 || summary.QueuedTurns > 0 || summary.SideQuestions > 0
+	return summary.RunningSessions > 0 || summary.QueuedTurns > 0 ||
+		summary.SideQuestions > 0 || summary.Delegations > 0
 }
 
 func (s *Studio) quitWorkSummary() QuitWorkSummary {
 	summary := QuitWorkSummary{}
 	projectIDs := make(map[string]bool)
 
+	runningSessionKeys := make(map[string]bool)
 	s.mu.RLock()
 	for projectID, project := range s.projects {
 		project.mu.RLock()
@@ -43,6 +46,7 @@ func (s *Studio) quitWorkSummary() QuitWorkSummary {
 			if running {
 				summary.RunningSessions++
 				projectIDs[projectID] = true
+				runningSessionKeys[projectID+"_"+session.ID] = true
 			}
 			summary.QueuedTurns += queued
 		}
@@ -58,6 +62,20 @@ func (s *Studio) quitWorkSummary() QuitWorkSummary {
 		projectIDs[run.projectID] = true
 	}
 	s.sideChatMu.Unlock()
+
+	// A delegation whose child session is already counted above must not be
+	// counted twice. Only the genuine gap is added: the window between the run
+	// record existing and the child turn going active, plus the monitor.
+	s.delegationMu.Lock()
+	for _, handle := range s.delegations {
+		if runningSessionKeys[handle.toProjectID+"_"+handle.toSessionID] {
+			continue
+		}
+		summary.Delegations++
+		projectIDs[handle.toProjectID] = true
+	}
+	s.delegationMu.Unlock()
+
 	summary.Projects = len(projectIDs)
 	return summary
 }
@@ -70,7 +88,7 @@ func countPhrase(count int, singular, plural string) string {
 }
 
 func quitWarningMessage(summary QuitWorkSummary) string {
-	parts := make([]string, 0, 3)
+	parts := make([]string, 0, 4)
 	if summary.RunningSessions > 0 {
 		parts = append(parts, countPhrase(summary.RunningSessions, "chat is still running", "chats are still running"))
 	}
@@ -79,6 +97,9 @@ func quitWarningMessage(summary QuitWorkSummary) string {
 	}
 	if summary.SideQuestions > 0 {
 		parts = append(parts, countPhrase(summary.SideQuestions, "side question is still running", "side questions are still running"))
+	}
+	if summary.Delegations > 0 {
+		parts = append(parts, countPhrase(summary.Delegations, "delegation is still starting", "delegations are still starting"))
 	}
 	lead := strings.Join(parts, ", ") + "."
 	projectLine := ""

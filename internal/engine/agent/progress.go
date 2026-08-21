@@ -61,7 +61,7 @@ func (a *Agent) updateProgress() {
 	}
 	progress.EstimatedRemaining = progress.EstimateRemaining()
 
-	callback(progress)
+	callAgentObserver(a.ID, "progress", func() { callback(progress) })
 }
 
 // SetProgress sets the current progress state.

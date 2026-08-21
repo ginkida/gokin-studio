@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"github.com/ginkida/gokin-studio/internal/engine/wsl"
 	"io"
 	"math"
 	"net/http"
@@ -59,6 +60,9 @@ type Studio struct {
 	mu                     sync.RWMutex
 	configSaveMu           sync.Mutex // serializes config snapshots through durable commit
 	sessionFileSaveMu      sync.Mutex // makes each optimistic editor compare-and-replace indivisible from another editor save
+	nativeRestoreSelectMu  sync.Mutex // keeps native file dialogs/staging latest-selection-wins
+	nativeRestoreMu        sync.Mutex
+	nativeRestoreCandidate *nativeRestoreCandidate
 	lifecycleMu            sync.Mutex // makes background registration atomic with shutdown
 	shuttingDown           bool
 	shutdownOnce           sync.Once
@@ -80,6 +84,15 @@ type Studio struct {
 	nativeCommandReady     bool
 	sideChatMu             sync.Mutex
 	sideChatRuns           map[string]sideChatRun
+
+	// delegationMu normally nests no other application locks. Initial
+	// publication is the narrow exception: while both endpoint metadata locks
+	// are held it may acquire delegationRunsMu and synchronously claim the
+	// target session queue (metadata -> delegationMu -> delegationRunsMu ->
+	// Project/session). Deletion follows the same metadata -> delegation order;
+	// run-store code never acquires delegationMu, preserving the graph.
+	delegationMu           sync.Mutex
+	delegations            map[string]delegationHandle
 	updateMu               sync.Mutex
 	pullRequestMu          sync.Mutex
 	pullRequestArchiveOnce sync.Once
@@ -113,12 +126,15 @@ type Studio struct {
 	testDeepLinkEmitter        func(DeepLinkEvent)
 	testNativeCommandEmitter   func(string)
 	testSideChatEmitter        func(string, SideChatEvent)
+	testDelegationEmitter      func(string, DelegationEvent)
 	testWindowActivator        func()
 	testUpdateHTTPClient       *http.Client
 	testUpdateEndpoint         string
 	testUpdateEmitter          func(UpdateStatus)
 	testUpdateNow              func() time.Time
 	testGHCommand              func(context.Context, string, ...string) ([]byte, error)
+	testBackupSaveDialog       func(string) (string, error)
+	testRestoreOpenDialog      func() (string, error)
 	testSpeechStarter          func(string, string, func(nativeSpeechEvent)) (nativeSpeechController, error)
 	testSpeechStatus           func(string) nativeSpeechStatus
 	testSpeechPermissions      func(context.Context) (nativeSpeechStatus, error)
@@ -224,6 +240,11 @@ func (s *Studio) Startup(ctx context.Context) {
 		fmt.Fprintf(os.Stderr, "gokin-studio: event log replay failed: %v\n", err)
 	}
 	s.eventLog.SetPersistPath(eventLogPath)
+	if removed, cleanupErrors := cleanupStaleNativeRestoreCandidates(time.Now(), os.TempDir()); len(cleanupErrors) > 0 {
+		s.LogEvent("warn", "backup", fmt.Sprintf("native restore candidate cleanup had %d error(s): %v", len(cleanupErrors), cleanupErrors[0]))
+	} else if removed > 0 {
+		s.LogEvent("info", "backup", fmt.Sprintf("removed %d stale native restore candidate(s)", removed))
+	}
 	if err := s.loadLocalEnvironment(); err != nil {
 		fmt.Fprintf(os.Stderr, "gokin-studio: local environment unavailable: %v\n", err)
 		s.LogEvent("warn", "local-environment", fmt.Sprintf("secure local environment unavailable: %v", err))
@@ -274,6 +295,19 @@ func (s *Studio) Startup(ctx context.Context) {
 		_, _ = s.RunAutoBackupIfDue()
 	})
 
+	// A delegation left "running" by a previous process has no monitor any
+	// more. Flip it so the UI stops showing it as live and cleanup can collect
+	// it, mirroring what scheduled runs do.
+	if reconciled, evicted, err := reconcileInterruptedDelegationRuns(); err != nil {
+		s.LogEvent("warn", "delegation", "reconcile interrupted delegation runs: "+err.Error())
+	} else {
+		s.reapEvictedDelegationSessions(evicted)
+		if reconciled > 0 {
+			s.LogEvent("info", "delegation", fmt.Sprintf(
+				"marked %d interrupted delegation run(s) as stopped", reconciled))
+		}
+	}
+
 	// Local recurring prompts are intentionally tied to the desktop lifecycle.
 	// Every attempt gets a separate child session with its own selected
 	// GLM/Kimi model, approval mode, transcript, and retained run status.
@@ -306,33 +340,39 @@ func (s *Studio) shutdown() {
 	s.setWakeEnabled(false)
 	s.stopPreviewServers("", "", true)
 	s.stopExternalBrowserTabs("", "")
+	s.clearNativeRestoreCandidate()
 
-	// Cancel all in-progress agent runs and terminals.
+	// Snapshot owners under the global lock, then close them without it. Task
+	// completion callbacks and terminal read loops may re-enter Studio; waiting
+	// for them while holding s.mu would create a shutdown-only lock cycle.
 	s.mu.RLock()
+	projects := make([]*Project, 0, len(s.projects))
 	for _, p := range s.projects {
-		p.Stop()
+		projects = append(projects, p)
 	}
+	terminals := make([]*Terminal, 0, len(s.terminals))
 	for _, t := range s.terminals {
-		t.Close()
+		terminals = append(terminals, t)
 	}
 	s.mu.RUnlock()
+
+	// Cancel all in-progress agent runs and terminals.
+	for _, p := range projects {
+		p.Stop()
+	}
+	for _, t := range terminals {
+		t.Close()
+	}
 
 	// Wait for all background goroutines (SendMessage, Dispatch) to finish.
 	s.wg.Wait()
 
-	// Release per-project provider transports and any stdio MCP child
-	// processes. Stop() only cancels active turns; without this explicit reset,
-	// idle HTTP connections and MCP servers would survive until the OS tears
-	// down the desktop process (and make graceful/headless shutdown leak
-	// resources). All tracked turns are finished above, so no caller can still
-	// be using these clients.
-	s.mu.RLock()
-	for _, p := range s.projects {
-		p.mu.Lock()
-		p.resetClientLocked()
-		p.mu.Unlock()
+	// Permanently close background-task start gates and completion observers,
+	// then release provider/MCP transports. All tracked turns are finished, so
+	// no caller can still be using these clients.
+	for _, p := range projects {
+		p.Close()
 	}
-	s.mu.RUnlock()
 
 	// Prune abandoned empty "Chat N" tabs before saving so they don't come
 	// back on next boot. Rule: a session with zero history entries AND a
@@ -340,11 +380,9 @@ func (s *Studio) shutdown() {
 	// gets dropped — both the in-memory entry and its on-disk files.
 	// Sessions that are empty but renamed, or that have any history at all,
 	// are preserved. We always keep at least one session per project.
-	s.mu.RLock()
-	for _, p := range s.projects {
+	for _, p := range projects {
 		p.pruneAbandonedEmptySessions()
 	}
-	s.mu.RUnlock()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -404,9 +442,26 @@ func (s *Studio) AddProject(name, directory string) (*ProjectInfo, error) {
 	if err != nil || !info.IsDir() {
 		return nil, fmt.Errorf("directory does not exist: %s", abs)
 	}
+	// One repository must be one project however the user spells its path.
+	// \\wsl$\Ubuntu\x and \\wsl.localhost\Ubuntu\x name the same directory, and
+	// registering both would give one repo two projects with two histories.
+	remote := remoteProjectDirectory(abs)
+	if remote {
+		if canonicalUNC, ok := wsl.CanonicalWindowsPath(abs); ok {
+			abs = canonicalUNC
+		}
+	}
 	canonical, err := filepath.EvalSymlinks(abs)
 	if err != nil {
-		return nil, fmt.Errorf("resolve project directory: %w", err)
+		// Go maps only IO_REPARSE_TAG_SYMLINK to ModeSymlink; anything else the
+		// 9P redirector reports becomes ModeIrregular and EvalSymlinks fails
+		// with ENOTDIR. Refusing the project over that would make WSL
+		// directories unusable, so fall back to the canonical spelling. A
+		// non-WSL path still fails with the identical message.
+		if !remote {
+			return nil, fmt.Errorf("resolve project directory: %w", err)
+		}
+		canonical = abs
 	}
 	// Resolve for identity/validity checks, but preserve the user's absolute
 	// spelling for display (on macOS /var commonly resolves to /private/var).
@@ -420,14 +475,12 @@ func (s *Studio) AddProject(name, directory string) (*ProjectInfo, error) {
 
 	// Check for duplicate directory.
 	for _, existing := range s.projects {
-		existingInfo, statErr := os.Stat(existing.Directory)
-		if filepath.Clean(existing.Directory) == filepath.Clean(abs) || (statErr == nil && os.SameFile(existingInfo, info)) {
+		if sameProjectDirectory(existing.Directory, abs) {
 			return nil, fmt.Errorf("project already registered: %s", abs)
 		}
 	}
 	for _, archived := range s.archived {
-		archivedInfo, statErr := os.Stat(archived.Project.Directory)
-		if filepath.Clean(archived.Project.Directory) == filepath.Clean(abs) || (statErr == nil && os.SameFile(archivedInfo, info)) {
+		if sameProjectDirectory(archived.Project.Directory, abs) {
 			return nil, fmt.Errorf("project is archived: %s", abs)
 		}
 	}
@@ -471,7 +524,7 @@ func (s *Studio) AddProject(name, directory string) (*ProjectInfo, error) {
 		projects = append(projects, existing.ToConfig())
 	}
 	projects = append(projects, p.ToConfig())
-	candidate := &StudioConfig{Projects: projects, Settings: s.config.Settings}
+	candidate := &StudioConfig{Projects: projects, Groups: s.config.Groups, Settings: s.config.Settings}
 	// Publish only after the candidate config is durable. Otherwise the UI
 	// would show a project that disappears on restart after a disk failure.
 	s.configSaveMu.Lock()
@@ -494,9 +547,9 @@ func (s *Studio) AddProject(name, directory string) (*ProjectInfo, error) {
 // RemoveProject removes a project from the studio.
 func (s *Studio) RemoveProject(id string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	p, ok := s.projects[id]
 	if !ok {
+		s.mu.Unlock()
 		return fmt.Errorf("project not found: %s", id)
 	}
 	// Managed worktrees are app-owned directories but may contain valuable
@@ -510,10 +563,12 @@ func (s *Studio) RemoveProject(id string) error {
 		session.mu.RUnlock()
 		if status.Error != "" {
 			p.mu.RUnlock()
+			s.mu.Unlock()
 			return fmt.Errorf("cannot remove project while session %q has an unavailable worktree: %s", sessionName, status.Error)
 		}
 		if status.Dirty {
 			p.mu.RUnlock()
+			s.mu.Unlock()
 			return fmt.Errorf("cannot remove project while session %q has %d uncommitted worktree change(s)", sessionName, status.ChangedFiles)
 		}
 	}
@@ -529,15 +584,41 @@ func (s *Studio) RemoveProject(id string) error {
 			projects = append(projects, existing.ToConfig())
 		}
 	}
-	candidate := &StudioConfig{Projects: projects, Settings: s.config.Settings}
+	candidate := &StudioConfig{Projects: projects, Groups: s.config.Groups, Settings: s.config.Settings}
 	s.configSaveMu.Lock()
 	err := candidate.Save()
 	s.configSaveMu.Unlock()
 	if err != nil {
+		s.mu.Unlock()
 		return fmt.Errorf("persist project removal: %w", err)
 	}
 	s.config.Projects = projects
+	p.mu.RLock()
 	removedName := p.Name
+	// Snapshot cleanup identities before detaching the project. Cleanup below
+	// deliberately runs without s.mu so event hooks and process exit callbacks
+	// may safely re-enter Studio.
+	sessionIDs := make([]string, 0, len(p.sessions))
+	for sid := range p.sessions {
+		sessionIDs = append(sessionIDs, sid)
+	}
+	p.mu.RUnlock()
+	delete(s.projects, id)
+	terminals := make([]*Terminal, 0)
+	for terminalID, terminal := range s.terminals {
+		if terminal.ProjectID == id {
+			delete(s.terminals, terminalID)
+			terminals = append(terminals, terminal)
+		}
+	}
+	s.mu.Unlock()
+
+	// Mark every source/target delegation terminal before p.Close stops child
+	// sessions. Otherwise its monitor could observe an idle child first and
+	// commit a misleading completed result while the project is being removed.
+	// The project is already absent from s.projects, so no new owner can appear
+	// while this cancellation emits terminal events without a global lock.
+	s.CancelDelegationsForSession(id, "")
 	s.cancelSideQuestions(id, "")
 	s.stopPreviewServers(id, "", true)
 	s.stopExternalBrowserTabs(id, "")
@@ -553,22 +634,12 @@ func (s *Studio) RemoveProject(id string) error {
 	// process + read-loop goroutine don't outlive the project. Without this,
 	// backend cleanup depended entirely on the frontend firing CloseTerminal
 	// on unmount, which can be missed (split view, lost termID reference).
-	// Mirrors Shutdown's terminal loop; t.Close() is idempotent. Safe under
-	// the held s.mu write lock — the read loop releases t.mu before taking
-	// s.mu, so there's no lock-order cycle.
-	for tid, t := range s.terminals {
-		if t.ProjectID == id {
-			delete(s.terminals, tid)
-			t.Close()
-		}
+	// Mirrors Shutdown's terminal loop; t.Close() is idempotent. Entries were
+	// detached atomically with the project above, and processes are closed now
+	// without s.mu so their exit callbacks may re-enter safely.
+	for _, terminal := range terminals {
+		terminal.Close()
 	}
-	// Collect every session ID before we drop the project so we can clean up
-	// both the persisted history and any replay buffers on disk.
-	sessionIDs := make([]string, 0, len(p.sessions))
-	for sid := range p.sessions {
-		sessionIDs = append(sessionIDs, sid)
-	}
-	delete(s.projects, id)
 	// Legacy single-file history (pre-sessions).
 	DeleteHistory(id)
 	// Per-session history + replay. Explicitly include "default" in case the
@@ -602,7 +673,9 @@ func (s *Studio) RemoveProject(id string) error {
 	removeProjectSessionSuggestions(id)
 	// Recurring prompts belong to the removed local project and must not keep
 	// waking up as orphaned scheduler errors.
-	_ = removeScheduledTasksFor(id, "")
+	if _, err := removeScheduledTasksFor(id, ""); err != nil {
+		s.logf("warn", "scheduler", "cleanup while removing project %q: %v", id, err)
+	}
 	_ = s.refreshScheduledWakeNeed()
 	// Versioned live artifacts can contain complete copies of project HTML/SVG.
 	// Remove those private app-owned snapshots with the project.
@@ -718,6 +791,7 @@ func (s *Studio) RelinkProjectDirectory(id, directory string) (*ProjectInfo, err
 	oldDirectory := p.Directory
 	projectName := p.Name
 	memStore := p.memoryStore
+	taskManager := p.taskManager
 	p.mu.RUnlock()
 	if filepath.Clean(oldDirectory) == filepath.Clean(abs) {
 		return p.Info(), nil
@@ -739,7 +813,7 @@ func (s *Studio) RelinkProjectDirectory(id, directory string) (*ProjectInfo, err
 		}
 		projects = append(projects, pc)
 	}
-	candidate := &StudioConfig{Projects: projects, Settings: s.config.Settings}
+	candidate := &StudioConfig{Projects: projects, Groups: s.config.Groups, Settings: s.config.Settings}
 	s.configSaveMu.Lock()
 	err = candidate.Save()
 	s.configSaveMu.Unlock()
@@ -751,6 +825,9 @@ func (s *Studio) RelinkProjectDirectory(id, directory string) (*ProjectInfo, err
 	// object so the next GLM/Kimi turn rebuilds tools, sandbox, MCP, learning,
 	// and background-task managers against the selected directory.
 	p.Stop()
+	if err := closeBackgroundTaskManager(taskManager); err != nil {
+		s.logf("warn", "tasks", "timed out settling background tasks while reconnecting project %q: %v", id, err)
+	}
 	for terminalID, terminal := range s.terminals {
 		if terminal.ProjectID == id {
 			delete(s.terminals, terminalID)
@@ -1031,15 +1108,7 @@ func (s *Studio) SetProjectPermissionMode(id, mode string) error {
 // Kimi-vs-GLM screenshot behavior cannot remain stale.
 func (s *Studio) SetProjectComputerUse(id string, enabled bool) error {
 	if !enabled {
-		s.mu.RLock()
-		p, ok := s.projects[id]
-		s.mu.RUnlock()
-		if !ok {
-			return fmt.Errorf("project not found: %s", id)
-		}
-		// Cancellation is synchronous: in-flight OS commands receive a
-		// cancelled context before the computer tools are removed.
-		p.Stop()
+		return s.disableProjectComputerUse(id)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1051,6 +1120,44 @@ func (s *Studio) SetProjectComputerUse(id string, enabled bool) error {
 		p.resetClientLocked()
 		p.mu.Unlock()
 	})
+}
+
+// disableProjectComputerUse keeps the stop and durable policy commit in one
+// lifecycle transaction. Without this, a new turn could claim queueWorker
+// after StopGeneration returned but before the setting/client changed, and
+// continue executing the computer tools the user had just disabled.
+func (s *Studio) disableProjectComputerUse(id string) error {
+	s.mu.Lock()
+	p, ok := s.projects[id]
+	if !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("project not found: %s", id)
+	}
+	p.metadataMu.Lock()
+	delegationNotices := s.cancelDelegationsForSessionQuiet(id, "")
+	removed := p.Stop()
+	err := s.persistProjectMutationLocked(id, func(pc *ProjectConfig) {
+		pc.ComputerUseEnabled = false
+	}, func(p *Project) {
+		p.mu.Lock()
+		p.ComputerUseEnabled = false
+		p.resetClientLocked()
+		p.mu.Unlock()
+	})
+	p.metadataMu.Unlock()
+	s.mu.Unlock()
+
+	for _, notice := range delegationNotices {
+		s.emitDelegationStopNotice(notice, " while disabling computer use")
+	}
+	for sid, ids := range removed {
+		if len(ids) > 0 {
+			p.emitEvent(s.ctx, EventChatQueueCleared, ChatQueueEvent{
+				ProjectID: id, SessionID: sid, IDs: ids,
+			})
+		}
+	}
+	return err
 }
 
 // SetProjectBudget sets the per-project monthly USD spend cap. The frontend
@@ -1798,14 +1905,42 @@ func (s *Studio) GetClipboardText() (string, error) {
 // with zero chats. Any session (including "default") can be deleted as long
 // as at least one other session remains.
 func (s *Studio) DeleteChatSession(projectID, sessionID string) error {
+	return s.deleteChatSession(projectID, sessionID, nil)
+}
+
+// deleteChatSession is the guarded internal form used by background retention.
+// The guard runs while p.mu is held for writing, immediately before any
+// cancellation or disk mutation, so an idle/clean preflight cannot race a new
+// turn that starts in the same chat. Interactive deletion passes no guard and
+// retains the public method's existing behaviour.
+func (s *Studio) deleteChatSession(projectID, sessionID string, guard func(*Project, *ChatSession) error) error {
 	s.mu.RLock()
 	p, ok := s.projects[projectID]
-	s.mu.RUnlock()
 	if !ok {
+		s.mu.RUnlock()
 		return fmt.Errorf("project not found: %s", projectID)
 	}
+	studioLocked := true
 	p.metadataMu.Lock()
-	defer p.metadataMu.Unlock()
+	metadataLocked := true
+	var delegationNotices []delegationStopNotice
+	var removedQueueIDs []string
+	defer func() {
+		if metadataLocked {
+			p.metadataMu.Unlock()
+		}
+		if studioLocked {
+			s.mu.RUnlock()
+		}
+		for _, notice := range delegationNotices {
+			s.emitDelegationStopNotice(notice, " while deleting session")
+		}
+		if len(removedQueueIDs) > 0 {
+			p.emitEvent(s.ctx, EventChatQueueCleared, ChatQueueEvent{
+				ProjectID: projectID, SessionID: sessionID, IDs: removedQueueIDs,
+			})
+		}
+	}()
 
 	// Hold the write lock for the guard check AND the delete so two concurrent
 	// deletion calls can't both pass the "at least 2 sessions" guard.
@@ -1814,6 +1949,12 @@ func (s *Studio) DeleteChatSession(projectID, sessionID string) error {
 	if !exists {
 		p.mu.Unlock()
 		return fmt.Errorf("session not found: %s", sessionID)
+	}
+	if guard != nil {
+		if err := guard(p, session); err != nil {
+			p.mu.Unlock()
+			return err
+		}
 	}
 	activeSessionCount := 0
 	for _, candidate := range p.sessions {
@@ -1830,13 +1971,18 @@ func (s *Studio) DeleteChatSession(projectID, sessionID string) error {
 		p.mu.Unlock()
 		return fmt.Errorf("cannot delete the last remaining session")
 	}
+	// Claim the exact terminal outcome before Stop makes the child look like a
+	// naturally completed turn to its monitor. The metadata topology lock held
+	// here prevents a new source/target delegation from appearing during this
+	// cancellation pass.
+	delegationNotices = s.cancelDelegationsForSessionQuiet(projectID, sessionID)
 	s.cancelSideQuestions(projectID, sessionID)
 	s.stopPreviewServers(projectID, sessionID, true)
 	s.stopExternalBrowserTabs(projectID, sessionID)
 	// Cancel before taking the history-file lock. The agent loop observes the
 	// cancellation and skips its final save; an already-running save completes
 	// first under the same per-file lock and is then removed below.
-	session.Stop()
+	removedQueueIDs = session.Stop()
 	session.mu.RLock()
 	nameSnapshot := session.Name
 	parentSnapshot := session.ParentID
@@ -1863,10 +2009,27 @@ func (s *Studio) DeleteChatSession(projectID, sessionID string) error {
 	}
 	delete(p.sessions, sessionID)
 	p.mu.Unlock()
+	// The topology barrier can now be released. Matching delegations were
+	// terminalised above, before the session was stopped or removed.
+	p.metadataMu.Unlock()
+	metadataLocked = false
+	s.mu.RUnlock()
+	studioLocked = false
 	_ = removeSessionArchiveRecord(projectID, sessionID)
 
 	DiscardReplay(projectID, sessionID)
-	_ = removeScheduledTasksFor(projectID, sessionID)
+	removedRuns, scheduledCleanupErr := removeScheduledTasksFor(projectID, sessionID)
+	for _, run := range removedRuns {
+		if scheduledTaskRunTerminal(run.Status) {
+			continue
+		}
+		if child := p.GetSession(run.SessionID); child != nil && child.ID == run.SessionID {
+			child.Stop()
+		}
+	}
+	if scheduledCleanupErr != nil {
+		s.logf("warn", "scheduler", "cleanup after deleting session %q/%q: %v", projectID, sessionID, scheduledCleanupErr)
+	}
 	_ = s.refreshScheduledWakeNeed()
 	// Drop the persisted draft for this session — once the session is gone,
 	// keeping its draft on disk just consumes inodes.
@@ -1922,21 +2085,21 @@ func (s *Studio) SendMessageWithAttachments(projectID, message string, attachmen
 }
 
 func (s *Studio) startMessage(projectID, message string, attachmentParts []*genai.Part, sessionID string) error {
-	return s.startMessageWithQueueEvent(projectID, message, attachmentParts, sessionID, nil)
+	return s.startMessageWithQueueEvent(projectID, message, attachmentParts, sessionID, nil, nil)
 }
 
 // startMessageWithQueueEvent atomically claims an idle session and, for an
 // incoming cross-session message, publishes its user-card before releasing the
 // worker to call the provider. This prevents a very fast response from racing
 // ahead of the attributed incoming turn in the frontend transcript.
-func (s *Studio) startMessageWithQueueEvent(projectID, message string, attachmentParts []*genai.Part, sessionID string, startEvent *ChatQueueEvent) error {
-	return s.startMessageWithQueueEventPermission(projectID, message, attachmentParts, sessionID, startEvent, "")
+func (s *Studio) startMessageWithQueueEvent(projectID, message string, attachmentParts []*genai.Part, sessionID string, startEvent *ChatQueueEvent, delegation *delegationStamp) error {
+	return s.startMessageWithQueueEventPermission(projectID, message, attachmentParts, sessionID, startEvent, "", delegation)
 }
 
-func (s *Studio) startMessageWithQueueEventPermission(projectID, message string, attachmentParts []*genai.Part, sessionID string, startEvent *ChatQueueEvent, firstPermissionMode string) error {
+func (s *Studio) startMessageWithQueueEventPermission(projectID, message string, attachmentParts []*genai.Part, sessionID string, startEvent *ChatQueueEvent, firstPermissionMode string, delegation *delegationStamp) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.startMessageWithQueueEventPermissionLocked(projectID, message, attachmentParts, sessionID, startEvent, firstPermissionMode)
+	return s.startMessageWithQueueEventPermissionLocked(projectID, message, attachmentParts, sessionID, startEvent, firstPermissionMode, delegation)
 }
 
 // startMessageWithQueueEventPermissionLocked carries the body. The caller MUST
@@ -1949,7 +2112,26 @@ func (s *Studio) startMessageWithQueueEventPermission(projectID, message string,
 // lock across the whole run precisely so ArchiveProject cannot slip in between
 // creating the child session and claiming its queue worker, so it calls this
 // variant instead of the locking wrapper above.
-func (s *Studio) startMessageWithQueueEventPermissionLocked(projectID, message string, attachmentParts []*genai.Part, sessionID string, startEvent *ChatQueueEvent, firstPermissionMode string) error {
+func (s *Studio) startMessageWithQueueEventPermissionLocked(projectID, message string, attachmentParts []*genai.Part, sessionID string, startEvent *ChatQueueEvent, firstPermissionMode string, delegation *delegationStamp) error {
+	p, ok := s.projects[projectID]
+	if !ok {
+		return fmt.Errorf("project not found: %s", projectID)
+	}
+	// metadataMu is the session-topology transaction barrier shared with
+	// create/delete/archive/import/clear/stop. Hold it only through the
+	// synchronous queue claim; the provider goroutine never inherits it.
+	p.metadataMu.Lock()
+	defer p.metadataMu.Unlock()
+	return s.startMessageWithQueueEventPermissionTopologyLocked(
+		projectID, message, attachmentParts, sessionID, startEvent,
+		firstPermissionMode, delegation,
+	)
+}
+
+// startMessageWithQueueEventPermissionTopologyLocked is used only when the
+// caller already owns the target project's metadataMu (delegation startup).
+// The caller must also hold s.mu for reading.
+func (s *Studio) startMessageWithQueueEventPermissionTopologyLocked(projectID, message string, attachmentParts []*genai.Part, sessionID string, startEvent *ChatQueueEvent, firstPermissionMode string, delegation *delegationStamp) error {
 	p, ok := s.projects[projectID]
 	settings := s.config.Settings
 	if !ok {
@@ -1982,6 +2164,9 @@ func (s *Studio) startMessageWithQueueEventPermissionLocked(projectID, message s
 	}
 	session.queueWorker = true
 	session.queueHalt = false
+	// Same critical section as the claim: a delegated turn must never be able
+	// to start without its chain stamp attached.
+	session.incomingDelegation = delegation
 	session.mu.Unlock()
 	p.mu.RUnlock()
 	// ArchiveProject takes s.mu.Lock and checks queueWorker. The caller holds
@@ -2027,6 +2212,10 @@ func (s *Studio) startMessageWithQueueEventPermissionLocked(projectID, message s
 			}
 			next := session.queuedTurns[0]
 			session.queuedTurns = session.queuedTurns[1:]
+			// Re-arm the stamp for the turn we are about to run. The previous
+			// turn cleared it, so without this a queued delegated follow-up
+			// would run as if a human had typed it.
+			session.incomingDelegation = next.Delegation
 			session.mu.Unlock()
 
 			p.emitEvent(s.ctx, EventChatQueueStarted, ChatQueueEvent{
@@ -2103,16 +2292,26 @@ func (s *Studio) QueueMessageWithAttachments(projectID, message string, attachme
 }
 
 func (s *Studio) queueMessage(projectID, message string, attachmentParts []*genai.Part, sessionID, queueID string) error {
+	return s.queueMessageWithDelegation(projectID, message, attachmentParts, sessionID, queueID, nil)
+}
+
+// queueMessageWithDelegation is queueMessage plus the cross-agent chain stamp.
+// The stamp rides on the queued item rather than on the session because a
+// session can hold several queued turns, and each must keep its own depth.
+func (s *Studio) queueMessageWithDelegation(projectID, message string, attachmentParts []*genai.Part, sessionID, queueID string, delegation *delegationStamp) error {
 	queueID = strings.TrimSpace(queueID)
 	if queueID == "" || len(queueID) > 128 {
 		return fmt.Errorf("invalid queue ID")
 	}
 	s.mu.RLock()
 	p, ok := s.projects[projectID]
-	s.mu.RUnlock()
 	if !ok {
+		s.mu.RUnlock()
 		return fmt.Errorf("project not found: %s", projectID)
 	}
+	defer s.mu.RUnlock()
+	p.metadataMu.Lock()
+	defer p.metadataMu.Unlock()
 	sid := sessionID
 	if sid == "" {
 		sid = "default"
@@ -2161,6 +2360,7 @@ func (s *Studio) queueMessage(projectID, message string, attachmentParts []*gena
 		Message:         message,
 		AttachmentParts: attachmentParts,
 		QueuedAt:        time.Now().UnixMilli(),
+		Delegation:      delegation,
 	})
 	return nil
 }
@@ -2179,13 +2379,22 @@ func attachmentPartsBytes(parts []*genai.Part) int {
 func (s *Studio) RemoveQueuedMessage(projectID, sessionID, queueID string) error {
 	s.mu.RLock()
 	p, ok := s.projects[projectID]
-	s.mu.RUnlock()
 	if !ok {
+		s.mu.RUnlock()
 		return fmt.Errorf("project not found: %s", projectID)
 	}
-	session := p.GetSession(sessionID)
-	if session == nil {
-		return fmt.Errorf("session not found: %s", sessionID)
+	defer s.mu.RUnlock()
+	p.metadataMu.Lock()
+	defer p.metadataMu.Unlock()
+	sid := sessionID
+	if sid == "" {
+		sid = "default"
+	}
+	p.mu.RLock()
+	session, exists := p.sessions[sid]
+	p.mu.RUnlock()
+	if !exists || session == nil {
+		return fmt.Errorf("session not found: %s", sid)
 	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
@@ -2202,24 +2411,35 @@ func (s *Studio) RemoveQueuedMessage(projectID, sessionID, queueID string) error
 func (s *Studio) StopGeneration(projectID, sessionID string) error {
 	s.mu.RLock()
 	p, ok := s.projects[projectID]
-	s.mu.RUnlock()
 	if !ok {
+		s.mu.RUnlock()
 		return fmt.Errorf("project not found: %s", projectID)
 	}
+	// A delegation run owns more than the ChatSession.active bit: its durable
+	// row is what the caller's card, cancel button and restart recovery trust.
+	// Commit that row as stopped before session.Stop makes the monitor observe
+	// an apparently natural completion. metadataMu is the same topology barrier
+	// used by delegation startup, so no matching run can appear in the gap.
+	p.metadataMu.Lock()
+	delegationNotices := s.cancelDelegationsForSessionQuiet(projectID, sessionID)
+	removed := make(map[string][]string)
 	if sessionID == "" {
-		removed := p.Stop()
-		for sid, ids := range removed {
-			if len(ids) > 0 {
-				p.emitEvent(s.ctx, EventChatQueueCleared, ChatQueueEvent{
-					ProjectID: projectID, SessionID: sid, IDs: ids,
-				})
-			}
-		}
+		removed = p.Stop()
 	} else {
 		ids := p.StopSession(sessionID)
 		if len(ids) > 0 {
+			removed[sessionID] = ids
+		}
+	}
+	p.metadataMu.Unlock()
+	s.mu.RUnlock()
+	for _, notice := range delegationNotices {
+		s.emitDelegationStopNotice(notice, " during Stop")
+	}
+	for sid, ids := range removed {
+		if len(ids) > 0 {
 			p.emitEvent(s.ctx, EventChatQueueCleared, ChatQueueEvent{
-				ProjectID: projectID, SessionID: sessionID, IDs: ids,
+				ProjectID: projectID, SessionID: sid, IDs: ids,
 			})
 		}
 	}
@@ -2230,11 +2450,33 @@ func (s *Studio) StopGeneration(projectID, sessionID string) error {
 func (s *Studio) ClearHistory(projectID, sessionID string) error {
 	s.mu.RLock()
 	p, ok := s.projects[projectID]
-	s.mu.RUnlock()
 	if !ok {
+		s.mu.RUnlock()
 		return fmt.Errorf("project not found: %s", projectID)
 	}
-	sid := sessionID
+	studioLocked := true
+	p.metadataMu.Lock()
+	metadataLocked := true
+	var delegationNotices []delegationStopNotice
+	var removedQueueIDs []string
+	var sid string
+	defer func() {
+		if metadataLocked {
+			p.metadataMu.Unlock()
+		}
+		if studioLocked {
+			s.mu.RUnlock()
+		}
+		for _, notice := range delegationNotices {
+			s.emitDelegationStopNotice(notice, " while clearing history")
+		}
+		if len(removedQueueIDs) > 0 {
+			p.emitEvent(s.ctx, EventChatQueueCleared, ChatQueueEvent{
+				ProjectID: projectID, SessionID: sid, IDs: removedQueueIDs,
+			})
+		}
+	}()
+	sid = sessionID
 	if sid == "" {
 		sid = "default"
 	}
@@ -2242,6 +2484,10 @@ func (s *Studio) ClearHistory(projectID, sessionID string) error {
 	if session == nil {
 		return fmt.Errorf("session not found: %s", sid)
 	}
+	// Claim the delegation's terminal row while the same topology barrier used
+	// by startup is held. The direct ClearHistory RPC is therefore safe even if
+	// a caller did not issue StopGeneration first.
+	delegationNotices = s.cancelDelegationsForSessionQuiet(projectID, sid)
 	s.cancelSideQuestions(projectID, sid)
 	// Invalidate the snapshot held by any side question before touching disk.
 	// A second bump after the clear closes the small window in which a brand-new
@@ -2254,12 +2500,7 @@ func (s *Studio) ClearHistory(projectID, sessionID string) error {
 	// history, ending with "model" as the only turn — which then fails the
 	// next LLM call. The Stop call is synchronous via cancelFn; the goroutine
 	// will exit on its next ctx.Err() check and skip its final SaveHistory.
-	removedQueueIDs := session.Stop()
-	if len(removedQueueIDs) > 0 {
-		p.emitEvent(s.ctx, EventChatQueueCleared, ChatQueueEvent{
-			ProjectID: projectID, SessionID: sid, IDs: removedQueueIDs,
-		})
-	}
+	removedQueueIDs = session.Stop()
 	// Delete the durable copy before mutating memory. If the disk operation
 	// fails, keep the conversation visible instead of claiming it was cleared
 	// only to restore it after restart.
@@ -2293,6 +2534,10 @@ func (s *Studio) ClearHistory(projectID, sessionID string) error {
 	// We just zeroed this session's usage; re-derive the project cost cache so
 	// the strict-budget gate reflects the reduction instead of staying stuck.
 	p.invalidateCostCache()
+	p.metadataMu.Unlock()
+	metadataLocked = false
+	s.mu.RUnlock()
+	studioLocked = false
 	return nil
 }
 
@@ -3465,7 +3710,12 @@ func (s *Studio) UpdateSettings(cfg StudioConfig) error {
 	for _, p := range s.projects {
 		projects = append(projects, p.ToConfig())
 	}
-	candidate := &StudioConfig{Projects: projects, Settings: cfg.Settings}
+	// Groups come from the authoritative in-memory config, not from cfg, for
+	// the same reason Projects is rebuilt from s.projects above: the caller
+	// sends a settings payload, not a whole config. SettingsPage posts
+	// {projects: [], settings: …} with no groups field at all, so trusting cfg
+	// here would still write an empty groups list over the stored one.
+	candidate := &StudioConfig{Projects: projects, Groups: s.config.Groups, Settings: cfg.Settings}
 	s.configSaveMu.Lock()
 	err = candidate.Save()
 	s.configSaveMu.Unlock()
@@ -3522,6 +3772,13 @@ func (s *Studio) ApplyDefaultToProjects() error {
 // fromSessionID identifies which chat session the dispatch originated from so
 // the result can route back to the same chat, not the default one. Empty
 // string falls back to "default" for backward compat with older bindings.
+// Dispatch is the user-facing "send this task to another project" action. It
+// is now a thin wrapper over StartDelegation.
+//
+// The previous implementation called client.SendMessage directly against the
+// target's shared client: no child session, no tool loop, no budget preflight,
+// no recordResponse, and a raw EventsEmit that bypassed the event-log tee. A
+// delegation is a real turn in the target project, so all of that works.
 func (s *Studio) Dispatch(fromID, toID, fromSessionID, task string) error {
 	if err := validateRPCText("task description", task, DispatchTaskMaxBytes, true); err != nil {
 		return err
@@ -3533,93 +3790,35 @@ func (s *Studio) Dispatch(fromID, toID, fromSessionID, task string) error {
 	if fromSid == "" {
 		fromSid = "default"
 	}
-	s.mu.RLock()
-	from, okFrom := s.projects[fromID]
-	to, okTo := s.projects[toID]
-	settings := s.config.Settings
-	s.mu.RUnlock()
-	if !okFrom {
-		return fmt.Errorf("source project not found: %s", fromID)
-	}
-	if !okTo {
-		return fmt.Errorf("target project not found: %s", toID)
-	}
-	dispatchFn := s.dispatchInternal
+	// Checked first so existing tests can substitute the whole path.
 	if s.testDispatchFn != nil {
-		dispatchFn = s.testDispatchFn
+		s.mu.RLock()
+		from, okFrom := s.projects[fromID]
+		to, okTo := s.projects[toID]
+		settings := s.config.Settings
+		s.mu.RUnlock()
+		if !okFrom {
+			return fmt.Errorf("source project not found: %s", fromID)
+		}
+		if !okTo {
+			return fmt.Errorf("target project not found: %s", toID)
+		}
+		if !s.startBackground("dispatch", func() {
+			s.testDispatchFn(from, to, fromSid, task, settings)
+		}) {
+			return fmt.Errorf("studio is shutting down")
+		}
+		return nil
 	}
-	// Go 1.25 wg.Go: same lifecycle scoping in one call.
-	//
-	// iter 970+: panic barrier. dispatchInternal does network I/O against a
-	// second project's LLM client; any panic there (provider library bug,
-	// nil-deref on a race) previously killed the whole app. Now surfaces in
-	// the event log.
-	if !s.startBackground("dispatch", func() {
-		dispatchFn(from, to, fromSid, task, settings)
-	}) {
-		return fmt.Errorf("studio is shutting down")
-	}
-	return nil
-}
-
-func (s *Studio) dispatchInternal(from, to *Project, fromSid, task string, settings Settings) {
-	// Capture names under the project locks so we don't race with RenameProject,
-	// which writes Name under p.mu.Lock(). Directory is set once in AddProject
-	// and never mutated, so it's safe to read without a lock.
-	from.mu.RLock()
-	fromName := from.Name
-	from.mu.RUnlock()
-	to.mu.RLock()
-	toName := to.Name
-	to.mu.RUnlock()
-
-	emitError := func(err error) {
-		// Humanize the error (401/429/context length → friendlier guidance)
-		// so the dispatch-result card in the source chat isn't a raw stack
-		// like "API error 401". Mirrors the main SendMessage error path.
-		wailsRuntime.EventsEmit(s.ctx, EventDispatchComplete, map[string]any{
-			"from": from.ID, "to": to.ID, "toName": toName,
-			"sessionID": fromSid,
-			"success":   false, "error": humanizeAPIError(err),
-		})
-	}
-
-	if err := to.initClient(settings); err != nil {
-		emitError(err)
-		return
-	}
-
-	prompt := fmt.Sprintf("## Dispatched by\n%s (%s)\n\n## Task\n%s", fromName, from.Directory, task)
-
-	to.mu.RLock()
-	c := to.client
-	to.mu.RUnlock()
-
-	if c == nil {
-		emitError(fmt.Errorf("client not initialized for project %s", toName))
-		return
-	}
-
-	// Use the Wails context so dispatch is cancelled on app shutdown.
-	resp, err := c.SendMessage(s.ctx, prompt)
-	if err != nil {
-		emitError(err)
-		return
-	}
-	if resp == nil {
-		emitError(fmt.Errorf("nil response from %s", toName))
-		return
-	}
-	collected, err := resp.Collect()
-	if err != nil {
-		emitError(err)
-		return
-	}
-	wailsRuntime.EventsEmit(s.ctx, EventDispatchComplete, map[string]any{
-		"from": from.ID, "to": to.ID, "toName": toName,
-		"sessionID": fromSid,
-		"success":   true, "result": collected.Text,
+	_, err := s.startDelegation(delegationRequest{
+		FromProjectID:  fromID,
+		FromSessionID:  fromSid,
+		ToProjectID:    toID,
+		Kind:           "run",
+		Task:           task,
+		LegacyDispatch: true,
 	})
+	return err
 }
 
 // --- Internal ---
@@ -3647,7 +3846,7 @@ func (s *Studio) persistProjectMutationLocked(id string, mutate func(*ProjectCon
 	if !found {
 		return fmt.Errorf("project not found: %s", id)
 	}
-	candidate := &StudioConfig{Projects: projects, Settings: s.config.Settings}
+	candidate := &StudioConfig{Projects: projects, Groups: s.config.Groups, Settings: s.config.Settings}
 	s.configSaveMu.Lock()
 	err := candidate.Save()
 	s.configSaveMu.Unlock()
@@ -3710,6 +3909,12 @@ func (s *Studio) saveConfigAsync() {
 	// Read Settings under the lock — UpdateSettings can race on s.config.Settings
 	// concurrently (struct assignment is not atomic for multi-field structs).
 	settings := s.config.Settings
+	// Groups are read here for the same reason as Settings, and carried below
+	// for a sharper one: Save() marshals exactly the struct it is handed and
+	// `groups` is omitempty, so omitting the field does not leave the on-disk
+	// groups alone — it deletes them. This is the hot path (every turn bumps
+	// lastUsedAt), so the omission erased them on the first message in any chat.
+	groups := s.config.Groups
 	s.mu.RUnlock()
 	// Clone the entire StudioConfig so we don't race with readers that read
 	// s.config (e.g. GetSettings) while the yaml.Marshal goroutine touches
@@ -3718,6 +3923,7 @@ func (s *Studio) saveConfigAsync() {
 	cfg := &StudioConfig{
 		Settings: settings,
 		Projects: projects,
+		Groups:   groups,
 	}
 	if err := cfg.Save(); err != nil {
 		fmt.Fprintf(os.Stderr, "gokin-studio: failed to save config: %v\n", err)

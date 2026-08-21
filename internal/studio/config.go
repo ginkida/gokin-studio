@@ -20,7 +20,10 @@ const (
 // StudioConfig is the top-level configuration saved to disk.
 type StudioConfig struct {
 	Projects []ProjectConfig `yaml:"projects" json:"projects"`
-	Settings Settings        `yaml:"settings" json:"settings"`
+	// Groups bundle related projects. They live inside the config file so they
+	// inherit its atomic 0600 save and need no new file or lock.
+	Groups   []ProjectGroupConfig `yaml:"groups,omitempty" json:"groups,omitempty"`
+	Settings Settings             `yaml:"settings" json:"settings"`
 }
 
 // ProjectConfig is the persisted state of a single project.
@@ -43,6 +46,15 @@ type ProjectConfig struct {
 	// bounded file edits; "manual" = ask; "skip" = bypass ordinary approvals.
 	// Legacy "ask" is migrated to "manual".
 	PermissionMode string `yaml:"permission_mode,omitempty" json:"permissionMode,omitempty"`
+	// Description and Capabilities are how OTHER projects' agents recognise
+	// this one. They are the replacement for ask_agent's fixed role enum, which
+	// no real project could ever match. Both are user-owned text: they ride
+	// into another project's prompt, so nothing generates them automatically.
+	Description  string   `yaml:"description,omitempty" json:"description,omitempty"`
+	Capabilities []string `yaml:"capabilities,omitempty" json:"capabilities,omitempty"`
+	// DelegationPolicy controls who may delegate INTO this project:
+	// "any" (default, today's reachability) | "group" | "off".
+	DelegationPolicy string `yaml:"delegation_policy,omitempty" json:"delegationPolicy,omitempty"`
 	// ComputerUseEnabled exposes OS-level screen tools to this project. It is
 	// opt-in and computer_* calls remain runtime-gated even in auto mode.
 	ComputerUseEnabled  bool     `yaml:"computer_use_enabled,omitempty" json:"computerUseEnabled,omitempty"`
@@ -142,7 +154,6 @@ func configPath() string {
 
 // LoadConfig reads the config from disk or returns defaults.
 func LoadConfig() *StudioConfig {
-	cfg := defaultConfig()
 	data, err := readRegularFileLimited(configPath(), StudioConfigMaxBytes)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -156,16 +167,12 @@ func LoadConfig() *StudioConfig {
 			quarantined := quarantineInvalidConfig()
 			fmt.Fprintf(os.Stderr, "gokin-studio: config unreadable, using defaults: %v%s\n", err, quarantined)
 		}
-		return cfg
-	}
-	if err := yaml.Unmarshal(data, cfg); err != nil {
-		quarantined := quarantineInvalidConfig()
-		fmt.Fprintf(os.Stderr, "gokin-studio: invalid config, using defaults: %v%s\n", err, quarantined)
 		return defaultConfig()
 	}
-	if len(cfg.Projects) > StudioConfigMaxProjects {
+	cfg, err := parseStudioConfig(data)
+	if err != nil {
 		quarantined := quarantineInvalidConfig()
-		fmt.Fprintf(os.Stderr, "gokin-studio: config has too many projects (%d, maximum %d), using defaults%s\n", len(cfg.Projects), StudioConfigMaxProjects, quarantined)
+		fmt.Fprintf(os.Stderr, "gokin-studio: invalid config, using defaults: %v%s\n", err, quarantined)
 		return defaultConfig()
 	}
 
@@ -308,6 +315,29 @@ func LoadConfig() *StudioConfig {
 	}
 
 	return cfg
+}
+
+// parseStudioConfig is the shared syntax and structural-boundary parser used
+// by startup and restore preflight. Runtime normalization remains in LoadConfig
+// so validation never mutates imported bytes or generates replacement IDs.
+func parseStudioConfig(data []byte) (*StudioConfig, error) {
+	cfg := defaultConfig()
+	if err := yaml.Unmarshal(data, cfg); err != nil {
+		return nil, err
+	}
+	if len(cfg.Projects) > StudioConfigMaxProjects {
+		return nil, fmt.Errorf("config has too many projects (%d, maximum %d)", len(cfg.Projects), StudioConfigMaxProjects)
+	}
+	return cfg, nil
+}
+
+func validateStudioConfigFile(path string) error {
+	data, err := readRegularFileLimited(path, StudioConfigMaxBytes)
+	if err != nil {
+		return err
+	}
+	_, err = parseStudioConfig(data)
+	return err
 }
 
 func quarantineInvalidConfig() string {

@@ -24,6 +24,10 @@ export interface ChatMessage {
   // been switching providers mid-conversation.
   model?: string
   provider?: string
+  // Marks an assistant message synthesized from a terminal chat:error event.
+  // The visible "Error:" prefix remains for persisted-history compatibility,
+  // while this flag lets live terminal-event logic avoid guessing from text.
+  isError?: boolean
   attachments?: ChatAttachment[]
   timestamp: number
 }
@@ -84,6 +88,30 @@ export interface AskUserQuestion {
   askedAt: number
 }
 
+// Retire only the question that owns the completion/cancel callback. A newer
+// approval can arrive before the older AnswerQuestion promise resumes, so a
+// chat-wide `null` assignment would be an ABA race.
+export function clearOwnedAskUser(
+  questions: Record<string, AskUserQuestion | null>,
+  chatKey: string,
+  questionID: string,
+): Record<string, AskUserQuestion | null> {
+  if (questions[chatKey]?.questionID !== questionID) return questions
+  return { ...questions, [chatKey]: null }
+}
+
+// chat:error is deliberately followed by chat:complete so the backend can
+// finalize usage/history and the UI can clear its spinner. Only the first of
+// those events should raise unread/desktop notifications for a failed turn.
+export function latestTurnHasMarkedError(messages: ChatMessage[]): boolean {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]
+    if (message.role === 'user') return false
+    if (message.role === 'assistant' && message.isError) return true
+  }
+  return false
+}
+
 export interface TokenUsage {
   // Per-turn totals (summed across every LLM round). Use for cost/billing display.
   totalInputTokens: number
@@ -133,7 +161,7 @@ interface ChatStore extends ChatState {
   appendStreamText: (chatKey: string, text: string) => void
   appendThinkingStream: (chatKey: string, text: string) => void
   addThinking: (chatKey: string, text: string) => void
-  finalizeAssistant: (chatKey: string, text: string) => void
+  finalizeAssistant: (chatKey: string, text: string, isError?: boolean) => void
   addToolCall: (chatKey: string, tool: string, args: Record<string, unknown>) => void
   addToolProgress: (chatKey: string, tool: string, text: string) => void
   addToolResult: (chatKey: string, tool: string, success: boolean, content: string, mcpApp?: MCPAppPayload) => void
@@ -145,6 +173,7 @@ interface ChatStore extends ChatState {
   setCurrentUsage: (chatKey: string, usage: TokenUsage | null) => void
   finalizeUsage: (chatKey: string, usage: TokenUsage | null) => void
   setAskUser: (chatKey: string, q: AskUserQuestion | null) => void
+  clearAskUser: (chatKey: string, questionID: string) => void
   enqueueTurn: (chatKey: string, turn: QueuedTurn) => void
   removeQueuedTurn: (chatKey: string, id: string) => void
   startQueuedTurn: (chatKey: string, id: string) => void
@@ -255,6 +284,12 @@ export const useChatStore = create<ChatStore>((set) => ({
     set((s) => ({
       askUser: { ...s.askUser, [chatKey]: q },
     })),
+
+  clearAskUser: (chatKey, questionID) =>
+    set((s) => {
+      const askUser = clearOwnedAskUser(s.askUser, chatKey, questionID)
+      return askUser === s.askUser ? s : { askUser }
+    }),
 
   enqueueTurn: (chatKey, turn) =>
     set((s) => {
@@ -374,7 +409,7 @@ export const useChatStore = create<ChatStore>((set) => ({
       }
     }),
 
-  finalizeAssistant: (projectId, text) =>
+  finalizeAssistant: (projectId, text, isError = false) =>
     set((s) => {
       const content = text || s.streaming[projectId] || ''
       if (!content) return s
@@ -383,7 +418,7 @@ export const useChatStore = create<ChatStore>((set) => ({
           ...s.messages,
           [projectId]: [
             ...(s.messages[projectId] || []),
-            { id: genId(), role: 'assistant', content, timestamp: Date.now() },
+            { id: genId(), role: 'assistant', content, isError: isError || undefined, timestamp: Date.now() },
           ],
         },
         streaming: { ...s.streaming, [projectId]: '' },

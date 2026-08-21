@@ -65,6 +65,7 @@ var defaultClassifier = &toolDependencyClassifier{
 		"preview_browser":  true,
 		"external_browser": true,
 		"session_agent":    true,
+		"delegate":         true,
 	},
 }
 
@@ -96,8 +97,8 @@ func RequiresUserApproval(name string, args map[string]any) bool {
 		// Listing and reading are bounded and attributed. Everything else
 		// crosses into another chat: "send" starts a full tool-enabled turn
 		// there under THAT session's permission mode, "archive" changes the
-		// user's visible catalog, "rename" edits it. The weaker one-shot
-		// ask_agent is already gated below, so these must be too. "suggest"
+		// user's visible catalog, while "rename" edits it. These therefore
+		// need exact review. "suggest"
 		// only offers a chip the user must click, so it stays ungated.
 		action, _ := args["action"].(string)
 		switch strings.ToLower(strings.TrimSpace(action)) {
@@ -105,9 +106,18 @@ func RequiresUserApproval(name string, args map[string]any) bool {
 			return true
 		}
 		return false
+	case "delegate":
+		// Starting work in another project is a spend commitment there and can
+		// run that project's own tools; reading a run back is inert.
+		action, _ := args["action"].(string)
+		switch strings.ToLower(strings.TrimSpace(action)) {
+		case "ask", "run", "batch":
+			return true
+		}
+		return false
 	case "write", "edit", "document_create", "delete", "move", "copy", "mkdir",
 		"git_add", "git_commit", "bash", "ssh", "refactor", "atomicwrite",
-		"kill_shell", "task_stop", "ask_agent":
+		"kill_shell", "task_stop":
 		return true
 	case "plugin_agent":
 		return true
@@ -146,7 +156,7 @@ func RequiresUserApproval(name string, args map[string]any) bool {
 		"git_status", "git_diff", "git_log", "git_blame",
 		"web_fetch", "web_search", "run_tests", "check_impact", "verify_code", "review_changes", "submit_code_review",
 		"go_to_definition", "find_references", "env", "task_output",
-		"ask_user", "todo", "tools_list", "request_tool",
+		"ask_user", "todo", "tools_list",
 		"plugin_resource",
 		"search_session_transcripts",
 		"memory", "memorize", "pin_context", "history_search", "shared_memory", "update_scratchpad",

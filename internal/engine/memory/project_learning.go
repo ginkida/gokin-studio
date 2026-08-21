@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ginkida/gokin-studio/internal/engine/fileutil"
 	"github.com/ginkida/gokin-studio/internal/engine/logging"
 	"gopkg.in/yaml.v3"
 )
@@ -29,6 +30,7 @@ type ProjectLearning struct {
 	// Timer mutex for debounced save
 	timerMu sync.Mutex
 	timer   *time.Timer
+	writer  fileutil.LatestFileWriter
 }
 
 // ProjectData contains all learned project-specific data.
@@ -71,7 +73,7 @@ type LearnedFileType struct {
 func NewProjectLearning(projectRoot string) (*ProjectLearning, error) {
 	// Create .gokin directory if it doesn't exist
 	gokinDir := filepath.Join(projectRoot, ".gokin")
-	if err := os.MkdirAll(gokinDir, 0755); err != nil {
+	if err := os.MkdirAll(gokinDir, 0o700); err != nil {
 		return nil, err
 	}
 
@@ -106,7 +108,8 @@ func NewProjectLearning(projectRoot string) (*ProjectLearning, error) {
 				pl.mu.Unlock()
 				return
 			}
-			// Snapshot data under lock
+			// Serialize and reserve this generation under the data lock. A
+			// concurrent Flush can only supersede it, never be overwritten by it.
 			pl.data.LastUpdated = time.Now()
 			data, err := yaml.Marshal(pl.data)
 			if err != nil {
@@ -114,15 +117,18 @@ func NewProjectLearning(projectRoot string) (*ProjectLearning, error) {
 				return
 			}
 			pl.dirty = false
-			pl.mu.Unlock()
-
-			// Write outside lock — disk I/O no longer blocks readers/writers.
-			if err := os.WriteFile(pl.path, data, 0644); err != nil {
+			pl.writer.ScheduleTracked(pl.path, data, 0o600, func(generation uint64, err error) {
+				if err == nil {
+					return
+				}
 				logging.Warn("failed to save project learning", "path", pl.path, "error", err)
 				pl.mu.Lock()
-				pl.dirty = true
+				if pl.writer.IsLatest(generation) {
+					pl.dirty = true
+				}
 				pl.mu.Unlock()
-			}
+			})
+			pl.mu.Unlock()
 		})
 	}
 
@@ -164,7 +170,7 @@ func normalizeProjectRoot(projectRoot string) string {
 
 // load reads data from the YAML file.
 func (pl *ProjectLearning) load() error {
-	data, err := os.ReadFile(pl.path)
+	data, err := fileutil.ReadRegularFileLimited(pl.path, maxLearningStoreFileBytes)
 	if err != nil {
 		return err
 	}
@@ -191,7 +197,7 @@ func (pl *ProjectLearning) save() error {
 		return err
 	}
 
-	return os.WriteFile(pl.path, data, 0644)
+	return pl.writer.Write(pl.path, data, 0o600)
 }
 
 // LearnCommand records a command execution with success/failure tracking.
@@ -511,14 +517,8 @@ func (pl *ProjectLearning) Flush() error {
 	pl.mu.Lock()
 	defer pl.mu.Unlock()
 
-	if !pl.dirty {
-		return nil
-	}
-
 	err := pl.save()
-	if err == nil {
-		pl.dirty = false
-	}
+	pl.dirty = err != nil
 	return err
 }
 
@@ -529,6 +529,5 @@ func (pl *ProjectLearning) Path() string {
 
 // Exists returns true if the learning file exists.
 func (pl *ProjectLearning) Exists() bool {
-	_, err := os.Stat(pl.path)
-	return err == nil
+	return fileutil.RegularFileExists(pl.path)
 }

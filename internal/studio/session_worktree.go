@@ -9,9 +9,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ginkida/gokin-studio/internal/engine/wsl"
 )
 
 const (
@@ -47,6 +50,21 @@ type SessionWorktreeStatus struct {
 
 func sessionWorktreeRecordPath(projectID, sessionID string) string {
 	return filepath.Join(configDir(), "session-worktrees", projectSessionStorageKey(projectID, sessionID)+".json")
+}
+
+// wslIsolationSkippedReason explains, in the session catalog and the UI, why a
+// WSL project's chats share the project directory instead of each getting their
+// own checkout.
+const wslIsolationSkippedReason = "per-session Git isolation is unavailable for WSL projects; this chat works directly in the project directory"
+
+// hostGOOS exists so the Windows-only branches below can be exercised from a
+// test on any platform. Production code never assigns it.
+var hostGOOS = runtime.GOOS
+
+// remoteProjectDirectory reports whether the project's files live inside a WSL
+// distro rather than on a Windows drive.
+func remoteProjectDirectory(dir string) bool {
+	return wsl.IsRemotePath(hostGOOS, dir)
 }
 
 // sessionWorktreeDirName is the configDir-relative root that holds every
@@ -220,6 +238,23 @@ func provisionSessionWorktree(project *Project, session *ChatSession, startDir s
 	project.mu.RLock()
 	projectDir := project.Directory
 	project.mu.RUnlock()
+	// A WSL project's repository lives inside the distro, but this worktree
+	// would be created under <configDir>/worktrees on the Windows drive. Git
+	// records absolute paths in a worktree's gitdir pointer, so the distro's
+	// git could not resolve a Windows-spelled one — and the checkout would then
+	// be handed to the tool registry and the workspace boundary, putting the
+	// agent outside WSL entirely.
+	//
+	// Returning nil rather than an error is deliberate: every caller treats a
+	// non-nil error as fatal, and AddProject would refuse the project outright.
+	// WorktreeError is deliberately left empty too, because a non-empty value
+	// turns into a hard per-turn failure in sessionWorkingDirectory.
+	if remoteProjectDirectory(projectDir) {
+		session.mu.Lock()
+		session.IsolationSkippedReason = wslIsolationSkippedReason
+		session.mu.Unlock()
+		return nil
+	}
 	repoRoot := runGit(projectDir, "rev-parse", "--show-toplevel")
 	if repoRoot == "" {
 		return nil
@@ -298,6 +333,9 @@ func runGitWorktreeCommandRaw(dir string, args ...string) (string, error) {
 	full = append(full, args...)
 	cmd := exec.CommandContext(ctx, "git", full...)
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	// ApplyGit clears cmd.Env, which is correct: a Windows environment does not
+	// cross into the distro. GIT_TERMINAL_PROMPT only matters for the host path.
+	wsl.ApplyGit(cmd, dir, append([]string{"git"}, full...))
 	cmd.WaitDelay = gitWaitDelay
 	output := &cappedCommandOutput{limit: maxGitOutputBytes}
 	cmd.Stdout = output
@@ -459,6 +497,33 @@ func removeSessionWorktreeAt(project *Project, session *ChatSession, projectDir 
 	}
 	if status.Dirty {
 		return fmt.Errorf("session worktree has %d uncommitted file change(s); commit or discard them before deleting this chat", status.ChangedFiles)
+	}
+	// A session-owned background process may still hold its task log or cwd
+	// inside the checkout after cancellation was requested. Close its manager
+	// before asking Git to remove the worktree, and detach the now-closed tool
+	// registry so a rare later safety failure can rebuild a usable manager.
+	session.mu.RLock()
+	taskManager := session.taskManager
+	session.mu.RUnlock()
+	if taskManager != nil {
+		if err := closeBackgroundTaskManager(taskManager); err != nil {
+			return fmt.Errorf("settle session background tasks before removing worktree: %w", err)
+		}
+		session.mu.Lock()
+		if session.taskManager == taskManager {
+			session.taskManager = nil
+			session.registry = nil
+		}
+		session.mu.Unlock()
+		// A task could have written a tracked file while cancellation was
+		// settling. Re-check the destructive preconditions after Done.
+		status = sessionWorktreeStatus(session)
+		if status.Error != "" {
+			return fmt.Errorf("cannot remove unavailable worktree safely: %s", status.Error)
+		}
+		if status.Dirty {
+			return fmt.Errorf("session worktree has %d uncommitted file change(s); commit or discard them before deleting this chat", status.ChangedFiles)
+		}
 	}
 	session.mu.RLock()
 	checkout := session.WorktreePath

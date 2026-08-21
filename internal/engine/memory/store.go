@@ -19,6 +19,8 @@ import (
 	"github.com/ginkida/gokin-studio/internal/engine/logging"
 )
 
+const maxMemoryStoreFileBytes int64 = 128 << 20
+
 // Store manages persistent memory storage.
 type Store struct {
 	configDir   string
@@ -48,7 +50,7 @@ type Store struct {
 func NewStore(configDir, projectPath string, maxEntries int) (*Store, error) {
 	// Create memory directory
 	memDir := filepath.Join(configDir, "memory")
-	if err := os.MkdirAll(memDir, 0755); err != nil {
+	if err := os.MkdirAll(memDir, 0o700); err != nil {
 		return nil, fmt.Errorf("failed to create memory directory: %w", err)
 	}
 
@@ -94,7 +96,7 @@ func CloneProjectMemory(configDir, oldProjectPath, newProjectPath string) error 
 		return nil
 	}
 	memDir := filepath.Join(configDir, "memory")
-	if err := os.MkdirAll(memDir, 0755); err != nil {
+	if err := os.MkdirAll(memDir, 0o700); err != nil {
 		return fmt.Errorf("create memory directory: %w", err)
 	}
 	for _, suffix := range []string{".json", ".archive.json"} {
@@ -140,7 +142,7 @@ func CloneProjectMemory(configDir, oldProjectPath, newProjectPath string) error 
 		if err != nil {
 			return fmt.Errorf("encode cloned memory: %w", err)
 		}
-		if err := fileutil.AtomicWrite(targetPath, data, 0644); err != nil {
+		if err := fileutil.AtomicWrite(targetPath, data, 0o600); err != nil {
 			return fmt.Errorf("write cloned memory: %w", err)
 		}
 	}
@@ -148,7 +150,7 @@ func CloneProjectMemory(configDir, oldProjectPath, newProjectPath string) error 
 }
 
 func readMemoryEntriesForClone(path string) ([]*Entry, bool, error) {
-	data, err := os.ReadFile(path)
+	data, err := fileutil.ReadRegularFileLimited(path, maxMemoryStoreFileBytes)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, false, nil
@@ -1071,8 +1073,9 @@ func (s *Store) load() error {
 	}
 	for _, f := range files {
 		if err := s.loadFile(f.path, f.target); err != nil {
-			logging.Warn("memory: failed to load file, quarantining and continuing", "path", f.path, "error", err)
-			s.quarantineFile(f.path)
+			quarantined := s.quarantineFile(f.path)
+			logging.Warn("memory: failed to load file, continuing with empty namespace",
+				"path", f.path, "error", err, "quarantined", quarantined)
 			// loadFile errors at json.Unmarshal (before populating target), so
 			// the map is still empty — nothing to roll back.
 		}
@@ -1094,7 +1097,7 @@ func (s *Store) load() error {
 }
 
 func (s *Store) loadFile(path string, target map[string]*Entry) error {
-	data, err := os.ReadFile(path)
+	data, err := fileutil.ReadRegularFileLimited(path, maxMemoryStoreFileBytes)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -1108,6 +1111,9 @@ func (s *Store) loadFile(path string, target map[string]*Entry) error {
 	}
 
 	for _, entry := range entries {
+		if entry == nil || entry.ID == "" {
+			continue
+		}
 		target[entry.ID] = entry
 	}
 	return nil
@@ -1116,16 +1122,17 @@ func (s *Store) loadFile(path string, target map[string]*Entry) error {
 // quarantineFile renames a corrupt memory file aside (path.corrupt-<nanos>) so
 // the next save can't silently overwrite data that may be recoverable by hand,
 // and so the parse error isn't re-hit on every startup. Best-effort.
-func (s *Store) quarantineFile(path string) {
-	if _, err := os.Stat(path); err != nil {
-		return // nothing to quarantine
+func (s *Store) quarantineFile(path string) bool {
+	if !fileutil.RegularFileExists(path) {
+		return false // missing, symlinked, or otherwise not ours to rename
 	}
 	dest := fmt.Sprintf("%s.corrupt-%d", path, time.Now().UnixNano())
 	if err := os.Rename(path, dest); err != nil {
 		logging.Warn("memory: failed to quarantine corrupt file", "path", path, "error", err)
-		return
+		return false
 	}
 	logging.Warn("memory: quarantined corrupt file", "from", path, "to", dest)
+	return true
 }
 
 // findSemanticDuplicateLocked returns an existing active entry that is a semantic
@@ -1293,7 +1300,7 @@ func (s *Store) saveFile(path string, entries []*Entry) error {
 	// Atomic write (temp + fsync + rename): a crash or full disk mid-write must
 	// not leave a truncated/corrupt JSON file that would fail to parse — and
 	// would (pre-fix) wipe ALL persisted memory on the next startup.
-	return fileutil.AtomicWrite(path, data, 0644)
+	return fileutil.AtomicWrite(path, data, 0o600)
 }
 
 // pruneOldest removes the oldest entries to stay within limit.

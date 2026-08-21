@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { ChevronRight, File, Folder, FolderOpen, Search, X } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { ChevronRight, File, Folder, FolderOpen, RotateCcw, Search, X } from 'lucide-react'
 import { ListSessionDirectory } from '../../../wailsjs/go/studio/Studio'
 
 interface Entry {
@@ -30,36 +30,72 @@ export function FilePicker({
   const [dirs, setDirs] = useState<Record<string, DirState>>({})
   const [query, setQuery] = useState('')
   const inputRef = useRef<HTMLInputElement>(null)
+  const requestSequenceRef = useRef(0)
+  const directoryRequestsRef = useRef(new Map<string, number>())
+  const scopeKey = `${projectId.length}:${projectId}${sessionId.length}:${sessionId}`
+  const scopeRef = useRef({ generation: 0, mounted: false })
+
+  const ownsScope = useCallback((generation: number) => (
+    scopeRef.current.mounted && scopeRef.current.generation === generation
+  ), [])
+
+  const loadDirectory = useCallback((path: string, expectedScope = scopeRef.current.generation) => {
+    const request = ++requestSequenceRef.current
+    directoryRequestsRef.current.set(path, request)
+    setDirs((current) => {
+      const existing = current[path] || { loaded: false, entries: [], expanded: path === '' }
+      return {
+        ...current,
+        [path]: { ...existing, loaded: false, expanded: path === '' ? true : existing.expanded, error: undefined },
+      }
+    })
+    return ListSessionDirectory(projectId, sessionId, path).then((entries) => {
+      if (!ownsScope(expectedScope) || directoryRequestsRef.current.get(path) !== request) return false
+      setDirs((current) => {
+        const existing = current[path] || { loaded: false, entries: [], expanded: path === '' }
+        return {
+          ...current,
+          [path]: { ...existing, loaded: true, entries: (entries || []) as Entry[], error: undefined },
+        }
+      })
+      return true
+    }).catch((err) => {
+      if (!ownsScope(expectedScope) || directoryRequestsRef.current.get(path) !== request) return false
+      setDirs((current) => {
+        const existing = current[path] || { loaded: false, entries: [], expanded: path === '' }
+        return {
+          ...current,
+          [path]: { ...existing, loaded: true, entries: [], error: String(err?.message || err) },
+        }
+      })
+      return false
+    })
+  }, [ownsScope, projectId, sessionId])
 
   useEffect(() => {
+    scopeRef.current.generation += 1
+    scopeRef.current.mounted = true
+    const generation = scopeRef.current.generation
+    directoryRequestsRef.current.clear()
+    setDirs({})
+    setQuery('')
     inputRef.current?.focus()
-    // Load root directory immediately
-    ListSessionDirectory(projectId, sessionId, '').then((entries) => {
-      setDirs((d) => ({ ...d, '': { loaded: true, entries: (entries || []) as Entry[], expanded: true } }))
-    }).catch((err) => {
-      setDirs((d) => ({ ...d, '': { loaded: true, entries: [], expanded: true, error: String(err?.message || err) } }))
-    })
-  }, [projectId, sessionId])
+    void loadDirectory('', generation)
+    return () => {
+      if (scopeRef.current.generation === generation) {
+        scopeRef.current.mounted = false
+        scopeRef.current.generation += 1
+      }
+      requestSequenceRef.current += 1
+      directoryRequestsRef.current.clear()
+    }
+  }, [loadDirectory, scopeKey])
 
   const toggle = (path: string) => {
-    setDirs((d) => {
-      const cur = d[path] || { loaded: false, entries: [], expanded: false }
-      const willExpand = !cur.expanded
-      const next = { ...cur, expanded: willExpand }
-      if (willExpand && (!cur.loaded || cur.error)) {
-        // Use the current state (dd) at resolve-time, not the captured `next`,
-        // so rapid double-clicks can't overwrite an intermediate expand/collapse.
-        // Also retry when a previous attempt left an error (cur.error set).
-        ListSessionDirectory(projectId, sessionId, path).then((entries) => {
-          setDirs((dd) => ({ ...dd, [path]: { ...dd[path], loaded: true, entries: (entries || []) as Entry[], error: undefined } }))
-        }).catch((err) => {
-          setDirs((dd) => ({ ...dd, [path]: { ...dd[path], loaded: true, entries: [], error: String(err?.message || err) } }))
-        })
-        // Reset to loading state so the subtree shows nothing while the fetch is in flight.
-        return { ...d, [path]: { ...next, loaded: false, error: undefined } }
-      }
-      return { ...d, [path]: next }
-    })
+    const current = dirs[path] || { loaded: false, entries: [], expanded: false }
+    const expanded = !current.expanded
+    setDirs((state) => ({ ...state, [path]: { ...(state[path] || current), expanded } }))
+    if (expanded && (!current.loaded || current.error)) void loadDirectory(path)
   }
 
   const onKey = (e: React.KeyboardEvent) => {
@@ -190,14 +226,19 @@ export function FilePicker({
             )
           ) : root?.loaded ? (
             root.error ? (
-              <div className="fp-empty">Failed to read project directory: {root.error}</div>
+              <div className="fp-empty" role="alert">
+                <span>Failed to read project directory: {root.error}</span>
+                <button type="button" className="btn-secondary" onClick={() => { void loadDirectory('') }}>
+                  <RotateCcw size={12} /> Retry
+                </button>
+              </div>
             ) : root.entries.length === 0 ? (
               <div className="fp-empty">Project directory is empty.</div>
             ) : (
               root.entries.map((e) => renderNode(e, 0))
             )
           ) : (
-            <div className="fp-empty">Loading…</div>
+            <div className="fp-empty" role="status">Loading…</div>
           )}
         </div>
         <div className="fp-footer">

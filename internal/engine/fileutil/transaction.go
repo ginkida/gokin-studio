@@ -1,9 +1,12 @@
 package fileutil
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -21,6 +24,15 @@ type FileTransaction struct {
 	startTime      time.Time
 	mu             sync.Mutex
 	RollbackErrors []error
+	snapshots      map[string]fileSnapshot
+	prepared       bool
+	mutated        bool
+}
+
+type fileSnapshot struct {
+	existed    bool
+	backupFile string
+	mode       os.FileMode
 }
 
 // FileOperation represents a single file operation in a transaction.
@@ -86,8 +98,9 @@ func NewFileTransaction(opts ...TransactionOption) (*FileTransaction, error) {
 		opt(tx)
 	}
 
-	// Create temp directory for staging
-	tempDir, err := os.MkdirTemp("", "gokin-tx-"+tx.id+"-")
+	// The user-visible ID is metadata, not a path component. Keeping it out of
+	// the MkdirTemp pattern prevents custom IDs from injecting separators.
+	tempDir, err := os.MkdirTemp("", "gokin-tx-")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp dir: %w", err)
 	}
@@ -109,19 +122,23 @@ func (tx *FileTransaction) WriteWithMode(path string, content []byte, mode os.Fi
 	if tx.committed || tx.rolledBack {
 		return fmt.Errorf("transaction already finalized")
 	}
+	if path == "" {
+		return fmt.Errorf("write path is empty")
+	}
 
 	// Stage content to temp file
 	tempFile := filepath.Join(tx.tempDir, fmt.Sprintf("op-%d-write", len(tx.operations)))
-	if err := os.WriteFile(tempFile, content, 0644); err != nil {
+	staged := append([]byte(nil), content...)
+	if err := os.WriteFile(tempFile, staged, 0o600); err != nil {
 		return fmt.Errorf("failed to stage write: %w", err)
 	}
 
 	tx.operations = append(tx.operations, FileOperation{
 		Type:     OpWrite,
 		Path:     path,
-		Content:  content,
+		Content:  staged,
 		TempFile: tempFile,
-		Mode:     mode,
+		Mode:     mode.Perm(),
 	})
 
 	return nil
@@ -134,6 +151,9 @@ func (tx *FileTransaction) Delete(path string) error {
 
 	if tx.committed || tx.rolledBack {
 		return fmt.Errorf("transaction already finalized")
+	}
+	if path == "" {
+		return fmt.Errorf("delete path is empty")
 	}
 
 	tx.operations = append(tx.operations, FileOperation{
@@ -151,6 +171,12 @@ func (tx *FileTransaction) Rename(oldPath, newPath string) error {
 
 	if tx.committed || tx.rolledBack {
 		return fmt.Errorf("transaction already finalized")
+	}
+	if oldPath == "" || newPath == "" {
+		return fmt.Errorf("rename paths must not be empty")
+	}
+	if filepath.Clean(oldPath) == filepath.Clean(newPath) {
+		return fmt.Errorf("rename source and destination are the same path")
 	}
 
 	tx.operations = append(tx.operations, FileOperation{
@@ -170,17 +196,20 @@ func (tx *FileTransaction) Chmod(path string, mode os.FileMode) error {
 	if tx.committed || tx.rolledBack {
 		return fmt.Errorf("transaction already finalized")
 	}
+	if path == "" {
+		return fmt.Errorf("chmod path is empty")
+	}
 
 	tx.operations = append(tx.operations, FileOperation{
 		Type: OpChmod,
 		Path: path,
-		Mode: mode,
+		Mode: mode.Perm(),
 	})
 
 	return nil
 }
 
-// Commit applies all staged operations atomically.
+// Commit applies all staged operations as a rollback-capable batch.
 // If any operation fails, all previously applied operations are rolled back.
 func (tx *FileTransaction) Commit() error {
 	tx.mu.Lock()
@@ -201,14 +230,18 @@ func (tx *FileTransaction) Commit() error {
 
 	// Phase 1: Backup existing files
 	if err := tx.backupPhase(); err != nil {
-		tx.rollbackInternal()
+		tx.rolledBack = true
+		tx.cleanup()
 		return fmt.Errorf("backup phase failed: %w", err)
 	}
 
 	// Phase 2: Apply operations
 	if err := tx.applyPhase(); err != nil {
-		tx.rollbackInternal()
-		return fmt.Errorf("apply phase failed: %w", err)
+		applyErr := fmt.Errorf("apply phase failed: %w", err)
+		if rollbackErr := tx.rollbackInternal(); rollbackErr != nil {
+			return errors.Join(applyErr, fmt.Errorf("rollback failed: %w", rollbackErr))
+		}
+		return applyErr
 	}
 
 	tx.committed = true
@@ -216,24 +249,43 @@ func (tx *FileTransaction) Commit() error {
 	return nil
 }
 
-// backupPhase creates backups of files that will be modified.
+// backupPhase snapshots every distinct path before the first mutation. Rename
+// destinations are included: operation-local backups cannot correctly restore
+// chains such as A->B followed by a write to B.
 func (tx *FileTransaction) backupPhase() error {
-	for i := range tx.operations {
-		op := &tx.operations[i]
-
-		// Check if file exists and needs backup
-		switch op.Type {
-		case OpWrite, OpDelete, OpRename, OpChmod:
-			if _, err := os.Stat(op.Path); err == nil {
-				// File exists, create backup
-				backupPath := filepath.Join(tx.tempDir, fmt.Sprintf("backup-%d", i))
-				if err := copyFile(op.Path, backupPath); err != nil {
-					return fmt.Errorf("failed to backup %s: %w", op.Path, err)
-				}
-				op.BackupFile = backupPath
-			}
+	paths := make(map[string]struct{})
+	for _, op := range tx.operations {
+		paths[op.Path] = struct{}{}
+		if op.NewPath != "" {
+			paths[op.NewPath] = struct{}{}
 		}
 	}
+	ordered := make([]string, 0, len(paths))
+	for path := range paths {
+		ordered = append(ordered, path)
+	}
+	sort.Strings(ordered)
+
+	tx.snapshots = make(map[string]fileSnapshot, len(ordered))
+	for i, path := range ordered {
+		info, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			tx.snapshots[path] = fileSnapshot{}
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("inspect %s: %w", path, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return fmt.Errorf("transaction path is not a regular file: %s", path)
+		}
+		backupPath := filepath.Join(tx.tempDir, fmt.Sprintf("backup-%d", i))
+		if err := backupRegularFile(path, backupPath); err != nil {
+			return fmt.Errorf("failed to backup %s: %w", path, err)
+		}
+		tx.snapshots[path] = fileSnapshot{existed: true, backupFile: backupPath, mode: info.Mode().Perm()}
+	}
+	tx.prepared = true
 	return nil
 }
 
@@ -241,6 +293,9 @@ func (tx *FileTransaction) backupPhase() error {
 func (tx *FileTransaction) applyPhase() error {
 	for i := range tx.operations {
 		op := &tx.operations[i]
+		// Mark the transaction dirty before calling an OS operation: a failed
+		// replace/chmod can still have changed the live path.
+		tx.mutated = true
 
 		var err error
 		switch op.Type {
@@ -269,18 +324,10 @@ func (tx *FileTransaction) applyWrite(op *FileOperation) error {
 		return fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
 
-	// Try atomic rename first (fastest)
-	if err := os.Rename(op.TempFile, op.Path); err == nil {
-		// Set permissions
-		return os.Chmod(op.Path, op.Mode)
-	}
-
-	// Fallback to copy (cross-device)
-	if err := copyFile(op.TempFile, op.Path); err != nil {
+	if err := atomicCopyFile(op.TempFile, op.Path, op.Mode); err != nil {
 		return fmt.Errorf("failed to write %s: %w", op.Path, err)
 	}
-
-	return os.Chmod(op.Path, op.Mode)
+	return nil
 }
 
 func (tx *FileTransaction) applyDelete(op *FileOperation) error {
@@ -297,7 +344,7 @@ func (tx *FileTransaction) applyRename(op *FileOperation) error {
 		return fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
 
-	if err := os.Rename(op.Path, op.NewPath); err != nil {
+	if err := durableMove(op.Path, op.NewPath); err != nil {
 		return fmt.Errorf("failed to rename %s to %s: %w", op.Path, op.NewPath, err)
 	}
 	return nil
@@ -322,57 +369,50 @@ func (tx *FileTransaction) Rollback() error {
 		return nil // Already rolled back
 	}
 
-	tx.rollbackInternal()
-	return nil
+	return tx.rollbackInternal()
 }
 
 // rollbackInternal performs the actual rollback (must be called with lock held).
-func (tx *FileTransaction) rollbackInternal() {
+func (tx *FileTransaction) rollbackInternal() error {
 	tx.RollbackErrors = nil
-
-	// Roll back in reverse order
-	for i := len(tx.operations) - 1; i >= 0; i-- {
-		op := &tx.operations[i]
-		if !op.Applied {
-			continue
+	if tx.prepared && tx.mutated {
+		paths := make([]string, 0, len(tx.snapshots))
+		for path := range tx.snapshots {
+			paths = append(paths, path)
 		}
-
-		switch op.Type {
-		case OpWrite:
-			if op.BackupFile != "" {
-				// Restore from backup
-				if err := copyFile(op.BackupFile, op.Path); err != nil {
-					tx.RollbackErrors = append(tx.RollbackErrors, fmt.Errorf("rollback write (restore) %s: %w", op.Path, err))
-				}
-			} else {
-				// Remove created file
-				if err := os.Remove(op.Path); err != nil {
-					tx.RollbackErrors = append(tx.RollbackErrors, fmt.Errorf("rollback write (remove) %s: %w", op.Path, err))
-				}
+		sort.Strings(paths)
+		removed := make(map[string]bool, len(paths))
+		for _, path := range paths {
+			info, err := os.Lstat(path)
+			if os.IsNotExist(err) {
+				removed[path] = true
+				continue
 			}
-
-		case OpDelete:
-			if op.BackupFile != "" {
-				// Restore deleted file
-				if err := copyFile(op.BackupFile, op.Path); err != nil {
-					tx.RollbackErrors = append(tx.RollbackErrors, fmt.Errorf("rollback delete (restore) %s: %w", op.Path, err))
-				}
+			if err != nil {
+				tx.RollbackErrors = append(tx.RollbackErrors, fmt.Errorf("rollback inspect %s: %w", path, err))
+				continue
 			}
-
-		case OpRename:
-			// Reverse the rename
-			if err := os.Rename(op.NewPath, op.Path); err != nil {
-				tx.RollbackErrors = append(tx.RollbackErrors, fmt.Errorf("rollback rename %s -> %s: %w", op.NewPath, op.Path, err))
+			if info.IsDir() {
+				tx.RollbackErrors = append(tx.RollbackErrors, fmt.Errorf("rollback refuses directory at file path %s", path))
+				continue
 			}
-
-		case OpChmod:
-			// Restore original permissions from backup (if we had them)
-			if op.BackupFile != "" {
-				if info, err := os.Stat(op.BackupFile); err == nil {
-					if err := os.Chmod(op.Path, info.Mode()); err != nil {
-						tx.RollbackErrors = append(tx.RollbackErrors, fmt.Errorf("rollback chmod %s: %w", op.Path, err))
-					}
-				}
+			if err := os.Remove(path); err != nil {
+				tx.RollbackErrors = append(tx.RollbackErrors, fmt.Errorf("rollback remove %s: %w", path, err))
+				continue
+			}
+			removed[path] = true
+		}
+		for _, path := range paths {
+			snapshot := tx.snapshots[path]
+			if !snapshot.existed || !removed[path] {
+				continue
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				tx.RollbackErrors = append(tx.RollbackErrors, fmt.Errorf("rollback create parent for %s: %w", path, err))
+				continue
+			}
+			if err := atomicCopyFile(snapshot.backupFile, path, snapshot.mode); err != nil {
+				tx.RollbackErrors = append(tx.RollbackErrors, fmt.Errorf("rollback restore %s: %w", path, err))
 			}
 		}
 	}
@@ -388,6 +428,7 @@ func (tx *FileTransaction) rollbackInternal() {
 
 	tx.rolledBack = true
 	tx.cleanup()
+	return errors.Join(tx.RollbackErrors...)
 }
 
 // cleanup removes the temporary directory.
@@ -428,24 +469,121 @@ func (tx *FileTransaction) GetOperations() []FileOperation {
 	defer tx.mu.Unlock()
 
 	ops := make([]FileOperation, len(tx.operations))
-	copy(ops, tx.operations)
+	for i, op := range tx.operations {
+		ops[i] = op
+		ops[i].Content = append([]byte(nil), op.Content...)
+	}
 	return ops
 }
 
-// copyFile copies a file from src to dst.
-func copyFile(src, dst string) error {
-	data, err := os.ReadFile(src)
+// backupRegularFile makes a private, exclusive backup from a stable regular
+// source. Backups never inherit broader permissions from live files.
+func backupRegularFile(src, dst string) error {
+	in, info, err := openStableRegular(src)
 	if err != nil {
 		return err
 	}
-
-	// Preserve permissions
-	info, err := os.Stat(src)
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return os.WriteFile(dst, data, 0644)
+		return err
 	}
+	success := false
+	defer func() {
+		_ = out.Close()
+		if !success {
+			_ = os.Remove(dst)
+		}
+	}()
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	if err := ensureStableSource(src, info); err != nil {
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	success = true
+	return nil
+}
 
-	return os.WriteFile(dst, data, info.Mode())
+func openStableRegular(path string) (*os.File, os.FileInfo, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return nil, nil, fmt.Errorf("path is not a regular file: %s", path)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	opened, err := f.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		_ = f.Close()
+		if err != nil {
+			return nil, nil, err
+		}
+		return nil, nil, fmt.Errorf("file changed while opening: %s", path)
+	}
+	return f, info, nil
+}
+
+func ensureStableSource(path string, before os.FileInfo) error {
+	after, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if after.Mode()&os.ModeSymlink != 0 || !after.Mode().IsRegular() || !os.SameFile(before, after) ||
+		after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime()) {
+		return fmt.Errorf("file changed while copying: %s", path)
+	}
+	return nil
+}
+
+func atomicCopyFile(src, dst string, mode os.FileMode) error {
+	in, info, err := openStableRegular(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	tmp, err := os.CreateTemp(filepath.Dir(dst), ".gokin-restore-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	success := false
+	defer func() {
+		_ = tmp.Close()
+		if !success {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := io.Copy(tmp, in); err != nil {
+		return err
+	}
+	if err := ensureStableSource(src, info); err != nil {
+		return err
+	}
+	if err := tmp.Chmod(mode.Perm()); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := durableReplace(tmpPath, dst); err != nil {
+		return err
+	}
+	success = true
+	return nil
 }
 
 // TransactionResult contains information about a completed transaction.

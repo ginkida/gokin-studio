@@ -1,6 +1,8 @@
 package studio
 
 import (
+	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -206,6 +208,11 @@ func TestRestorePreImportBackup_Success(t *testing.T) {
 	if string(content) != "marker: v1" {
 		t.Errorf("active config not restored from backup; content=%q", string(content))
 	}
+	if info, err := os.Stat(cfgDir); err != nil {
+		t.Fatal(err)
+	} else if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("restored config dir mode=%#o, want 0700", got)
+	}
 	// Safety backup has v2.
 	v2content, err := os.ReadFile(filepath.Join(result.PreBackupPath, "config.yaml"))
 	if err != nil {
@@ -213,6 +220,67 @@ func TestRestorePreImportBackup_Success(t *testing.T) {
 	}
 	if string(v2content) != "marker: v2" {
 		t.Errorf("safety backup didn't capture v2 state; got %q", string(v2content))
+	}
+}
+
+func TestRestorePreImportBackup_ConsecutiveSameSecondRestoresUseDistinctSafetyPaths(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	cfgDir := configDir()
+	parent := filepath.Dir(cfgDir)
+	seed := func(name, marker string) {
+		t.Helper()
+		dir := filepath.Join(parent, name)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(marker), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(cfgDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	currentConfig := "projects: []\nsettings:\n  theme: dark\n"
+	firstConfig := "projects: []\nsettings:\n  theme: light\n"
+	secondConfig := "projects: []\nsettings:\n  theme: system\n"
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte(currentConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	firstTarget := preImportPrefix + "first"
+	secondTarget := preImportPrefix + "second"
+	seed(firstTarget, firstConfig)
+	seed(secondTarget, secondConfig)
+
+	previousNow := archivePathNow
+	archivePathNow = func() time.Time { return time.Date(2026, 8, 12, 12, 34, 56, 0, time.UTC) }
+	t.Cleanup(func() { archivePathNow = previousNow })
+	s := NewStudio()
+	first, err := s.RestorePreImportBackup(firstTarget)
+	if err != nil {
+		t.Fatalf("first restore: %v", err)
+	}
+	second, err := s.RestorePreImportBackup(secondTarget)
+	if err != nil {
+		t.Fatalf("second same-second restore: %v", err)
+	}
+	if first.PreBackupPath == second.PreBackupPath {
+		t.Fatalf("same-second restores collided at %q", first.PreBackupPath)
+	}
+	for _, snapshot := range []string{first.PreBackupPath, second.PreBackupPath} {
+		if _, err := os.Stat(filepath.Join(snapshot, "config.yaml")); err != nil {
+			t.Fatalf("safety snapshot %q missing: %v", snapshot, err)
+		}
+		info, err := os.Stat(snapshot)
+		if err != nil {
+			t.Fatalf("stat snapshot %q: %v", snapshot, err)
+		}
+		if info.ModTime().Unix() != archivePathNow().Unix() {
+			t.Fatalf("snapshot %q creation mtime=%v, want %v", snapshot, info.ModTime(), archivePathNow())
+		}
+	}
+	active, err := os.ReadFile(filepath.Join(cfgDir, "config.yaml"))
+	if err != nil || string(active) != secondConfig {
+		t.Fatalf("active config=%q err=%v, want second snapshot", active, err)
 	}
 }
 
@@ -229,6 +297,255 @@ func TestRestorePreImportBackup_RejectsBadName(t *testing.T) {
 		if err == nil {
 			t.Errorf("RestorePreImportBackup(%q) should have errored", bad)
 		}
+	}
+}
+
+func TestRestorePreImportBackup_RejectsInvalidConfigBeforeMovingCurrentData(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	cfgDir := configDir()
+	parent := filepath.Dir(cfgDir)
+	if err := os.MkdirAll(cfgDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	current := []byte("projects: []\n")
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), current, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	name := preImportPrefix + "invalid"
+	target := filepath.Join(parent, name)
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "config.yaml"), []byte("projects: [broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := NewStudio().RestorePreImportBackup(name)
+	if err == nil || !strings.Contains(err.Error(), "invalid config.yaml") || result != nil {
+		t.Fatalf("result=%+v error=%v, want config preflight rejection", result, err)
+	}
+	got, readErr := os.ReadFile(filepath.Join(cfgDir, "config.yaml"))
+	if readErr != nil || !bytes.Equal(got, current) {
+		t.Fatalf("current config moved by rejected restore: content=%q err=%v", got, readErr)
+	}
+	if _, statErr := os.Stat(target); statErr != nil {
+		t.Fatalf("invalid snapshot was consumed: %v", statErr)
+	}
+	claims, globErr := filepath.Glob(filepath.Join(parent, restoreClaimPrefix+"*"))
+	if globErr != nil || len(claims) != 0 {
+		t.Fatalf("invalid snapshot leaked restore claims: %v (glob error: %v)", claims, globErr)
+	}
+}
+
+func TestRestorePreImportBackup_PromotesClaimedSnapshotNotRecreatedName(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	cfgDir := configDir()
+	parent := filepath.Dir(cfgDir)
+	if err := os.MkdirAll(cfgDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	current := []byte("projects: []\nsettings:\n  theme: dark\n")
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), current, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	name := preImportPrefix + "selected"
+	target := filepath.Join(parent, name)
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	selected := []byte("projects: []\nsettings:\n  theme: light\n")
+	if err := os.WriteFile(filepath.Join(target, "config.yaml"), selected, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	recreated := []byte("projects: []\nsettings:\n  theme: system\n")
+	previousRename := configDirRename
+	swapped := false
+	configDirRename = func(oldPath, newPath string) error {
+		if oldPath == target && strings.HasPrefix(filepath.Base(newPath), restoreClaimPrefix) {
+			if err := previousRename(oldPath, newPath); err != nil {
+				return err
+			}
+			if err := os.Mkdir(target, 0o700); err != nil {
+				return err
+			}
+			if err := os.WriteFile(filepath.Join(target, "config.yaml"), recreated, 0o600); err != nil {
+				return err
+			}
+			swapped = true
+			return nil
+		}
+		return previousRename(oldPath, newPath)
+	}
+	t.Cleanup(func() { configDirRename = previousRename })
+
+	result, err := NewStudio().RestorePreImportBackup(name)
+	if err != nil {
+		t.Fatalf("RestorePreImportBackup: %v", err)
+	}
+	if !swapped {
+		t.Fatal("test did not recreate the public snapshot name after claim")
+	}
+	active, readErr := os.ReadFile(filepath.Join(cfgDir, "config.yaml"))
+	if readErr != nil || !bytes.Equal(active, selected) {
+		t.Fatalf("active config=%q err=%v, want originally selected snapshot", active, readErr)
+	}
+	leftAtName, readErr := os.ReadFile(filepath.Join(target, "config.yaml"))
+	if readErr != nil || !bytes.Equal(leftAtName, recreated) {
+		t.Fatalf("recreated public snapshot=%q err=%v, want untouched replacement", leftAtName, readErr)
+	}
+	previous, readErr := os.ReadFile(filepath.Join(result.PreBackupPath, "config.yaml"))
+	if readErr != nil || !bytes.Equal(previous, current) {
+		t.Fatalf("safety snapshot=%q err=%v, want previous active config", previous, readErr)
+	}
+}
+
+func TestRestorePreImportBackup_PromotionFailureReturnsClaimAndCurrentData(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	cfgDir := configDir()
+	parent := filepath.Dir(cfgDir)
+	if err := os.MkdirAll(cfgDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	current := []byte("projects: []\nsettings:\n  theme: dark\n")
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), current, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	name := preImportPrefix + "promotion-failure"
+	target := filepath.Join(parent, name)
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	selected := []byte("projects: []\nsettings:\n  theme: light\n")
+	if err := os.WriteFile(filepath.Join(target, "config.yaml"), selected, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	previousRename := configDirRename
+	configDirRename = func(oldPath, newPath string) error {
+		if strings.HasPrefix(filepath.Base(oldPath), restoreClaimPrefix) && newPath == cfgDir {
+			return errors.New("injected claimed-snapshot promotion failure")
+		}
+		return previousRename(oldPath, newPath)
+	}
+	t.Cleanup(func() { configDirRename = previousRename })
+
+	result, err := NewStudio().RestorePreImportBackup(name)
+	if err == nil || result != nil || !strings.Contains(err.Error(), "previous data restored") {
+		t.Fatalf("result=%+v error=%v, want rollback report", result, err)
+	}
+	active, readErr := os.ReadFile(filepath.Join(cfgDir, "config.yaml"))
+	if readErr != nil || !bytes.Equal(active, current) {
+		t.Fatalf("active config=%q err=%v, want original current data", active, readErr)
+	}
+	returned, readErr := os.ReadFile(filepath.Join(target, "config.yaml"))
+	if readErr != nil || !bytes.Equal(returned, selected) {
+		t.Fatalf("returned snapshot=%q err=%v, want selected data", returned, readErr)
+	}
+	if info, statErr := os.Stat(target); statErr != nil {
+		t.Fatal(statErr)
+	} else if got := info.Mode().Perm(); got != 0o755 {
+		t.Fatalf("returned snapshot mode=%#o, want original 0755", got)
+	}
+	claims, globErr := filepath.Glob(filepath.Join(parent, restoreClaimPrefix+"*"))
+	if globErr != nil || len(claims) != 0 {
+		t.Fatalf("promotion failure leaked restore claims: %v (glob error: %v)", claims, globErr)
+	}
+}
+
+func TestSnapshotClaimProtectsFromCleanupAndRestoresOriginalAge(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	parent := filepath.Dir(configDir())
+	original := filepath.Join(parent, preImportPrefix+"old-selected")
+	if err := os.Mkdir(original, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	originalTime := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+	if err := os.Chtimes(original, originalTime, originalTime); err != nil {
+		t.Fatal(err)
+	}
+	claimedAt := time.Now().Round(time.Second)
+	previousNow := archivePathNow
+	archivePathNow = func() time.Time { return claimedAt }
+	t.Cleanup(func() { archivePathNow = previousNow })
+
+	claim, err := claimSnapshotDir(original, parent)
+	if err != nil {
+		t.Fatalf("claimSnapshotDir: %v", err)
+	}
+	claimedInfo, err := os.Stat(claim.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimedInfo.ModTime().Equal(claimedAt) {
+		t.Fatalf("claim mtime=%v, want fresh protection time %v", claimedInfo.ModTime(), claimedAt)
+	}
+	// Even if the mtime refresh is lost (for example the process dies between
+	// Rename and Chtimes), the timestamp embedded in the claim name protects it
+	// from another process's age-based cleanup.
+	if err := os.Chtimes(claim.path, originalTime, originalTime); err != nil {
+		t.Fatal(err)
+	}
+	cleanup, err := NewStudio().CleanupOldData(CleanupParams{PreImportDays: 1})
+	if err != nil {
+		t.Fatalf("CleanupOldData: %v", err)
+	}
+	if cleanup.PreImportDirsRemoved != 0 {
+		t.Fatalf("cleanup removed a live restore claim: %+v", cleanup)
+	}
+	if _, err := os.Stat(claim.path); err != nil {
+		t.Fatalf("cleanup touched live restore claim: %v", err)
+	}
+	cause := errors.New("injected validation failure")
+	if got := returnClaimedSnapshot(claim, cause); !errors.Is(got, cause) {
+		t.Fatalf("returnClaimedSnapshot error=%v, want wrapped cause", got)
+	}
+	returnedInfo, err := os.Stat(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !returnedInfo.ModTime().Equal(originalTime) {
+		t.Fatalf("returned snapshot mtime=%v, want original %v", returnedInfo.ModTime(), originalTime)
+	}
+	if _, err := os.Stat(claim.path); !os.IsNotExist(err) {
+		t.Fatalf("claim path remained after return: %v", err)
+	}
+}
+
+func TestRestorePreImportBackup_RejectsSymlinkWithoutTouchingTarget(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	parent := filepath.Dir(configDir())
+	external := filepath.Join(t.TempDir(), "external")
+	if err := os.Mkdir(external, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	externalTime := time.Date(2024, 2, 3, 4, 5, 6, 0, time.UTC)
+	if err := os.Chtimes(external, externalTime, externalTime); err != nil {
+		t.Fatal(err)
+	}
+	name := preImportPrefix + "symlink"
+	link := filepath.Join(parent, name)
+	if err := os.Symlink(external, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	result, err := NewStudio().RestorePreImportBackup(name)
+	if err == nil || result != nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("result=%+v error=%v, want symlink rejection", result, err)
+	}
+	info, statErr := os.Stat(external)
+	if statErr != nil {
+		t.Fatal(statErr)
+	}
+	if !info.ModTime().Equal(externalTime) {
+		t.Fatalf("external symlink target mtime=%v, want untouched %v", info.ModTime(), externalTime)
+	}
+	returned, lstatErr := os.Lstat(link)
+	if lstatErr != nil {
+		t.Fatalf("rejected snapshot symlink was not returned: %v", lstatErr)
+	}
+	if returned.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("rejected snapshot path mode=%v, want symlink", returned.Mode())
 	}
 }
 

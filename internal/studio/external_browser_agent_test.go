@@ -115,6 +115,42 @@ func TestExternalBrowserAgentRequiresActiveFreshTabAndTokenBoundResponse(t *test
 	}
 }
 
+func TestExternalBrowserAgentRegistrySerializesEachExactTab(t *testing.T) {
+	registry := newExternalBrowserAgentRegistry()
+	first := &externalBrowserAgentPending{projectID: "project", sessionID: "session", tabID: "tab", bridgeToken: "first-token", origin: "https://example.com"}
+	if _, err := registry.register("first", first); err != nil {
+		t.Fatalf("register first action: %v", err)
+	}
+	if _, err := registry.register("duplicate-id", &externalBrowserAgentPending{projectID: "project", sessionID: "session", tabID: "tab"}); err == nil || !strings.Contains(err.Error(), "already in progress") {
+		t.Fatalf("same-tab parallel action was not rejected: %v", err)
+	}
+	if _, err := registry.register("other-tab", &externalBrowserAgentPending{projectID: "project", sessionID: "session", tabID: "other"}); err != nil {
+		t.Fatalf("independent tab action rejected: %v", err)
+	}
+	if _, err := registry.register("first", &externalBrowserAgentPending{projectID: "other-project", sessionID: "session", tabID: "tab"}); err == nil || !strings.Contains(err.Error(), "identity already exists") {
+		t.Fatalf("duplicate request identity was not rejected: %v", err)
+	}
+	registry.cleanup("first", first)
+	if _, err := registry.register("after-cleanup", &externalBrowserAgentPending{projectID: "project", sessionID: "session", tabID: "tab"}); err != nil {
+		t.Fatalf("tab remained locked after cleanup: %v", err)
+	}
+	old := &externalBrowserAgentPending{projectID: "old-project", sessionID: "session", tabID: "old-tab", bridgeToken: "old-token", origin: "https://old.example"}
+	if _, err := registry.register("reused", old); err != nil {
+		t.Fatalf("register old identity owner: %v", err)
+	}
+	if err := registry.resolve("reused", old.tabID, old.bridgeToken, `{"error":"done"}`); err != nil {
+		t.Fatalf("resolve old identity owner: %v", err)
+	}
+	replacement := &externalBrowserAgentPending{projectID: "new-project", sessionID: "session", tabID: "new-tab"}
+	if _, err := registry.register("reused", replacement); err != nil {
+		t.Fatalf("reuse released identity: %v", err)
+	}
+	registry.cleanup("reused", old)
+	if _, err := registry.register("probe", &externalBrowserAgentPending{projectID: replacement.projectID, sessionID: replacement.sessionID, tabID: replacement.tabID}); err == nil || !strings.Contains(err.Error(), "already in progress") {
+		t.Fatalf("stale cleanup removed the replacement owner: %v", err)
+	}
+}
+
 func TestExternalBrowserTabStateRejectsWrongTokenAndOrigin(t *testing.T) {
 	s := newStudioForTest(t)
 	project := addTestProject(t, s, "Browser state")

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ginkida/gokin-studio/internal/engine/fileutil"
 	"github.com/ginkida/gokin-studio/internal/engine/logging"
 )
 
@@ -24,6 +25,7 @@ type DelegationMetrics struct {
 
 	configDir string
 	mu        sync.RWMutex
+	writer    fileutil.LatestFileWriter
 }
 
 // PathStats tracks statistics for a specific delegation path.
@@ -84,7 +86,7 @@ func (dm *DelegationMetrics) storagePath() string {
 
 // load loads metrics from disk.
 func (dm *DelegationMetrics) load() error {
-	data, err := os.ReadFile(dm.storagePath())
+	data, err := fileutil.ReadRegularFileLimited(dm.storagePath(), maxOptimizerStoreFileBytes)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -100,6 +102,17 @@ func (dm *DelegationMetrics) load() error {
 	dm.PathMetrics = loaded.PathMetrics
 	dm.RuleWeights = loaded.RuleWeights
 	dm.UpdatedAt = loaded.UpdatedAt
+	if dm.PathMetrics == nil {
+		dm.PathMetrics = make(map[string]*PathStats)
+	}
+	if dm.RuleWeights == nil {
+		dm.RuleWeights = make(map[string]float64)
+	}
+	for path, stats := range dm.PathMetrics {
+		if stats == nil {
+			delete(dm.PathMetrics, path)
+		}
+	}
 
 	return nil
 }
@@ -120,10 +133,23 @@ func (dm *DelegationMetrics) save() ([]byte, error) {
 // writeSnapshot writes pre-serialized data to disk without holding any locks.
 func (dm *DelegationMetrics) writeSnapshot(data []byte) error {
 	dir := filepath.Dir(dm.storagePath())
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(dm.storagePath(), data, 0644)
+	return dm.writer.Write(dm.storagePath(), data, 0o600)
+}
+
+func (dm *DelegationMetrics) scheduleSnapshot(data []byte) {
+	dir := filepath.Dir(dm.storagePath())
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		logging.Debug("failed to create delegation metrics directory", "error", err)
+		return
+	}
+	dm.writer.Schedule(dm.storagePath(), data, 0o600, func(err error) {
+		if err != nil {
+			logging.Debug("failed to save delegation metrics", "error", err)
+		}
+	})
 }
 
 // RecordExecution records the outcome of a delegation.
@@ -182,11 +208,7 @@ func (dm *DelegationMetrics) RecordExecution(fromAgent, toAgent, contextType str
 		logging.Debug("failed to serialize delegation metrics", "error", err)
 		return
 	}
-	go func() {
-		if err := dm.writeSnapshot(snapshot); err != nil {
-			logging.Debug("failed to save delegation metrics", "error", err)
-		}
-	}()
+	dm.scheduleSnapshot(snapshot)
 }
 
 // evictOldest removes the oldest paths by LastUsed until map is at maxSize.

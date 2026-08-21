@@ -7,6 +7,108 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## Release v2.1.0 (2026-08-21)
+
+A feature release on top of v2.0.0: 127 modified files and 101 new ones
+(+13.4k lines). The headline is **cross-project delegation**, which replaces the
+retired `ask_agent` bridge; alongside it ship **Windows/WSL execution routing**
+and an engine-agent reliability pass. Config format and the GLM/Kimi provider
+contract are unchanged — a v2.0.0 config loads as-is.
+
+### Cross-project delegation
+
+- **`delegate` tool** (`internal/engine/tools/delegate.go`) with `list` / `ask` /
+  `run` / `batch` / `status` / `fetch` / `cancel`. It replaces `ask_agent`, whose
+  fixed `target_role` enum and "first other project" fallback left the target
+  ambiguous; the Studio bridge (`internal/studio/messenger.go`,
+  `tools.AskAgentTool`) is removed rather than kept as a fallback.
+- **Targets describe themselves.** `project_profile.go` adds user-authored
+  `Description` + `Capabilities` per project; `groups.go` adds project groups
+  (member-facing shared context) and a `DelegationPolicy` of `any` (default) /
+  `group` / `off`. `delegate list` returns the real project IDs and their
+  reachability instead of a role enum.
+- **Real work, real checkout.** `delegation.go` runs a delegated task as a child
+  session in the target's own worktree, monitors it, and returns a bounded
+  envelope; `delegation_batch.go` performs a bounded fan-out and queues the
+  synthesis turn back in the caller's own chat. Fan-out atomically reserves every
+  target before creating a paid turn, so a concurrent run cannot leave a
+  partially-started batch.
+- **Durable records.** `delegation_runs.go` persists each run
+  (`delegation_runs.json`, 0600, atomic, bounded). Store read/write failure fails
+  closed: the child and its queue stop, recoverable bytes are not overwritten,
+  and one terminal `storage_error` reaches the caller.
+- **Hop guard before every gate.** `delegation_guard.go` evaluates hop depth and
+  cycles *before* every permission gate, Skip mode included — a structurally
+  refused delegation is never something the user is asked to approve, and no
+  permissive mode can wave it through.
+- **Blocked calls are reported.** `recordDeniedTool` marks tool calls a target
+  refused, so the caller reads the answer as possibly incomplete rather than
+  authoritative.
+- **UI:** `stores/delegationStore.ts`, `components/dispatch/DelegationsPanel.tsx`,
+  a StatusBar indicator, and live delegation events routed through
+  `useWailsEvents.ts`.
+
+### Windows / WSL
+
+- **New `internal/engine/wsl` package.** `ApplyExec` retargets an
+  already-constructed `*exec.Cmd` into a distro instead of rebuilding it, so
+  attached stdout/stderr writers, context, `WaitDelay`, and process attributes
+  survive. It returns false *without touching the command* for host targets,
+  which is what keeps macOS and Linux on byte-identical code paths.
+- `wsl_status.go` surfaces distro availability and a per-platform unavailability
+  detail; `security/path_validator` translates Linux paths to
+  `\\wsl.localhost\<distro>\...` UNC form.
+- Worktree isolation is skipped for WSL projects with an explicit
+  `IsolationSkippedReason` — the repository lives inside the distro while the
+  worktree would land on the Windows drive.
+- Platform-split durable file publication: `replace_file_{unix,windows}.go`,
+  `fileutil/atomic_replace_{unix,windows}.go`, `archive_open_flags_*.go`.
+- `scripts/wslprobe` is a standalone probe for verifying distro behavior.
+
+### Engine agent hardening
+
+- `callback_safety.go` — observer/callback invocation can no longer take the
+  runner down with it.
+- `runner_panic.go` — panic barrier around agent runs, with the result surfaced
+  rather than swallowed.
+- `coordinate_tool_adapter.go` + `tool_runner_adapter.go` — the execution
+  adapters the engine Runner installs for `task` / `coordinate`.
+- **Studio no longer advertises what it cannot execute.** `newStudioToolRegistry`
+  unregisters `task` and `coordinate`: studio has its own session/delegation
+  execution model and never installs those adapters, so advertising them was a
+  capability the model could call but nothing could run. `task_output` /
+  `task_stop` remain for background shell commands started by `bash`.
+- **`request_tool` retired.** Specialist toolsets are immutable for their run, so
+  Explore / Plan / Guide / dynamic agents can no longer add write or shell
+  capability mid-run, and `tools_list` reports the exact filtered registry
+  instead of advertising inaccessible tools.
+
+### Session lifecycle races
+
+- **`queueHalt` hand-off.** Stop could land after `startMessage` synchronously
+  claimed the queue worker but before the goroutine established `cancelFn` — a
+  micro-phase with no context to cancel. `queueHalt` is now the durable bit,
+  checked before client initialization (which may allocate transports or start
+  MCP children) and again at the idle→active transition, so the first provider
+  request is never sent after the user or a task deletion already stopped the
+  session.
+- **Delegation stamp consumed under a write lock.** The incoming-delegation
+  marker is read and cleared in one critical section, so it cannot leak into the
+  next — possibly human-initiated — turn of the same session.
+
+### Testing and hygiene
+
+- Test functions: **1438** studio, **1355** engine (of which 907 in `tools`), and
+  **100** frontend. 70 new test files. Statement coverage: 78.7% studio,
+  53.7% `engine/tools`.
+- The frontend suite is `node --test` over logic extracted out of the
+  megacomponents into `src/lib` (`backupImport`, `download`, `onboarding`,
+  delegation store/panel, preview and ask-user lifecycles, tool presentation,
+  workspace split-tree) — testable without a DOM runner.
+- Full suite is race-clean; `go vet`, `gofmt`, and `tsc --noEmit` are clean.
+
+---
+
 ## Release v2.0.0 (2026-08-10)
 
 The Claude Desktop / Cowork parity release, and the largest single release so far:

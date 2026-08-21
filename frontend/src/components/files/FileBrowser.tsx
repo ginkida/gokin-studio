@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import type { CSSProperties } from 'react'
 import { useProjectStore } from '../../stores/projectStore'
 import { ListSessionDirectory } from '../../../wailsjs/go/studio/Studio'
@@ -54,12 +54,25 @@ export function FileBrowser({
   const activeProject = useProjectStore((s) => s.projects.find((p) => p.id === s.activeProjectId))
   const [refreshKey, setRefreshKey] = useState(0)
   const [localArtifactPath, setLocalArtifactPath] = useState<string | null>(null)
+  const [controlledArtifactPath, setControlledArtifactPath] = useState<string | null>(artifactPath ?? null)
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null)
   const [fileDirty, setFileDirty] = useState(false)
+  const [fileSaving, setFileSaving] = useState(false)
   const [requestConfirmation, confirmationDialog] = useConfirmDialog()
+  const artifactSelectionRequestRef = useRef(0)
+  const onArtifactPathChangeRef = useRef(onArtifactPathChange)
   const refresh = useCallback(() => setRefreshKey((k) => k + 1), [])
-  const selectedArtifact = artifactPath === undefined ? localArtifactPath : artifactPath
-  const setSelectedArtifact = onArtifactPathChange || setLocalArtifactPath
+  const artifactControlled = artifactPath !== undefined
+  const selectedArtifact = artifactControlled ? controlledArtifactPath : localArtifactPath
+  const setSelectedArtifact = useCallback((path: string | null) => {
+    if (artifactControlled) setControlledArtifactPath(path)
+    else setLocalArtifactPath(path)
+    onArtifactPathChangeRef.current?.(path)
+  }, [artifactControlled])
+
+  useEffect(() => {
+    onArtifactPathChangeRef.current = onArtifactPathChange
+  }, [onArtifactPathChange])
   const { width: fileListWidth, updateWidth: setFileListWidth } = usePersistentPanelWidth(
     'gokin:file-preview-list-width',
     FILE_LIST_DEFAULT_WIDTH,
@@ -68,6 +81,9 @@ export function FileBrowser({
   )
 
   const confirmFileNavigation = useCallback(async () => {
+    // The native save is already committed to an exact path and cannot be
+    // cancelled. Do not offer a contradictory "Discard" route while it runs.
+    if (fileSaving) return false
     if (!fileDirty) return true
     return requestConfirmation({
       title: 'Discard unsaved file edits?',
@@ -76,7 +92,7 @@ export function FileBrowser({
       cancelLabel: 'Keep editing',
       danger: true,
     })
-  }, [fileDirty, requestConfirmation, selectedFilePath])
+  }, [fileDirty, fileSaving, requestConfirmation, selectedFilePath])
 
   const openTextFile = useCallback(async (path: string | null) => {
     if (path === selectedFilePath) return
@@ -87,13 +103,35 @@ export function FileBrowser({
     setFileDirty(false)
   }, [activeProjectId, confirmFileNavigation, fileDirty, selectedFilePath, sessionID, setSelectedArtifact])
 
-  const openOfficeArtifact = useCallback(async (path: string) => {
-    if (selectedFilePath && !(await confirmFileNavigation())) return
+  const openOfficeArtifact = useCallback(async (path: string): Promise<boolean> => {
+    if (selectedFilePath && !(await confirmFileNavigation())) return false
     if (fileDirty && selectedFilePath && activeProjectId) discardCachedSessionFileDraft(activeProjectId, sessionID, selectedFilePath)
     setSelectedFilePath(null)
     setFileDirty(false)
     setSelectedArtifact(path)
+    return true
   }, [activeProjectId, confirmFileNavigation, fileDirty, selectedFilePath, sessionID, setSelectedArtifact])
+
+  // Top-level Files receives artifact selections from chat/diff navigation as
+  // a controlled prop. Stage that request behind the same dirty/save gate as a
+  // local tree click instead of letting the prop hide the editor immediately.
+  useEffect(() => {
+    if (!artifactControlled || artifactPath === controlledArtifactPath) return
+    const requested = artifactPath
+    const previous = controlledArtifactPath
+    const request = ++artifactSelectionRequestRef.current
+    if (requested === null) {
+      setControlledArtifactPath(null)
+      return
+    }
+    void openOfficeArtifact(requested).then((accepted) => {
+      if (artifactSelectionRequestRef.current !== request || accepted) return
+      onArtifactPathChangeRef.current?.(previous)
+    })
+    return () => {
+      if (artifactSelectionRequestRef.current === request) artifactSelectionRequestRef.current += 1
+    }
+  }, [artifactControlled, artifactPath, controlledArtifactPath, openOfficeArtifact])
 
   useEffect(() => {
     const handler = (event: Event) => {
@@ -127,6 +165,7 @@ export function FileBrowser({
     <div
       className={`file-browser ${selectedArtifact || selectedFilePath ? 'has-artifact' : ''}`}
       style={{ '--preview-list-width': `${fileListWidth}px` } as CSSProperties}
+      aria-busy={fileSaving}
     >
       <div className="file-browser-pane">
         <div className="file-browser-header">
@@ -139,6 +178,7 @@ export function FileBrowser({
         <div className="file-browser-guide">
           <span><PanelsTopLeft size={10} /> HTML, PDF, image, and video files open in Preview</span>
           <span><MessageSquare size={10} /> Text files open here and can be added to chat</span>
+          {fileSaving && <span className="file-browser-saving" role="status" aria-live="polite"><Loader size={10} className="spin" /> Saving open file… File switching is paused.</span>}
         </div>
         <div className="file-browser-tree">
           <DirectoryNode
@@ -167,6 +207,7 @@ export function FileBrowser({
             onChange={setFileListWidth}
           />
           <ArtifactPreview
+            key={`${activeProjectId}:${sessionID}:${selectedArtifact}`}
             projectID={activeProjectId}
             sessionID={sessionID}
             path={selectedArtifact}
@@ -188,11 +229,13 @@ export function FileBrowser({
             onChange={setFileListWidth}
           />
           <FileEditor
+            key={`${activeProjectId}:${sessionID}:${selectedFilePath}`}
             projectID={activeProjectId}
             sessionID={sessionID}
             path={selectedFilePath}
             active={isActive}
             onDirtyChange={setFileDirty}
+            onSavingChange={setFileSaving}
             onRequestClose={() => { void openTextFile(null) }}
           />
         </>
@@ -220,7 +263,7 @@ function DirectoryNode({
   selectedArtifact: string | null
   selectedFile: string | null
   onOpenArtifact: (path: string | null) => void
-  onOpenOfficeArtifact: (path: string) => void | Promise<void>
+  onOpenOfficeArtifact: (path: string) => void | Promise<unknown>
   onOpenFile: (path: string | null) => void | Promise<void>
 }) {
   const [entries, setEntries] = useState<FileEntry[]>([])
@@ -228,13 +271,23 @@ function DirectoryNode({
   const [loaded, setLoaded] = useState(false)
   const [loadError, setLoadError] = useState(false)
   const [focusedPath, setFocusedPath] = useState('')
+  const requestRef = useRef(0)
 
   useEffect(() => {
     if (expanded && !loaded) {
+      const request = ++requestRef.current
       ListSessionDirectory(projectId, sessionId, path).then((result) => {
+        if (requestRef.current !== request) return
         if (result) setEntries(result as FileEntry[])
         setLoaded(true)
-      }).catch(() => { setLoaded(true); setLoadError(true) })
+      }).catch(() => {
+        if (requestRef.current !== request) return
+        setLoaded(true)
+        setLoadError(true)
+      })
+      return () => {
+        if (requestRef.current === request) requestRef.current += 1
+      }
     }
   }, [expanded, loaded, projectId, sessionId, path])
 
@@ -346,7 +399,7 @@ function FileNode({
   selectedArtifact: string | null
   selectedFile: string | null
   onOpenArtifact: (path: string | null) => void
-  onOpenOfficeArtifact: (path: string) => void | Promise<void>
+  onOpenOfficeArtifact: (path: string) => void | Promise<unknown>
   onOpenFile: (path: string | null) => void | Promise<void>
   focusedPath: string
   onFocusPath: (path: string) => void
@@ -355,6 +408,9 @@ function FileNode({
   const [children, setChildren] = useState<FileEntry[]>([])
   const [loaded, setLoaded] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
+  const requestRef = useRef(0)
+
+  useEffect(() => () => { requestRef.current += 1 }, [])
 
   const handleToggle = () => {
     if (!entry.isDir) return
@@ -363,13 +419,16 @@ function FileNode({
     // Collapsing never triggers a load.
     const willExpand = !expanded
     if (willExpand && (!loaded || loadError)) {
+      const request = ++requestRef.current
       setLoaded(false)
       setLoadError(null)
       setChildren([])
       ListSessionDirectory(projectId, sessionId, entry.path).then((result) => {
+        if (requestRef.current !== request) return
         if (result) setChildren(result as FileEntry[])
         setLoaded(true)
       }).catch((err) => {
+        if (requestRef.current !== request) return
         setLoaded(true)
         setLoadError(String(err?.message || err || 'Failed to read directory'))
       })

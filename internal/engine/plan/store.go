@@ -8,12 +8,17 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/ginkida/gokin-studio/internal/engine/fileutil"
 )
+
+const maxPlanStoreFileBytes int64 = 64 << 20
 
 // PlanStore provides persistent storage for plan states.
 type PlanStore struct {
-	dir string
-	mu  sync.RWMutex
+	dir            string
+	mu             sync.RWMutex
+	beforeSaveLock func() // deterministic publication-order test seam
 }
 
 // PlanInfo contains metadata about a stored plan.
@@ -35,7 +40,7 @@ type PlanInfo struct {
 // configDir should be the base config directory (e.g., ~/.config/gokin).
 func NewPlanStore(configDir string) (*PlanStore, error) {
 	dir := filepath.Join(configDir, "plans")
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("failed to create plans directory: %w", err)
 	}
 
@@ -50,21 +55,28 @@ func (s *PlanStore) Save(plan *Plan) error {
 		return fmt.Errorf("cannot save nil plan")
 	}
 
-	// Snapshot plan data under plan's lock to prevent data races
-	// with concurrent CompleteStep/FailStep/StartStep calls.
+	if s.beforeSaveLock != nil {
+		s.beforeSaveLock()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Reserve the store's publication order before taking the plan snapshot.
+	// Previously two concurrent saves could snapshot old/new in order, acquire
+	// this lock in reverse order, and leave the older plan on disk.
 	plan.mu.RLock()
-	data, err := json.MarshalIndent(plan, "", "  ")
 	planID := plan.ID
+	if err := fileutil.ValidateStoreID("plan", planID); err != nil {
+		plan.mu.RUnlock()
+		return err
+	}
+	data, err := json.MarshalIndent(plan, "", "  ")
 	plan.mu.RUnlock()
 	if err != nil {
 		return fmt.Errorf("failed to marshal plan: %w", err)
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	filePath := filepath.Join(s.dir, planID+".json")
-	if err := os.WriteFile(filePath, data, 0644); err != nil {
+	if err := fileutil.AtomicWrite(filePath, data, 0o600); err != nil {
 		return fmt.Errorf("failed to write plan: %w", err)
 	}
 
@@ -73,11 +85,14 @@ func (s *PlanStore) Save(plan *Plan) error {
 
 // Load loads a plan from disk by ID.
 func (s *PlanStore) Load(planID string) (*Plan, error) {
+	if err := fileutil.ValidateStoreID("plan", planID); err != nil {
+		return nil, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	filePath := filepath.Join(s.dir, planID+".json")
-	data, err := os.ReadFile(filePath)
+	data, err := fileutil.ReadRegularFileLimited(filePath, maxPlanStoreFileBytes)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("plan not found: %s", planID)
@@ -88,6 +103,9 @@ func (s *PlanStore) Load(planID string) (*Plan, error) {
 	var plan Plan
 	if err := json.Unmarshal(data, &plan); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal plan: %w", err)
+	}
+	if plan.ID != planID {
+		return nil, fmt.Errorf("plan ID mismatch: requested %s, file contains %s", planID, plan.ID)
 	}
 	plan.EnsureStepContracts()
 
@@ -113,14 +131,21 @@ func (s *PlanStore) LoadLast(workDir string) (*Plan, error) {
 			continue
 		}
 
+		planID := entry.Name()[:len(entry.Name())-len(".json")]
+		if !fileutil.SafeFilenameComponent(planID) {
+			continue
+		}
 		filePath := filepath.Join(s.dir, entry.Name())
-		data, err := os.ReadFile(filePath)
+		data, err := fileutil.ReadRegularFileLimited(filePath, maxPlanStoreFileBytes)
 		if err != nil {
 			continue
 		}
 
 		plan := new(Plan)
 		if err := json.Unmarshal(data, plan); err != nil {
+			continue
+		}
+		if plan.ID != planID {
 			continue
 		}
 		plan.EnsureStepContracts()
@@ -198,14 +223,21 @@ func (s *PlanStore) List() ([]PlanInfo, error) {
 			continue
 		}
 
+		planID := entry.Name()[:len(entry.Name())-len(".json")]
+		if !fileutil.SafeFilenameComponent(planID) {
+			continue
+		}
 		filePath := filepath.Join(s.dir, entry.Name())
-		data, err := os.ReadFile(filePath)
+		data, err := fileutil.ReadRegularFileLimited(filePath, maxPlanStoreFileBytes)
 		if err != nil {
 			continue
 		}
 
 		var plan Plan
 		if err := json.Unmarshal(data, &plan); err != nil {
+			continue
+		}
+		if plan.ID != planID {
 			continue
 		}
 
@@ -261,6 +293,9 @@ func (s *PlanStore) ListResumable(workDir string) ([]PlanInfo, error) {
 
 // Delete removes a plan from disk.
 func (s *PlanStore) Delete(planID string) error {
+	if err := fileutil.ValidateStoreID("plan", planID); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -295,14 +330,21 @@ func (s *PlanStore) Cleanup(maxAge time.Duration) (int, error) {
 			continue
 		}
 
+		planID := entry.Name()[:len(entry.Name())-len(".json")]
+		if !fileutil.SafeFilenameComponent(planID) {
+			continue
+		}
 		filePath := filepath.Join(s.dir, entry.Name())
-		data, err := os.ReadFile(filePath)
+		data, err := fileutil.ReadRegularFileLimited(filePath, maxPlanStoreFileBytes)
 		if err != nil {
 			continue
 		}
 
 		var plan Plan
 		if err := json.Unmarshal(data, &plan); err != nil {
+			continue
+		}
+		if plan.ID != planID {
 			continue
 		}
 
@@ -324,12 +366,14 @@ func (s *PlanStore) Cleanup(maxAge time.Duration) (int, error) {
 
 // Exists checks if a plan exists.
 func (s *PlanStore) Exists(planID string) bool {
+	if !fileutil.SafeFilenameComponent(planID) {
+		return false
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	filePath := filepath.Join(s.dir, planID+".json")
-	_, err := os.Stat(filePath)
-	return err == nil
+	return fileutil.RegularFileExists(filePath)
 }
 
 // truncateString truncates a string to maxLen with ellipsis.

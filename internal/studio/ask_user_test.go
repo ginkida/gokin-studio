@@ -9,7 +9,10 @@ import (
 
 func TestAnswerQuestionResolvesPending(t *testing.T) {
 	r := newAskUserRegistry()
-	ch := r.register("qid-1")
+	ch, ok := r.register("qid-1")
+	if !ok {
+		t.Fatal("register returned false")
+	}
 
 	// Resolver runs concurrently; consumer blocks on the channel.
 	go func() {
@@ -38,8 +41,11 @@ func TestResolveUnknownReturnsFalse(t *testing.T) {
 
 func TestCleanupRemovesEntry(t *testing.T) {
 	r := newAskUserRegistry()
-	r.register("qid-2")
-	r.cleanup("qid-2")
+	ch, ok := r.register("qid-2")
+	if !ok {
+		t.Fatal("register returned false")
+	}
+	r.cleanup("qid-2", ch)
 	if r.resolve("qid-2", "x") {
 		t.Error("after cleanup, resolve should miss")
 	}
@@ -47,7 +53,10 @@ func TestCleanupRemovesEntry(t *testing.T) {
 
 func TestStudioAnswerQuestion(t *testing.T) {
 	s := NewStudio()
-	ch := s.askUsers.register("qid-3")
+	ch, ok := s.askUsers.register("qid-3")
+	if !ok {
+		t.Fatal("register returned false")
+	}
 
 	if err := s.AnswerQuestion("qid-3", "yes"); err != nil {
 		t.Fatalf("AnswerQuestion error: %v", err)
@@ -68,7 +77,10 @@ func TestStudioAnswerQuestion(t *testing.T) {
 
 func TestStudioCancelQuestion(t *testing.T) {
 	s := NewStudio()
-	ch := s.askUsers.register("qid-4")
+	ch, ok := s.askUsers.register("qid-4")
+	if !ok {
+		t.Fatal("register returned false")
+	}
 	if err := s.CancelQuestion("qid-4"); err != nil {
 		t.Fatalf("CancelQuestion error: %v", err)
 	}
@@ -141,7 +153,10 @@ func TestCancelQuestion_UnknownID(t *testing.T) {
 // sends AND closes).
 func TestCancelRegistry_ClosesChannel(t *testing.T) {
 	r := newAskUserRegistry()
-	ch := r.register("qid-cancel")
+	ch, ok := r.register("qid-cancel")
+	if !ok {
+		t.Fatal("register returned false")
+	}
 
 	if !r.cancel("qid-cancel") {
 		t.Fatal("cancel returned false for registered ID")
@@ -165,7 +180,10 @@ func TestCancelRegistry_ClosesChannel(t *testing.T) {
 func TestAskUserRegistryResolveCancelRaceHasSingleWinner(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		r := newAskUserRegistry()
-		ch := r.register("qid-race")
+		ch, ok := r.register("qid-race")
+		if !ok {
+			t.Fatal("register returned false")
+		}
 		start := make(chan struct{})
 		results := make(chan bool, 2)
 		var wg sync.WaitGroup
@@ -198,5 +216,116 @@ func TestAskUserRegistryResolveCancelRaceHasSingleWinner(t *testing.T) {
 				t.Fatalf("iteration %d left resolved channel open", i)
 			}
 		}
+	}
+}
+
+func TestAskUserRegistryRejectsDuplicateWithoutOrphaningOriginal(t *testing.T) {
+	r := newAskUserRegistry()
+	original, ok := r.register("same-id")
+	if !ok {
+		t.Fatal("first register returned false")
+	}
+	if duplicate, ok := r.register("same-id"); ok || duplicate != nil {
+		t.Fatalf("duplicate register = (%v, %v), want (nil, false)", duplicate, ok)
+	}
+	if !r.resolve("same-id", "original answer") {
+		t.Fatal("original owner was not resolvable")
+	}
+	if got := <-original; got != "original answer" {
+		t.Fatalf("original owner received %q", got)
+	}
+}
+
+func TestAskUserRegistryStaleCleanupCannotDeleteReplacement(t *testing.T) {
+	r := newAskUserRegistry()
+	old, ok := r.register("reused-id")
+	if !ok {
+		t.Fatal("old register returned false")
+	}
+	if !r.resolve("reused-id", "old answer") {
+		t.Fatal("old resolve returned false")
+	}
+	if got := <-old; got != "old answer" {
+		t.Fatalf("old owner received %q", got)
+	}
+
+	replacement, ok := r.register("reused-id")
+	if !ok {
+		t.Fatal("replacement register returned false")
+	}
+	r.cleanup("reused-id", old)
+	if !r.resolve("reused-id", "new answer") {
+		t.Fatal("stale cleanup deleted replacement owner")
+	}
+	if got := <-replacement; got != "new answer" {
+		t.Fatalf("replacement owner received %q", got)
+	}
+}
+
+func TestAskUserRegistrySerializesExactRouteOnly(t *testing.T) {
+	r := newAskUserRegistry()
+	releaseFirst, err := r.acquireRoute(context.Background(), "project", "chat")
+	if err != nil {
+		t.Fatalf("acquire first route: %v", err)
+	}
+
+	acquiredSame := make(chan func(), 1)
+	go func() {
+		release, acquireErr := r.acquireRoute(context.Background(), "project", "chat")
+		if acquireErr == nil {
+			acquiredSame <- release
+		}
+	}()
+	select {
+	case release := <-acquiredSame:
+		release()
+		t.Fatal("same route acquired before its predecessor released")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	releaseOther, err := r.acquireRoute(context.Background(), "project", "other-chat")
+	if err != nil {
+		t.Fatalf("independent route was blocked: %v", err)
+	}
+	releaseOther()
+
+	releaseFirst()
+	select {
+	case release := <-acquiredSame:
+		release()
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("queued route did not acquire after release")
+	}
+}
+
+func TestAskUserRegistryRouteWaitHonorsCancellation(t *testing.T) {
+	r := newAskUserRegistry()
+	release, err := r.acquireRoute(context.Background(), "project", "chat")
+	if err != nil {
+		t.Fatalf("acquire held route: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, acquireErr := r.acquireRoute(ctx, "project", "chat")
+		result <- acquireErr
+	}()
+	cancel()
+	select {
+	case acquireErr := <-result:
+		if acquireErr != context.Canceled {
+			t.Fatalf("acquire error = %v, want context.Canceled", acquireErr)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("cancelled route waiter did not return")
+	}
+	release()
+
+	r.mu.Lock()
+	remaining := len(r.routes)
+	r.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("route registry leaked %d entries", remaining)
 	}
 }

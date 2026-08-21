@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ginkida/gokin-studio/internal/engine/chat"
+	"github.com/ginkida/gokin-studio/internal/engine/fileutil"
 	"github.com/ginkida/gokin-studio/internal/engine/logging"
 )
 
@@ -29,6 +30,7 @@ type ContextAgent struct {
 	growthRate    float64 // tokens per second (smoothed)
 
 	mu       sync.Mutex
+	stopOnce sync.Once
 	stopChan chan struct{}
 }
 
@@ -70,7 +72,7 @@ func (a *ContextAgent) Start(ctx context.Context) {
 
 // Stop stops the agent.
 func (a *ContextAgent) Stop() {
-	close(a.stopChan)
+	a.stopOnce.Do(func() { close(a.stopChan) })
 }
 
 // CheckAndCompact checks token usage and triggers compaction if threshold exceeded.
@@ -152,13 +154,13 @@ func (a *ContextAgent) Checkpoint(ctx context.Context) {
 	}
 
 	checkpointDir := filepath.Join(a.storageDir, "checkpoints")
-	if err := os.MkdirAll(checkpointDir, 0755); err != nil {
+	if err := os.MkdirAll(checkpointDir, 0o700); err != nil {
 		logging.Error("failed to create checkpoint dir", "error", err)
 		return
 	}
 
-	timestamp := time.Now().Format("20060102_150405")
-	filename := filepath.Join(checkpointDir, fmt.Sprintf("cp_%s.json", timestamp))
+	now := time.Now()
+	filename := filepath.Join(checkpointDir, fmt.Sprintf("cp_%s_%09d.json", now.Format("20060102_150405"), now.Nanosecond()))
 
 	// Simplified state for checkpoint
 	state := struct {
@@ -166,7 +168,7 @@ func (a *ContextAgent) Checkpoint(ctx context.Context) {
 		Tokens    int
 		History   int // Count of messages
 	}{
-		Timestamp: time.Now(),
+		Timestamp: now,
 		Tokens:    a.manager.GetCurrentTokens(),
 		History:   len(history),
 	}
@@ -177,7 +179,7 @@ func (a *ContextAgent) Checkpoint(ctx context.Context) {
 		return
 	}
 
-	if err := os.WriteFile(filename, data, 0644); err != nil {
+	if err := fileutil.AtomicWrite(filename, data, 0o600); err != nil {
 		logging.Error("failed to write checkpoint", "error", err)
 		return
 	}
@@ -194,19 +196,22 @@ func (a *ContextAgent) rotateCheckpoints(dir string, max int) {
 		return
 	}
 
-	if len(files) <= max {
-		return
-	}
-
 	var checkpoints []os.FileInfo
 	for _, f := range files {
 		if !f.IsDir() && filepath.Ext(f.Name()) == ".json" {
-			info, err := f.Info()
-			if err != nil {
+			path := filepath.Join(dir, f.Name())
+			if !fileutil.RegularFileExists(path) {
+				continue
+			}
+			info, err := os.Lstat(path)
+			if err != nil || !info.Mode().IsRegular() {
 				continue
 			}
 			checkpoints = append(checkpoints, info)
 		}
+	}
+	if len(checkpoints) <= max {
+		return
 	}
 
 	sort.Slice(checkpoints, func(i, j int) bool {

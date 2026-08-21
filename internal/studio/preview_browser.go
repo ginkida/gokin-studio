@@ -20,27 +20,48 @@ const previewBrowserPayloadMaxBytes = 6 << 20
 
 type previewBrowserRegistry struct {
 	mu      sync.Mutex
-	pending map[string]chan string
+	pending map[string]*previewBrowserPending
+}
+
+type previewBrowserPending struct {
+	projectID     string
+	sessionID     string
+	configuration string
+	bridgeToken   string
+	ch            chan string
 }
 
 func newPreviewBrowserRegistry() *previewBrowserRegistry {
-	return &previewBrowserRegistry{pending: make(map[string]chan string)}
+	return &previewBrowserRegistry{pending: make(map[string]*previewBrowserPending)}
 }
-func (r *previewBrowserRegistry) register(id string) chan string {
-	ch := make(chan string, 1)
+func (r *previewBrowserRegistry) register(id string, pending *previewBrowserPending) (chan string, error) {
 	r.mu.Lock()
-	r.pending[id] = ch
-	r.mu.Unlock()
-	return ch
+	defer r.mu.Unlock()
+	if _, exists := r.pending[id]; exists {
+		return nil, fmt.Errorf("preview browser request identity already exists")
+	}
+	for _, existing := range r.pending {
+		if existing.projectID == pending.projectID &&
+			existing.sessionID == pending.sessionID &&
+			existing.configuration == pending.configuration &&
+			existing.bridgeToken == pending.bridgeToken {
+			return nil, fmt.Errorf("another Preview browser action is already in progress for this frame")
+		}
+	}
+	pending.ch = make(chan string, 1)
+	r.pending[id] = pending
+	return pending.ch, nil
 }
-func (r *previewBrowserRegistry) cleanup(id string) {
+func (r *previewBrowserRegistry) cleanup(id string, owner *previewBrowserPending) {
 	r.mu.Lock()
-	delete(r.pending, id)
+	if r.pending[id] == owner {
+		delete(r.pending, id)
+	}
 	r.mu.Unlock()
 }
 func (r *previewBrowserRegistry) resolve(id, payload string) bool {
 	r.mu.Lock()
-	ch, ok := r.pending[id]
+	pending, ok := r.pending[id]
 	if ok {
 		delete(r.pending, id)
 	}
@@ -48,8 +69,8 @@ func (r *previewBrowserRegistry) resolve(id, payload string) bool {
 	if !ok {
 		return false
 	}
-	ch <- payload
-	close(ch)
+	pending.ch <- payload
+	close(pending.ch)
 	return true
 }
 
@@ -76,22 +97,20 @@ func (t *previewBrowserTool) Validate(args map[string]any) error {
 	case "inspect":
 		return nil
 	case "click":
-		if _, ok := tools.GetInt(args, "x"); !ok {
-			return tools.NewValidationError("x", "is required")
-		}
-		if _, ok := tools.GetInt(args, "y"); !ok {
-			return tools.NewValidationError("y", "is required")
+		x, xOK := tools.GetInt(args, "x")
+		y, yOK := tools.GetInt(args, "y")
+		if !xOK || !yOK || x < 0 || y < 0 || x > 10000 || y > 10000 {
+			return tools.NewValidationError("x/y", "must be viewport coordinates between 0 and 10000")
 		}
 	case "fill":
 		text, ok := tools.GetString(args, "text")
 		if !ok || text == "" || len(text) > 4000 || !utf8.ValidString(text) {
 			return tools.NewValidationError("text", "must be non-empty valid UTF-8 up to 4000 bytes")
 		}
-		if _, ok := tools.GetInt(args, "x"); !ok {
-			return tools.NewValidationError("x", "is required")
-		}
-		if _, ok := tools.GetInt(args, "y"); !ok {
-			return tools.NewValidationError("y", "is required")
+		x, xOK := tools.GetInt(args, "x")
+		y, yOK := tools.GetInt(args, "y")
+		if !xOK || !yOK || x < 0 || y < 0 || x > 10000 || y > 10000 {
+			return tools.NewValidationError("x/y", "must be viewport coordinates between 0 and 10000")
 		}
 	case "scroll":
 		value, ok := tools.GetInt(args, "deltaY")
@@ -172,8 +191,12 @@ func (s *Studio) requestPreviewBrowser(ctx context.Context, projectID, sessionID
 	configuration, token := run.config.Name, run.bridgeToken
 	run.mu.RUnlock()
 	id := uuid.NewString()[:12]
-	ch := s.previewBrowser.register(id)
-	defer s.previewBrowser.cleanup(id)
+	pending := &previewBrowserPending{projectID: projectID, sessionID: sessionID, configuration: configuration, bridgeToken: token}
+	ch, err := s.previewBrowser.register(id, pending)
+	if err != nil {
+		return "", err
+	}
+	defer s.previewBrowser.cleanup(id, pending)
 	event := map[string]any{"requestID": id, "projectID": projectID, "sessionID": sessionID, "configuration": configuration, "bridgeToken": token, "args": args}
 	if s.testPreviewBrowserEmitter != nil {
 		s.testPreviewBrowserEmitter(event)
@@ -200,7 +223,7 @@ func (s *Studio) ResolvePreviewBrowserRequest(requestID, payload string) error {
 		return fmt.Errorf("preview response exceeds the allowed size")
 	}
 	var value map[string]any
-	if json.Unmarshal([]byte(payload), &value) != nil {
+	if json.Unmarshal([]byte(payload), &value) != nil || value == nil {
 		return fmt.Errorf("preview response is invalid JSON")
 	}
 	if s.previewBrowser == nil || !s.previewBrowser.resolve(requestID, payload) {

@@ -13,11 +13,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"google.golang.org/genai"
 )
 
 const (
 	maxScheduledTasks       = 64
 	maxScheduledTaskName    = 120
+	maxScheduledTaskError   = 2000
 	maxScheduledTaskFile    = 8 << 20
 	maxScheduledTaskRuns    = 512
 	maxRunsPerScheduledTask = 50
@@ -43,7 +45,8 @@ type ScheduledTask struct {
 	CreatedAt       int64  `json:"createdAt"`
 	NextRunAt       int64  `json:"nextRunAt,omitempty"`
 	LastRunAt       int64  `json:"lastRunAt,omitempty"`
-	LastStatus      string `json:"lastStatus,omitempty"` // running | completed | stopped | error
+	LastRunID       string `json:"lastRunID,omitempty"`
+	LastStatus      string `json:"lastStatus,omitempty"` // dispatching | running | completed | stopped | error
 	LastError       string `json:"lastError,omitempty"`
 	Provider        string `json:"provider,omitempty"`     // glm | kimi
 	Model           string `json:"model,omitempty"`        // provider catalog model
@@ -435,6 +438,7 @@ func (s *Studio) SaveScheduledTask(input ScheduledTask) (ScheduledTask, error) {
 		// Preserve run history across edits.
 		task.CreatedAt = tasks[i].CreatedAt
 		task.LastRunAt = tasks[i].LastRunAt
+		task.LastRunID = tasks[i].LastRunID
 		task.LastStatus = tasks[i].LastStatus
 		task.LastError = tasks[i].LastError
 		tasks[i] = task
@@ -446,6 +450,13 @@ func (s *Studio) SaveScheduledTask(input ScheduledTask) (ScheduledTask, error) {
 			scheduledTasksMu.Unlock()
 			return ScheduledTask{}, fmt.Errorf("at most %d scheduled tasks are allowed", maxScheduledTasks)
 		}
+		// Run summaries are scheduler-owned output, never client input. A new
+		// Wails/tool caller must not be able to fabricate a live owner, terminal
+		// history, or error banner that has no corresponding durable run row.
+		task.LastRunAt = 0
+		task.LastRunID = ""
+		task.LastStatus = ""
+		task.LastError = ""
 		tasks = append(tasks, task)
 	}
 	err = saveScheduledTasksRaw(tasks)
@@ -663,7 +674,7 @@ func (s *Studio) scheduledTaskRunSessions(task ScheduledTask, runs []ScheduledTa
 			continue
 		}
 		owned[run.SessionID] = session
-		if run.Status == "running" {
+		if !scheduledTaskRunTerminal(run.Status) {
 			activeIDs[run.SessionID] = true
 		}
 	}
@@ -753,7 +764,7 @@ func (s *Studio) finishScheduledTaskDeletion(projectID string, task ScheduledTas
 		}
 	} else {
 		for _, run := range runs {
-			if run.Status != "running" {
+			if scheduledTaskRunTerminal(run.Status) {
 				continue
 			}
 			if session := owned[run.SessionID]; session != nil {
@@ -768,12 +779,15 @@ func (s *Studio) finishScheduledTaskDeletion(projectID string, task ScheduledTas
 	return nil
 }
 
-func removeScheduledTasksFor(projectID, sessionID string) error {
+// removeScheduledTasksFor removes source-owned task and run rows as one
+// recoverable transaction and returns the removed rows so the caller can stop
+// their exact live child sessions before forgetting them in memory too.
+func removeScheduledTasksFor(projectID, sessionID string) ([]ScheduledTaskRun, error) {
 	scheduledTasksMu.Lock()
 	defer scheduledTasksMu.Unlock()
 	tasks, err := loadScheduledTasksRaw()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	out := make([]ScheduledTask, 0, len(tasks))
 	changed := false
@@ -790,34 +804,60 @@ func removeScheduledTasksFor(projectID, sessionID string) error {
 		if sessionID == "" {
 			return removeScheduledTaskRunsLocked(projectID, nil)
 		}
-		return nil
+		return nil, nil
+	}
+	runs, err := loadScheduledTaskRunsRaw()
+	if err != nil {
+		return nil, err
+	}
+	runOut := make([]ScheduledTaskRun, 0, len(runs))
+	removedRuns := make([]ScheduledTaskRun, 0)
+	for _, run := range runs {
+		if run.ProjectID == projectID && removedIDs[run.TaskID] {
+			removedRuns = append(removedRuns, run)
+			continue
+		}
+		runOut = append(runOut, run)
+	}
+	if len(removedRuns) > 0 {
+		if err := saveScheduledTaskRunsRaw(runOut); err != nil {
+			return nil, err
+		}
 	}
 	if err := saveScheduledTasksRaw(out); err != nil {
-		return err
+		if len(removedRuns) > 0 {
+			if restoreErr := saveScheduledTaskRunsRaw(runs); restoreErr != nil {
+				return nil, fmt.Errorf("remove scheduled tasks: %v; restoring run index also failed: %w", err, restoreErr)
+			}
+		}
+		return nil, err
 	}
-	return removeScheduledTaskRunsLocked(projectID, removedIDs)
+	return removedRuns, nil
 }
 
 // removeScheduledTaskRunsLocked requires scheduledTasksMu. A nil taskIDs map
 // removes every run for the project.
-func removeScheduledTaskRunsLocked(projectID string, taskIDs map[string]bool) error {
+func removeScheduledTaskRunsLocked(projectID string, taskIDs map[string]bool) ([]ScheduledTaskRun, error) {
 	runs, err := loadScheduledTaskRunsRaw()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	out := make([]ScheduledTaskRun, 0, len(runs))
-	changed := false
+	removed := make([]ScheduledTaskRun, 0)
 	for _, run := range runs {
 		if run.ProjectID == projectID && (taskIDs == nil || taskIDs[run.TaskID]) {
-			changed = true
+			removed = append(removed, run)
 			continue
 		}
 		out = append(out, run)
 	}
-	if !changed {
-		return nil
+	if len(removed) == 0 {
+		return nil, nil
 	}
-	return saveScheduledTaskRunsRaw(out)
+	if err := saveScheduledTaskRunsRaw(out); err != nil {
+		return nil, err
+	}
+	return removed, nil
 }
 
 func (s *Studio) RunScheduledTaskNow(projectID, taskID string) (ScheduledTaskRun, error) {
@@ -883,39 +923,118 @@ func (s *Studio) reconcileInterruptedScheduledRuns() {
 		return
 	}
 	changed := false
-	stoppedTasks := make(map[string]bool)
 	now := time.Now().UnixMilli()
 	for i := range runs {
-		if runs[i].Status != "running" {
+		if scheduledTaskRunTerminal(runs[i].Status) {
 			continue
 		}
-		runs[i].Status = "stopped"
+		oldStatus := runs[i].Status
+		if oldStatus == "running" {
+			runs[i].Status = "stopped"
+		} else {
+			runs[i].Status = "error"
+		}
 		runs[i].CompletedAt = now
-		runs[i].Error = "Gokin Studio closed before this run finished"
-		stoppedTasks[runs[i].TaskID] = true
+		if oldStatus == "running" {
+			runs[i].Error = "Gokin Studio closed before this run finished"
+		} else {
+			runs[i].Error = truncateUTF8(fmt.Sprintf(
+				"invalid scheduled run status %q recovered at startup", oldStatus), maxScheduledTaskError)
+		}
 		changed = true
 	}
 	if changed {
 		if err := saveScheduledTaskRunsRaw(runs); err != nil {
 			s.LogEvent("error", "scheduler", err.Error())
-		}
-		tasks, err := loadScheduledTasksRaw()
-		if err != nil {
-			s.LogEvent("error", "scheduler", err.Error())
 			return
 		}
-		taskChanged := false
-		for i := range tasks {
-			if stoppedTasks[tasks[i].ID] && tasks[i].LastStatus == "running" {
-				tasks[i].LastStatus = "stopped"
-				tasks[i].LastError = "Gokin Studio closed before this run finished"
-				taskChanged = true
+	}
+	// Repair a crash between the two durable commits too: the run row is the
+	// authoritative execution record, while LastStatus is only a denormalized
+	// card summary. Previously an already-terminal row was skipped here, so a
+	// failed task-summary write left "running" in the UI forever after restart.
+	tasks, err := loadScheduledTasksRaw()
+	if err != nil {
+		s.LogEvent("error", "scheduler", err.Error())
+		return
+	}
+	latest := make(map[string]ScheduledTaskRun)
+	terminalByID := make(map[string]ScheduledTaskRun)
+	for _, run := range runs {
+		if !scheduledTaskRunTerminal(run.Status) {
+			continue
+		}
+		terminalByID[run.ID] = run
+		current, exists := latest[run.TaskID]
+		if !exists || run.StartedAt > current.StartedAt {
+			latest[run.TaskID] = run
+		}
+	}
+	taskChanged := false
+	for i := range tasks {
+		run, ok := ScheduledTaskRun{}, false
+		if tasks[i].LastRunID != "" {
+			run, ok = terminalByID[tasks[i].LastRunID]
+			ok = ok && run.TaskID == tasks[i].ID && run.ProjectID == tasks[i].ProjectID
+			if !ok {
+				if tasks[i].LastStatus == "running" || tasks[i].LastStatus == "dispatching" {
+					tasks[i].LastStatus = "error"
+					tasks[i].LastError = truncateUTF8(fmt.Sprintf(
+						"scheduled run %s lost durable tracking before startup reconciliation",
+						tasks[i].LastRunID), maxScheduledTaskError)
+					taskChanged = true
+				}
+				continue
+			}
+		} else {
+			run, ok = latest[tasks[i].ID]
+		}
+		terminalAt := int64(0)
+		if ok {
+			terminalAt = run.CompletedAt
+			if terminalAt <= 0 {
+				terminalAt = run.StartedAt
 			}
 		}
-		if taskChanged {
-			if err := saveScheduledTasksRaw(tasks); err != nil {
-				s.LogEvent("error", "scheduler", err.Error())
+		// dispatchDueScheduledTasks persists this state before it creates a
+		// child/run. If the process dies in that gap there is intentionally no
+		// row to reconcile, so convert the stale marker explicitly instead of
+		// showing "dispatching" forever (or reverting to an older success).
+		if tasks[i].LastStatus == "dispatching" && tasks[i].LastRunID == "" && (!ok || terminalAt < tasks[i].LastRunAt) {
+			tasks[i].LastStatus = "stopped"
+			tasks[i].LastError = "Gokin Studio closed before this scheduled run started"
+			taskChanged = true
+			continue
+		}
+		if !ok {
+			if tasks[i].LastStatus == "running" {
+				tasks[i].LastStatus = "error"
+				tasks[i].LastError = "scheduled run lost durable tracking before startup reconciliation"
+				taskChanged = true
 			}
+			continue
+		}
+		if tasks[i].LastRunID == "" && tasks[i].LastStatus == "running" && terminalAt < tasks[i].LastRunAt {
+			tasks[i].LastStatus = "error"
+			tasks[i].LastError = "scheduled run lost durable tracking before startup reconciliation"
+			taskChanged = true
+			continue
+		}
+		// A task may have a newer dispatch failure with no run row (for
+		// example an unavailable model). Preserve that more recent summary.
+		staleLiveSummary := tasks[i].LastStatus == "running" || tasks[i].LastStatus == "dispatching"
+		if tasks[i].LastRunID == "" && !staleLiveSummary && tasks[i].LastRunAt >= terminalAt {
+			continue
+		}
+		tasks[i].LastRunAt = terminalAt
+		tasks[i].LastRunID = run.ID
+		tasks[i].LastStatus = run.Status
+		tasks[i].LastError = truncateUTF8(run.Error, maxScheduledTaskError)
+		taskChanged = true
+	}
+	if taskChanged {
+		if err := saveScheduledTasksRaw(tasks); err != nil {
+			s.LogEvent("error", "scheduler", err.Error())
 		}
 	}
 }
@@ -928,6 +1047,18 @@ func (s *Studio) dispatchDueScheduledTasks(now time.Time) {
 		s.LogEvent("error", "scheduler", err.Error())
 		return
 	}
+	runs, err := loadScheduledTaskRunsRaw()
+	if err != nil {
+		scheduledTasksMu.Unlock()
+		s.LogEvent("error", "scheduler", err.Error())
+		return
+	}
+	liveTasks := make(map[string]bool)
+	for _, run := range runs {
+		if !scheduledTaskRunTerminal(run.Status) {
+			liveTasks[run.TaskID] = true
+		}
+	}
 	var due []ScheduledTask
 	changed := false
 	for i := range tasks {
@@ -935,12 +1066,19 @@ func (s *Studio) dispatchDueScheduledTasks(now time.Time) {
 			tasks[i].NextRunAt <= 0 || tasks[i].NextRunAt > now.UnixMilli() {
 			continue
 		}
-		due = append(due, tasks[i])
 		tasks[i].NextRunAt = nextScheduledRun(tasks[i], now).UnixMilli()
+		changed = true
+		if liveTasks[tasks[i].ID] {
+			// Never overlap executions of one routine. Advance cadence so a long
+			// run does not cause a tight catch-up loop, but preserve the exact live
+			// summary until its correlated terminal callback arrives.
+			continue
+		}
+		due = append(due, tasks[i])
 		tasks[i].LastRunAt = now.UnixMilli()
+		tasks[i].LastRunID = ""
 		tasks[i].LastStatus = "dispatching"
 		tasks[i].LastError = ""
-		changed = true
 	}
 	if changed {
 		err = saveScheduledTasksRaw(tasks)
@@ -1013,24 +1151,36 @@ func (s *Studio) dispatchScheduledTask(task ScheduledTask) (ScheduledTaskRun, er
 		SessionID: session.ID, StartedAt: now.UnixMilli(), Status: "running",
 		Provider: task.Provider, Model: task.Model, ApprovalMode: task.ApprovalMode,
 	}
-	evictedRuns, err := appendScheduledTaskRun(run)
+	evictedRuns, err := appendScheduledTaskRunForTask(task, run)
 	if err != nil {
-		s.updateScheduledTaskResult(task.ID, now, "error", err)
-		return ScheduledTaskRun{}, err
+		persistErr := fmt.Errorf("persist scheduled run: %w", err)
+		if cleanupErr := discardScheduledRunSession(project, session); cleanupErr != nil {
+			// A failed rollback must be visible: the child was never published in
+			// the run index, so the sessions event is now its only UI discovery
+			// path. Keep it inspectable instead of pretending it disappeared.
+			project.emitEvent(s.ctx, EventSessionsChanged, map[string]any{
+				"projectID": task.ProjectID, "sessionID": session.ID,
+			})
+			persistErr = fmt.Errorf("%w; discard unpublished child session: %v", persistErr, cleanupErr)
+		}
+		if summaryErr := s.updateScheduledTaskResult(task.ID, now, "error", persistErr); summaryErr != nil {
+			persistErr = fmt.Errorf("%w; persist scheduled task error summary: %v", persistErr, summaryErr)
+		}
+		return ScheduledTaskRun{}, persistErr
 	}
 	// Retention just dropped these rows; their chats and worktrees would be
 	// unreachable from any UI path if we did not reap them here.
 	s.reapEvictedScheduledRunSessions(task, evictedRuns)
-	s.updateScheduledTaskResult(task.ID, now, "running", nil)
 	project.emitEvent(s.ctx, EventSessionsChanged, map[string]any{
 		"projectID": task.ProjectID, "sessionID": session.ID,
 	})
 	// The Locked variant: this function holds s.mu.RLock for its whole body
 	// (see the defer above), and read locks are not reentrant — calling the
 	// ordinary startMessage here would block forever behind any pending writer.
-	if err := s.startMessageWithQueueEventPermissionLocked(task.ProjectID, task.Prompt, nil, session.ID, nil, ""); err != nil {
-		finishScheduledTaskRun(run.ID, "error", err)
-		s.updateScheduledTaskResult(task.ID, now, "error", err)
+	if err := s.claimScheduledTaskRunStart(task, run, now); err != nil {
+		if finishErr := s.finalizeScheduledTaskRun(task, run, now, "error", err); finishErr != nil {
+			return run, fmt.Errorf("start scheduled run: %v; %w", err, finishErr)
+		}
 		return run, err
 	}
 	if !s.startBackground("scheduled-task-run", func() {
@@ -1038,8 +1188,9 @@ func (s *Studio) dispatchScheduledTask(task ScheduledTask) (ScheduledTaskRun, er
 	}) {
 		err := fmt.Errorf("studio is shutting down")
 		session.Stop()
-		finishScheduledTaskRun(run.ID, "stopped", err)
-		s.updateScheduledTaskResult(task.ID, now, "stopped", err)
+		if finishErr := s.finalizeScheduledTaskRun(task, run, now, "stopped", err); finishErr != nil {
+			return run, fmt.Errorf("%v; %w", err, finishErr)
+		}
 		return run, err
 	}
 	return run, nil
@@ -1092,6 +1243,54 @@ func createScheduledRunSession(project *Project, task ScheduledTask, now time.Ti
 	return session, nil
 }
 
+// discardScheduledRunSession rolls back the unpublished child created before
+// appendScheduledTaskRun. The run index is the ownership link used by history,
+// deletion and retention; leaving a session behind when that append fails
+// creates an unreachable chat (and, for Git projects, a full orphan worktree).
+//
+// The rollback mirrors DeleteChatSession's durable ordering while avoiding its
+// scheduler cleanup side effects. The caller still holds s.mu.RLock, so it
+// cannot invoke the public deletion path without risking a recursive read-lock
+// deadlock behind a pending writer.
+func discardScheduledRunSession(project *Project, session *ChatSession) error {
+	project.metadataMu.Lock()
+	defer project.metadataMu.Unlock()
+
+	project.mu.Lock()
+	stored, exists := project.sessions[session.ID]
+	if !exists || stored != session {
+		project.mu.Unlock()
+		return fmt.Errorf("scheduled run session ownership changed: %s", session.ID)
+	}
+	session.mu.RLock()
+	name := session.Name
+	parentID := session.ParentID
+	history := append([]*genai.Content(nil), session.history...)
+	var usage *SessionUsage
+	if session.usage != nil {
+		copyUsage := *session.usage
+		usage = &copyUsage
+	}
+	session.mu.RUnlock()
+	storageKey := projectSessionStorageKey(project.ID, session.ID)
+	if err := deleteHistoryChecked(storageKey); err != nil {
+		project.mu.Unlock()
+		return fmt.Errorf("delete unpublished scheduled run history: %w", err)
+	}
+	if err := removeSessionWorktreeAt(project, session, project.Directory); err != nil {
+		restoreErr := SaveHistoryWithUsage(storageKey, name, parentID, usage, history)
+		project.mu.Unlock()
+		if restoreErr != nil {
+			return fmt.Errorf("discard unpublished scheduled worktree: %v; restoring its history also failed: %w", err, restoreErr)
+		}
+		return fmt.Errorf("discard unpublished scheduled worktree: %w", err)
+	}
+	delete(project.sessions, session.ID)
+	project.mu.Unlock()
+	DiscardReplay(project.ID, session.ID)
+	return nil
+}
+
 // appendScheduledTaskRun records a run and returns the rows evicted by the
 // retention caps. Those rows are the ONLY authoritative link between a run and
 // the chat session plus Git worktree it created, so the caller must clean them
@@ -1099,29 +1298,226 @@ func createScheduledRunSession(project *Project, task ScheduledTask, now time.Ti
 // interval schedule would otherwise leave one orphaned chat and one full repo
 // checkout behind on every firing, forever.
 func appendScheduledTaskRun(run ScheduledTaskRun) ([]ScheduledTaskRun, error) {
+	return appendScheduledTaskRunOwned(nil, run)
+}
+
+// appendScheduledTaskRunForTask proves that the task still exists in the same
+// critical section that publishes its child run. Run-now and deletion may race
+// after either side has taken a snapshot; this makes the winner unambiguous:
+// deletion first means dispatch rolls its unpublished child back, append first
+// means deletion sees the durable row and stops the exact child.
+func appendScheduledTaskRunForTask(task ScheduledTask, run ScheduledTaskRun) ([]ScheduledTaskRun, error) {
+	return appendScheduledTaskRunOwned(&task, run)
+}
+
+func appendScheduledTaskRunOwned(task *ScheduledTask, run ScheduledTaskRun) ([]ScheduledTaskRun, error) {
 	scheduledTasksMu.Lock()
 	defer scheduledTasksMu.Unlock()
+	if task != nil {
+		tasks, err := loadScheduledTasksRaw()
+		if err != nil {
+			return nil, err
+		}
+		found := false
+		for _, current := range tasks {
+			if current.ID == task.ID && current.ProjectID == task.ProjectID {
+				if !sameScheduledTaskExecution(current, *task) {
+					return nil, fmt.Errorf("scheduled task changed before its run started")
+				}
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("scheduled task was deleted before its run started")
+		}
+	}
 	runs, err := loadScheduledTaskRunsRaw()
 	if err != nil {
 		return nil, err
 	}
-	runs = append(runs, run)
-	sort.SliceStable(runs, func(i, j int) bool { return runs[i].StartedAt > runs[j].StartedAt })
-	perTask := make(map[string]int)
-	kept := make([]ScheduledTaskRun, 0, min(len(runs), maxScheduledTaskRuns))
-	var evicted []ScheduledTaskRun
-	for _, candidate := range runs {
-		if len(kept) >= maxScheduledTaskRuns || perTask[candidate.TaskID] >= maxRunsPerScheduledTask {
-			evicted = append(evicted, candidate)
-			continue
+	for _, current := range runs {
+		if current.ID == run.ID {
+			return nil, fmt.Errorf("scheduled run ID already exists: %s", run.ID)
 		}
-		perTask[candidate.TaskID]++
-		kept = append(kept, candidate)
+		if task != nil && current.ProjectID == task.ProjectID && current.TaskID == task.ID &&
+			!scheduledTaskRunTerminal(current.Status) {
+			return nil, fmt.Errorf("scheduled task is already running (run %s)", current.ID)
+		}
+	}
+	runs = append(runs, run)
+	kept, evicted, err := fitScheduledTaskRuns(runs)
+	if err != nil {
+		return nil, err
 	}
 	if err := saveScheduledTaskRunsRaw(kept); err != nil {
 		return nil, err
 	}
 	return evicted, nil
+}
+
+func scheduledApprovalModeForExecution(mode string) string {
+	mode = normalizeScheduledApprovalMode(mode)
+	if mode == "" {
+		return "manual"
+	}
+	return mode
+}
+
+func sameScheduledTaskExecution(current, expected ScheduledTask) bool {
+	if current.ID != expected.ID || current.ProjectID != expected.ProjectID ||
+		current.SessionID != expected.SessionID || current.Prompt != expected.Prompt ||
+		current.Enabled != expected.Enabled ||
+		scheduledApprovalModeForExecution(current.ApprovalMode) != scheduledApprovalModeForExecution(expected.ApprovalMode) {
+		return false
+	}
+	// Original scheduler rows inherited the project model and persisted both
+	// fields empty. dispatchScheduledTask resolves that legacy pair before it
+	// reaches this check; accept the migration, but require exact equality once
+	// either stored field is explicit so an edit cannot launch a stale model.
+	if current.Provider == "" && current.Model == "" {
+		return true
+	}
+	return current.Provider == expected.Provider && current.Model == expected.Model
+}
+
+// claimScheduledTaskRunStart closes the last gap between durable publication
+// and paid work. Deletion holds the same lock while removing task/run rows, so
+// it can occur entirely before this claim (which then refuses) or after the
+// queueWorker is visible (which then stops it), never in between.
+func (s *Studio) claimScheduledTaskRunStart(task ScheduledTask, run ScheduledTaskRun, now time.Time) error {
+	scheduledTasksMu.Lock()
+	defer scheduledTasksMu.Unlock()
+	tasks, err := loadScheduledTasksRaw()
+	if err != nil {
+		return fmt.Errorf("read scheduled tasks before run start: %w", err)
+	}
+	taskIndex := -1
+	for i, current := range tasks {
+		if current.ID == task.ID && current.ProjectID == task.ProjectID {
+			if !sameScheduledTaskExecution(current, task) {
+				return fmt.Errorf("scheduled task changed before its run started")
+			}
+			taskIndex = i
+			break
+		}
+	}
+	if taskIndex < 0 {
+		return fmt.Errorf("scheduled task was deleted before its run started")
+	}
+	runs, err := loadScheduledTaskRunsRaw()
+	if err != nil {
+		return fmt.Errorf("read scheduled runs before start: %w", err)
+	}
+	runFound := false
+	for _, current := range runs {
+		if current.ID == run.ID && current.TaskID == task.ID && current.ProjectID == task.ProjectID &&
+			current.SessionID == run.SessionID && current.Status == "running" {
+			runFound = true
+			break
+		}
+	}
+	if !runFound {
+		return fmt.Errorf("scheduled run lost durable ownership before it started")
+	}
+	// Commit the denormalized owner summary before opening the worker gate.
+	// Deletion uses this same lock, so it cannot remove the task between this
+	// durable write and the synchronous queueWorker transition below.
+	tasks[taskIndex].LastRunAt = now.UnixMilli()
+	tasks[taskIndex].LastRunID = run.ID
+	tasks[taskIndex].LastStatus = "running"
+	tasks[taskIndex].LastError = ""
+	if err := saveScheduledTasksRaw(tasks); err != nil {
+		return fmt.Errorf("persist scheduled task running state: %w", err)
+	}
+	return s.startMessageWithQueueEventPermissionLocked(
+		task.ProjectID, task.Prompt, nil, run.SessionID, nil, "", nil,
+	)
+}
+
+func loadScheduledTaskRunState(task ScheduledTask, runID string) (ScheduledTaskRun, bool, bool, error) {
+	scheduledTasksMu.Lock()
+	defer scheduledTasksMu.Unlock()
+	tasks, err := loadScheduledTasksRaw()
+	if err != nil {
+		return ScheduledTaskRun{}, false, false, err
+	}
+	taskFound := false
+	for _, current := range tasks {
+		if current.ID == task.ID && current.ProjectID == task.ProjectID {
+			taskFound = true
+			break
+		}
+	}
+	if !taskFound {
+		return ScheduledTaskRun{}, false, false, nil
+	}
+	runs, err := loadScheduledTaskRunsRaw()
+	if err != nil {
+		return ScheduledTaskRun{}, false, true, err
+	}
+	for _, run := range runs {
+		if run.ID == runID {
+			return run, true, true, nil
+		}
+	}
+	return ScheduledTaskRun{}, false, true, nil
+}
+
+// fitScheduledTaskRuns applies history caps without ever evicting a live row.
+// A run row is the only durable owner of its child chat/worktree; dropping a
+// running row would turn retention into an untracked provider turn as soon as
+// guarded cleanup refuses a dirty checkout. Terminal history is expendable,
+// live ownership is not. If live work alone exceeds a cap, the new append is
+// rejected and dispatch rolls its unpublished child back.
+func fitScheduledTaskRuns(runs []ScheduledTaskRun) ([]ScheduledTaskRun, []ScheduledTaskRun, error) {
+	sorted := append([]ScheduledTaskRun(nil), runs...)
+	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].StartedAt > sorted[j].StartedAt })
+
+	livePerTask := make(map[string]int)
+	liveTotal := 0
+	for _, run := range sorted {
+		if scheduledTaskRunTerminal(run.Status) {
+			continue
+		}
+		liveTotal++
+		livePerTask[run.TaskID]++
+		if livePerTask[run.TaskID] > maxRunsPerScheduledTask {
+			return nil, nil, fmt.Errorf(
+				"task %s already has %d live scheduled runs (retention limit %d)",
+				run.TaskID, livePerTask[run.TaskID], maxRunsPerScheduledTask)
+		}
+	}
+	if liveTotal > maxScheduledTaskRuns {
+		return nil, nil, fmt.Errorf(
+			"%d live scheduled runs exceed the global retention limit %d",
+			liveTotal, maxScheduledTaskRuns)
+	}
+
+	perTask := make(map[string]int, len(livePerTask))
+	kept := make([]ScheduledTaskRun, 0, min(len(sorted), maxScheduledTaskRuns))
+	evicted := make([]ScheduledTaskRun, 0)
+	// Reserve capacity concretely by keeping every live owner first. We sort the
+	// result again below, so this does not alter the externally visible order.
+	for _, candidate := range sorted {
+		if !scheduledTaskRunTerminal(candidate.Status) {
+			kept = append(kept, candidate)
+			perTask[candidate.TaskID]++
+		}
+	}
+	for _, candidate := range sorted {
+		if !scheduledTaskRunTerminal(candidate.Status) {
+			continue
+		}
+		if len(kept) >= maxScheduledTaskRuns || perTask[candidate.TaskID] >= maxRunsPerScheduledTask {
+			evicted = append(evicted, candidate)
+			continue
+		}
+		kept = append(kept, candidate)
+		perTask[candidate.TaskID]++
+	}
+	sort.SliceStable(kept, func(i, j int) bool { return kept[i].StartedAt > kept[j].StartedAt })
+	return kept, evicted, nil
 }
 
 // reapEvictedScheduledRunSessions removes the chats and worktrees belonging to
@@ -1145,27 +1541,75 @@ func (s *Studio) reapEvictedScheduledRunSessions(task ScheduledTask, evicted []S
 	})
 }
 
-func finishScheduledTaskRun(runID, status string, runErr error) {
+func scheduledTaskRunTerminal(status string) bool {
+	switch status {
+	case "completed", "stopped", "error":
+		return true
+	}
+	return false
+}
+
+// finishScheduledTaskRun durably claims a terminal transition. It returns the
+// attempted snapshot on a write failure so callers can report the exact run,
+// and refuses to revive or overwrite a row that is already terminal.
+func finishScheduledTaskRun(runID, status string, runErr error) (ScheduledTaskRun, bool, error) {
+	if !scheduledTaskRunTerminal(status) {
+		return ScheduledTaskRun{}, false, fmt.Errorf("invalid terminal scheduled run status %q", status)
+	}
 	scheduledTasksMu.Lock()
 	defer scheduledTasksMu.Unlock()
 	runs, err := loadScheduledTaskRunsRaw()
 	if err != nil {
-		return
+		return ScheduledTaskRun{}, false, err
 	}
 	for i := range runs {
 		if runs[i].ID != runID {
 			continue
 		}
+		if scheduledTaskRunTerminal(runs[i].Status) {
+			return runs[i], false, nil
+		}
 		runs[i].Status = status
 		runs[i].CompletedAt = time.Now().UnixMilli()
 		if runErr != nil {
-			runs[i].Error = runErr.Error()
+			runs[i].Error = truncateUTF8(runErr.Error(), maxScheduledTaskError)
 		} else {
 			runs[i].Error = ""
 		}
-		_ = saveScheduledTaskRunsRaw(runs)
-		return
+		updated := runs[i]
+		if err := saveScheduledTaskRunsRaw(runs); err != nil {
+			return updated, false, err
+		}
+		return updated, true, nil
 	}
+	return ScheduledTaskRun{}, false, fmt.Errorf("scheduled task run not found: %s", runID)
+}
+
+// finalizeScheduledTaskRun keeps the task summary subordinate to its durable
+// run row. A failed terminal write is surfaced as an error on the task and in
+// Diagnostics; it must never be flattened into a misleading "completed".
+func (s *Studio) finalizeScheduledTaskRun(
+	task ScheduledTask, run ScheduledTaskRun, now time.Time,
+	status string, runErr error,
+) error {
+	_, changed, err := finishScheduledTaskRun(run.ID, status, runErr)
+	if err != nil {
+		persistErr := fmt.Errorf("persist scheduled run %s terminal state: %w", run.ID, err)
+		s.LogEvent("error", "scheduler", persistErr.Error())
+		if summaryErr := s.updateScheduledTaskRunResult(task.ID, run.ID, now, "error", persistErr); summaryErr != nil {
+			return fmt.Errorf("%w; persist scheduled task error summary: %v", persistErr, summaryErr)
+		}
+		return persistErr
+	}
+	if !changed {
+		return nil
+	}
+	if err := s.updateScheduledTaskRunResult(task.ID, run.ID, now, status, runErr); err != nil {
+		summaryErr := fmt.Errorf("persist scheduled task %s result: %w", task.ID, err)
+		s.LogEvent("error", "scheduler", summaryErr.Error())
+		return summaryErr
+	}
+	return nil
 }
 
 func (s *Studio) monitorScheduledTaskRun(task ScheduledTask, run ScheduledTaskRun, project *Project, session *ChatSession) {
@@ -1175,12 +1619,12 @@ func (s *Studio) monitorScheduledTaskRun(task ScheduledTask, run ScheduledTaskRu
 	}
 	ticker := time.NewTicker(150 * time.Millisecond)
 	defer ticker.Stop()
+	lastOwnershipCheck := time.Time{}
 	for {
 		select {
 		case <-ctx.Done():
 			err := fmt.Errorf("scheduled run stopped during shutdown")
-			finishScheduledTaskRun(run.ID, "stopped", err)
-			s.updateScheduledTaskResult(task.ID, time.Now(), "stopped", err)
+			_ = s.finalizeScheduledTaskRun(task, run, time.Now(), "stopped", err)
 			return
 		case <-ticker.C:
 			session.mu.RLock()
@@ -1201,17 +1645,64 @@ func (s *Studio) monitorScheduledTaskRun(task ScheduledTask, run ScheduledTaskRu
 				}
 			}
 			session.mu.RUnlock()
+			// A run index may be several MiB. Poll ownership at a bounded cadence
+			// while the provider is active, but always re-check immediately once
+			// the child becomes idle before committing a terminal result.
+			if !active || lastOwnershipCheck.IsZero() || time.Since(lastOwnershipCheck) >= time.Second {
+				lastOwnershipCheck = time.Now()
+				stored, found, taskFound, storeErr := loadScheduledTaskRunState(task, run.ID)
+				if !taskFound && storeErr == nil {
+					// Intentional task deletion removes task and run rows under the same
+					// scheduler lock, then stops the child. Stop here too so even a race
+					// between durable deletion and in-memory cancellation fails closed.
+					session.Stop()
+					return
+				}
+				if storeErr != nil || !found {
+					if storeErr == nil {
+						storeErr = fmt.Errorf("durable scheduled run row disappeared")
+					}
+					session.Stop()
+					err := fmt.Errorf("scheduled run %s lost durable tracking: %w", run.ID, storeErr)
+					s.LogEvent("error", "scheduler", err.Error())
+					if summaryErr := s.updateScheduledTaskRunResult(task.ID, run.ID, time.Now(), "error", err); summaryErr != nil {
+						s.LogEvent("error", "scheduler", fmt.Sprintf("%v; persist error summary: %v", err, summaryErr))
+					}
+					project.emitEvent(s.ctx, EventSessionsChanged, map[string]any{
+						"projectID": task.ProjectID, "sessionID": session.ID,
+					})
+					return
+				}
+				if scheduledTaskRunTerminal(stored.Status) {
+					// A deletion/cancellation path won the durable state transition.
+					// Never let the old monitor continue a paid child behind it.
+					session.Stop()
+					return
+				}
+				if stored.Status != "running" {
+					session.Stop()
+					err := fmt.Errorf("scheduled run %s has invalid durable status %q", run.ID, stored.Status)
+					s.LogEvent("error", "scheduler", err.Error())
+					if summaryErr := s.updateScheduledTaskRunResult(task.ID, run.ID, time.Now(), "error", err); summaryErr != nil {
+						s.LogEvent("error", "scheduler", fmt.Sprintf("%v; persist error summary: %v", err, summaryErr))
+					}
+					project.emitEvent(s.ctx, EventSessionsChanged, map[string]any{
+						"projectID": task.ProjectID, "sessionID": session.ID,
+					})
+					return
+				}
+			}
 			if active {
 				continue
 			}
 			if !hasModel {
 				err := fmt.Errorf("run ended before a model response was saved")
-				finishScheduledTaskRun(run.ID, "error", err)
-				s.updateScheduledTaskResult(task.ID, time.Now(), "error", err)
+				_ = s.finalizeScheduledTaskRun(task, run, time.Now(), "error", err)
 				return
 			}
-			finishScheduledTaskRun(run.ID, "completed", nil)
-			s.updateScheduledTaskResult(task.ID, time.Now(), "completed", nil)
+			if err := s.finalizeScheduledTaskRun(task, run, time.Now(), "completed", nil); err != nil {
+				return
+			}
 			project.emitEvent(s.ctx, EventSessionsChanged, map[string]any{
 				"projectID": task.ProjectID, "sessionID": session.ID,
 			})
@@ -1220,28 +1711,52 @@ func (s *Studio) monitorScheduledTaskRun(task ScheduledTask, run ScheduledTaskRu
 	}
 }
 
-func (s *Studio) updateScheduledTaskResult(id string, now time.Time, status string, dispatchErr error) {
+func (s *Studio) updateScheduledTaskResult(id string, now time.Time, status string, dispatchErr error) error {
+	return s.updateScheduledTaskRunResult(id, "", now, status, dispatchErr)
+}
+
+func (s *Studio) updateScheduledTaskRunResult(id, runID string, now time.Time, status string, dispatchErr error) error {
 	scheduledTasksMu.Lock()
 	defer scheduledTasksMu.Unlock()
 	tasks, err := loadScheduledTasksRaw()
 	if err != nil {
 		s.LogEvent("error", "scheduler", err.Error())
-		return
+		return err
 	}
 	for i := range tasks {
 		if tasks[i].ID != id {
 			continue
 		}
+		if runID != "" {
+			// A terminal callback belongs to one exact run. Once a newer run has
+			// claimed the summary, the older callback remains valid in run history
+			// but must not replace the card's current "running"/terminal status.
+			if tasks[i].LastRunID != "" && tasks[i].LastRunID != runID {
+				return nil
+			}
+			if tasks[i].LastRunID == "" && tasks[i].LastRunAt > now.UnixMilli() {
+				return nil
+			}
+			tasks[i].LastRunID = runID
+		} else {
+			if tasks[i].LastRunID != "" &&
+				(tasks[i].LastStatus == "running" || tasks[i].LastStatus == "dispatching") {
+				return nil
+			}
+			tasks[i].LastRunID = ""
+		}
 		tasks[i].LastRunAt = now.UnixMilli()
 		tasks[i].LastStatus = status
 		if dispatchErr != nil {
-			tasks[i].LastError = dispatchErr.Error()
+			tasks[i].LastError = truncateUTF8(dispatchErr.Error(), maxScheduledTaskError)
 		} else {
 			tasks[i].LastError = ""
 		}
 		if err := saveScheduledTasksRaw(tasks); err != nil {
 			s.LogEvent("error", "scheduler", err.Error())
+			return err
 		}
-		return
+		return nil
 	}
+	return fmt.Errorf("scheduled task not found: %s", id)
 }

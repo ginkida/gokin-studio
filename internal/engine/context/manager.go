@@ -533,7 +533,7 @@ func (m *ContextManager) GetContextHealth() (int, int, float64) {
 	if m.tokenCounter != nil {
 		max = m.tokenCounter.GetLimits().MaxInputTokens
 	}
-	
+
 	percent := 0.0
 	if max > 0 {
 		percent = float64(total) / float64(max) * 100

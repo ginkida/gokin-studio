@@ -13,11 +13,34 @@ import (
 
 // CoordinatedTaskDef defines a task for coordination.
 type CoordinatedTaskDef struct {
+	ID           string   `json:"id"`
 	Prompt       string   `json:"prompt"`
 	AgentType    string   `json:"agent_type"`
 	Priority     int      `json:"priority"`
-	Dependencies []string `json:"dependencies,omitempty"`
+	Dependencies []string `json:"depends_on,omitempty"`
 }
+
+// CoordinationResult is the import-cycle-free result shape returned by a
+// runner-backed coordinate executor.
+type CoordinationResult struct {
+	AgentID   string        `json:"agent_id"`
+	Type      string        `json:"type"`
+	Status    string        `json:"status"`
+	Output    string        `json:"output"`
+	Error     string        `json:"error,omitempty"`
+	Duration  time.Duration `json:"duration"`
+	Completed bool          `json:"completed"`
+}
+
+// CoordinateExecutor bridges CoordinateTool to an agent runtime without
+// importing that runtime into the tools package.
+type CoordinateExecutor func(
+	ctx context.Context,
+	tasks []CoordinatedTaskDef,
+	maxParallel int,
+	timeout time.Duration,
+	callback CoordinateCallback,
+) (map[string]CoordinationResult, error)
 
 // CoordinateCallback is called when coordination events occur.
 type CoordinateCallback interface {
@@ -31,6 +54,7 @@ type CoordinateCallback interface {
 // CoordinateTool manages parallel agent execution with dependencies.
 type CoordinateTool struct {
 	coordinatorFactory func() any // Returns *agent.Coordinator
+	executor           CoordinateExecutor
 	callback           CoordinateCallback
 }
 
@@ -42,6 +66,12 @@ func NewCoordinateTool() *CoordinateTool {
 // SetCoordinatorFactory sets the factory function for creating coordinators.
 func (t *CoordinateTool) SetCoordinatorFactory(factory func() any) {
 	t.coordinatorFactory = factory
+}
+
+// SetExecutor installs the runtime-backed coordination path. The legacy
+// factory remains supported for embedders that still configure it directly.
+func (t *CoordinateTool) SetExecutor(executor CoordinateExecutor) {
+	t.executor = executor
 }
 
 // SetCallback sets the callback for coordination events.
@@ -123,6 +153,9 @@ func (t *CoordinateTool) Validate(args map[string]any) error {
 	if !ok || len(tasks) == 0 {
 		return NewValidationError("tasks", "must be a non-empty array")
 	}
+	if len(tasks) > 50 {
+		return NewValidationError("tasks", "must contain at most 50 tasks")
+	}
 
 	// Validate each task
 	ids := make(map[string]bool)
@@ -147,25 +180,61 @@ func (t *CoordinateTool) Validate(args map[string]any) error {
 		}
 
 		agentType, _ := task["agent_type"].(string)
-		if agentType == "" {
+		switch agentType {
+		case "explore", "bash", "general", "plan":
+		case "":
 			return NewValidationError("tasks", fmt.Sprintf("task %s must have an agent_type", id))
+		default:
+			return NewValidationError("tasks", fmt.Sprintf("task %s has unsupported agent_type: %s", id, agentType))
+		}
+		if _, exists := task["priority"]; exists {
+			priority, valid := coordinateIntArg(task, "priority", 5)
+			if !valid || priority < 1 || priority > 10 {
+				return NewValidationError("tasks", fmt.Sprintf("task %s priority must be an integer from 1 to 10", id))
+			}
 		}
 	}
 
 	// Validate dependencies exist
+	graph := make(map[string][]string, len(tasks))
 	for _, taskAny := range tasks {
 		task := taskAny.(map[string]any)
 		id := task["id"].(string)
-		if deps, ok := task["depends_on"].([]any); ok {
-			for _, depAny := range deps {
-				dep, _ := depAny.(string)
+		if rawDeps, exists := task["depends_on"]; exists {
+			deps, valid := coordinateDependencies(rawDeps)
+			if !valid {
+				return NewValidationError("tasks", fmt.Sprintf("task %s depends_on must be an array of task IDs", id))
+			}
+			seenDeps := make(map[string]bool, len(deps))
+			for _, dep := range deps {
 				if !ids[dep] {
 					return NewValidationError("tasks", fmt.Sprintf("task %s depends on unknown task: %s", id, dep))
 				}
 				if dep == id {
 					return NewValidationError("tasks", fmt.Sprintf("task %s cannot depend on itself", id))
 				}
+				if seenDeps[dep] {
+					return NewValidationError("tasks", fmt.Sprintf("task %s repeats dependency: %s", id, dep))
+				}
+				seenDeps[dep] = true
 			}
+			graph[id] = deps
+		}
+	}
+	if cycle := coordinateDependencyCycle(graph); len(cycle) > 0 {
+		return NewValidationError("tasks", fmt.Sprintf("dependency cycle detected: %s", strings.Join(cycle, " -> ")))
+	}
+
+	if _, exists := args["max_parallel"]; exists {
+		maxParallel, valid := coordinateIntArg(args, "max_parallel", 3)
+		if !valid || maxParallel < 1 || maxParallel > 10 {
+			return NewValidationError("max_parallel", "must be an integer from 1 to 10")
+		}
+	}
+	if _, exists := args["timeout_minutes"]; exists {
+		timeoutMinutes, valid := coordinateIntArg(args, "timeout_minutes", 10)
+		if !valid || timeoutMinutes < 1 || timeoutMinutes > 120 {
+			return NewValidationError("timeout_minutes", "must be an integer from 1 to 120")
 		}
 	}
 
@@ -173,14 +242,39 @@ func (t *CoordinateTool) Validate(args map[string]any) error {
 }
 
 func (t *CoordinateTool) Execute(ctx context.Context, args map[string]any) (ToolResult, error) {
-	// Parse arguments first so the graceful-fallback path can use them.
-	tasksAny, ok := args["tasks"].([]any)
-	if !ok {
-		return NewErrorResult("tasks must be an array"), nil
+	if err := t.Validate(args); err != nil {
+		return NewErrorResult(err.Error()), nil
 	}
-	timeoutMinutes := 10
-	if tm, ok := args["timeout_minutes"].(float64); ok {
-		timeoutMinutes = int(tm)
+	// Parse arguments first so the graceful-fallback path can use them.
+	tasksAny := args["tasks"].([]any)
+	timeoutMinutes, _ := coordinateIntArg(args, "timeout_minutes", 10)
+	maxParallel, _ := coordinateIntArg(args, "max_parallel", 3)
+	definitions := make([]CoordinatedTaskDef, 0, len(tasksAny))
+	for _, taskAny := range tasksAny {
+		task := taskAny.(map[string]any)
+		priority, _ := coordinateIntArg(task, "priority", 5)
+		dependencies, _ := coordinateDependencies(task["depends_on"])
+		definitions = append(definitions, CoordinatedTaskDef{
+			ID:           task["id"].(string),
+			Prompt:       task["prompt"].(string),
+			AgentType:    task["agent_type"].(string),
+			Priority:     priority,
+			Dependencies: dependencies,
+		})
+	}
+
+	if t.executor != nil {
+		results, err := t.executor(
+			ctx,
+			definitions,
+			maxParallel,
+			time.Duration(timeoutMinutes)*time.Minute,
+			t.callback,
+		)
+		if err != nil {
+			return NewErrorResult(fmt.Sprintf("coordination failed: %v", err)), nil
+		}
+		return formatCoordinationResults(definitions, results), nil
 	}
 
 	// When no coordinator factory is wired, fall back to a structured task
@@ -208,35 +302,23 @@ func (t *CoordinateTool) Execute(ctx context.Context, args map[string]any) (Tool
 		// Fall back to simplified execution
 		return t.executeSimple(ctx, tasksAny)
 	}
+	if stopper, ok := coordAny.(interface{ Stop() }); ok {
+		defer stopper.Stop()
+	}
 
 	// Build task ID mapping (user IDs -> internal IDs)
 	taskIDMap := make(map[string]string)
 
 	// Add tasks to coordinator
-	for _, taskAny := range tasksAny {
-		task := taskAny.(map[string]any)
-		userID := task["id"].(string)
-		prompt := task["prompt"].(string)
-		agentType := task["agent_type"].(string)
-
-		priority := 5
-		if p, ok := task["priority"].(float64); ok {
-			priority = int(p)
-		}
-
+	for _, task := range topologicallySortedCoordinationTasks(definitions) {
 		// Map dependencies to internal IDs
-		var deps []string
-		if depsAny, ok := task["depends_on"].([]any); ok {
-			for _, depAny := range depsAny {
-				depUserID := depAny.(string)
-				if internalID, exists := taskIDMap[depUserID]; exists {
-					deps = append(deps, internalID)
-				}
-			}
+		deps := make([]string, 0, len(task.Dependencies))
+		for _, dependencyID := range task.Dependencies {
+			deps = append(deps, taskIDMap[dependencyID])
 		}
 
-		internalID := coord.AddTask(prompt, agentType, priority, deps)
-		taskIDMap[userID] = internalID
+		internalID := coord.AddTask(task.Prompt, task.AgentType, task.Priority, deps)
+		taskIDMap[task.ID] = internalID
 	}
 
 	// Start coordination
@@ -291,7 +373,7 @@ func (t *CoordinateTool) Execute(ctx context.Context, args map[string]any) (Tool
 			logging.Debug("failed to unmarshal task result", "error", err, "taskID", userID)
 		}
 
-		if result.Status == "completed" || result.Error == "" {
+		if result.Status == "completed" {
 			sb.WriteString("Status: **Completed**\n")
 			succeeded++
 		} else {
@@ -316,6 +398,44 @@ func (t *CoordinateTool) Execute(ctx context.Context, args map[string]any) (Tool
 	return NewSuccessResult(sb.String()), nil
 }
 
+func formatCoordinationResults(tasks []CoordinatedTaskDef, results map[string]CoordinationResult) ToolResult {
+	var sb strings.Builder
+	sb.WriteString("## Coordination Complete\n\n")
+	succeeded := 0
+	failed := 0
+	for _, task := range tasks {
+		result, exists := results[task.ID]
+		sb.WriteString(fmt.Sprintf("### Task: %s\n", task.ID))
+		if !exists {
+			sb.WriteString("Status: No result\n\n")
+			failed++
+			continue
+		}
+		if result.Status == "completed" && result.Completed {
+			sb.WriteString("Status: **Completed**\n")
+			succeeded++
+		} else {
+			errorMessage := result.Error
+			if errorMessage == "" {
+				errorMessage = result.Status
+			}
+			sb.WriteString(fmt.Sprintf("Status: **Failed** - %s\n", errorMessage))
+			failed++
+		}
+		if result.Output != "" {
+			output := result.Output
+			if len(output) > 500 {
+				output = output[:500] + "...[truncated]"
+			}
+			sb.WriteString(fmt.Sprintf("Output:\n```\n%s\n```\n", output))
+		}
+		sb.WriteString("\n")
+	}
+	sb.WriteString(fmt.Sprintf("---\n**Summary:** %d succeeded, %d failed out of %d tasks\n",
+		succeeded, failed, len(tasks)))
+	return NewSuccessResult(sb.String())
+}
+
 // executeSimple is a fallback when coordinator interface isn't available.
 func (t *CoordinateTool) executeSimple(ctx context.Context, tasksAny []any) (ToolResult, error) {
 	var sb strings.Builder
@@ -335,4 +455,131 @@ func (t *CoordinateTool) executeSimple(ctx context.Context, tasksAny []any) (Too
 	sb.WriteString("Execute each task sequentially using the tools available to you (bash, read, write, edit, git, web, etc.).\n")
 
 	return NewSuccessResult(sb.String()), nil
+}
+
+func coordinateIntArg(args map[string]any, key string, defaultValue int) (int, bool) {
+	value, exists := args[key]
+	if !exists || value == nil {
+		return defaultValue, true
+	}
+	switch number := value.(type) {
+	case int:
+		return number, true
+	case int32:
+		return int(number), true
+	case int64:
+		return int(number), int64(int(number)) == number
+	case float32:
+		converted := int(number)
+		return converted, float32(converted) == number
+	case float64:
+		converted := int(number)
+		return converted, float64(converted) == number
+	case json.Number:
+		parsed, err := number.Int64()
+		return int(parsed), err == nil && int64(int(parsed)) == parsed
+	default:
+		return 0, false
+	}
+}
+
+func coordinateDependencies(value any) ([]string, bool) {
+	if value == nil {
+		return nil, true
+	}
+	switch dependencies := value.(type) {
+	case []string:
+		clone := append([]string(nil), dependencies...)
+		for _, dependency := range clone {
+			if strings.TrimSpace(dependency) == "" {
+				return nil, false
+			}
+		}
+		return clone, true
+	case []any:
+		result := make([]string, 0, len(dependencies))
+		for _, rawDependency := range dependencies {
+			dependency, ok := rawDependency.(string)
+			if !ok || strings.TrimSpace(dependency) == "" {
+				return nil, false
+			}
+			result = append(result, dependency)
+		}
+		return result, true
+	default:
+		return nil, false
+	}
+}
+
+func coordinateDependencyCycle(graph map[string][]string) []string {
+	const (
+		visiting = 1
+		visited  = 2
+	)
+	state := make(map[string]int, len(graph))
+	path := make([]string, 0, len(graph))
+	var visit func(string) []string
+	visit = func(taskID string) []string {
+		switch state[taskID] {
+		case visited:
+			return nil
+		case visiting:
+			start := 0
+			for i, pathID := range path {
+				if pathID == taskID {
+					start = i
+					break
+				}
+			}
+			cycle := append([]string(nil), path[start:]...)
+			return append(cycle, taskID)
+		}
+		state[taskID] = visiting
+		path = append(path, taskID)
+		for _, dependency := range graph[taskID] {
+			if cycle := visit(dependency); len(cycle) > 0 {
+				return cycle
+			}
+		}
+		path = path[:len(path)-1]
+		state[taskID] = visited
+		return nil
+	}
+	for taskID := range graph {
+		if cycle := visit(taskID); len(cycle) > 0 {
+			return cycle
+		}
+	}
+	return nil
+}
+
+func topologicallySortedCoordinationTasks(tasks []CoordinatedTaskDef) []CoordinatedTaskDef {
+	remaining := append([]CoordinatedTaskDef(nil), tasks...)
+	ordered := make([]CoordinatedTaskDef, 0, len(tasks))
+	added := make(map[string]bool, len(tasks))
+	for len(remaining) > 0 {
+		next := make([]CoordinatedTaskDef, 0, len(remaining))
+		for _, task := range remaining {
+			ready := true
+			for _, dependency := range task.Dependencies {
+				if !added[dependency] {
+					ready = false
+					break
+				}
+			}
+			if !ready {
+				next = append(next, task)
+				continue
+			}
+			ordered = append(ordered, task)
+			added[task.ID] = true
+		}
+		if len(next) == len(remaining) {
+			// Validate rejects this state; retaining the remaining definitions
+			// makes this helper total for direct package callers as well.
+			return append(ordered, next...)
+		}
+		remaining = next
+	}
+	return ordered
 }

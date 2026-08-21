@@ -68,7 +68,7 @@ func TestIsReadOnlyForPlanMode(t *testing.T) {
 		"git_branch", "todo", "memory", "pin_context",
 		"enter_plan_mode", "exit_plan_mode", "update_plan_progress",
 		"ask_agent", "coordinate", "shared_memory", "update_scratchpad",
-		"request_tool", "task", "task_stop",
+		"task", "task_stop",
 		"memorize", "batch", "refactor", "verify_code", "check_impact",
 		"undo_plan", "redo_plan",
 	}

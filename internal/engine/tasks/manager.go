@@ -2,13 +2,22 @@ package tasks
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
+	"github.com/ginkida/gokin-studio/internal/engine/logging"
 	"github.com/ginkida/gokin-studio/internal/engine/security"
 )
+
+var removeTaskOutputFile = os.Remove
+
+// ErrManagerClosed is returned when new work is submitted after the manager
+// has entered its permanent teardown phase.
+var ErrManagerClosed = errors.New("task manager is closed")
 
 // CompletionHandler is called when a task completes.
 type CompletionHandler func(task *Task)
@@ -21,6 +30,13 @@ type Manager struct {
 
 	onComplete CompletionHandler
 	sandbox    bool
+	closed     bool
+	// monitorWG covers completion callbacks as well as the channel observer.
+	// monitorDone is closed once the permanent Close gate guarantees no future
+	// Add can race Wait.
+	monitorWG          sync.WaitGroup
+	monitorsDone       chan struct{}
+	monitorWaitStarted bool
 
 	mu sync.RWMutex
 }
@@ -29,9 +45,10 @@ type Manager struct {
 func NewManager(workDir string) *Manager {
 	isolation := security.DetectWorkspaceIsolation()
 	return &Manager{
-		tasks:   make(map[string]*Task),
-		workDir: workDir,
-		sandbox: isolation.Available,
+		tasks:        make(map[string]*Task),
+		workDir:      workDir,
+		sandbox:      isolation.Available,
+		monitorsDone: make(chan struct{}),
 	}
 }
 
@@ -75,26 +92,29 @@ func (m *Manager) Start(ctx context.Context, command string) (string, error) {
 // the host network. Callers must exact-gate allowNetwork=true.
 func (m *Manager) StartWithNetwork(ctx context.Context, command string, allowNetwork bool) (string, error) {
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return "", ErrManagerClosed
+	}
 	m.counter++
 	id := fmt.Sprintf("task_%d_%d", time.Now().Unix(), m.counter)
 
 	task := NewTask(id, command, m.workDir)
 	task.Sandboxed = m.sandbox
 	task.AllowNetwork = allowNetwork
-	m.tasks[id] = task
-	onComplete := m.onComplete
-	m.mu.Unlock()
-
-	// Start the task
 	if err := task.Start(ctx); err != nil {
-		m.mu.Lock()
-		delete(m.tasks, id)
 		m.mu.Unlock()
 		return "", err
 	}
+	// Publish only after Task.Start has made the task cancellable and changed
+	// it to Running. Teardown can therefore never observe an uncancellable
+	// Pending task between map insertion and startup.
+	m.tasks[id] = task
+	m.monitorWG.Add(1)
+	m.mu.Unlock()
 
 	// Monitor for completion
-	go m.monitorTask(task, onComplete)
+	go m.monitorTask(task)
 
 	return id, nil
 }
@@ -113,37 +133,52 @@ func (m *Manager) StartWithArgsAndNetwork(
 	allowNetwork bool,
 ) (string, error) {
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return "", ErrManagerClosed
+	}
 	m.counter++
 	id := fmt.Sprintf("task_%d_%d", time.Now().Unix(), m.counter)
 
 	task := NewTaskWithArgs(id, program, args, m.workDir)
 	task.Sandboxed = m.sandbox
 	task.AllowNetwork = allowNetwork
-	m.tasks[id] = task
-	onComplete := m.onComplete
-	m.mu.Unlock()
-
-	// Start the task
 	if err := task.Start(ctx); err != nil {
-		m.mu.Lock()
-		delete(m.tasks, id)
 		m.mu.Unlock()
 		return "", err
 	}
+	m.tasks[id] = task
+	m.monitorWG.Add(1)
+	m.mu.Unlock()
 
 	// Monitor for completion
-	go m.monitorTask(task, onComplete)
+	go m.monitorTask(task)
 
 	return id, nil
 }
 
 // monitorTask waits for task completion and calls the handler.
-func (m *Manager) monitorTask(task *Task, onComplete CompletionHandler) {
+func (m *Manager) monitorTask(task *Task) {
+	defer m.monitorWG.Done()
 	<-task.Done()
 
+	m.mu.RLock()
+	onComplete := m.onComplete
+	m.mu.RUnlock()
 	if onComplete != nil {
-		onComplete(task)
+		callCompletionHandler(onComplete, task)
 	}
+}
+
+func callCompletionHandler(handler CompletionHandler, task *Task) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			logging.Warn("background task completion handler panicked",
+				"task_id", task.ID,
+				"panic", fmt.Sprint(recovered))
+		}
+	}()
+	handler(task)
 }
 
 // Get returns a task by ID.
@@ -178,6 +213,41 @@ func (m *Manager) GetInfo(id string) (Info, bool) {
 	return task.GetInfo(), true
 }
 
+// Wait blocks until the task has finished closing its process and output
+// stream. A cancelled status is published eagerly, so status polling alone is
+// not a safe completion barrier.
+func (m *Manager) Wait(ctx context.Context, id string) (Info, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.mu.RLock()
+	task, ok := m.tasks[id]
+	m.mu.RUnlock()
+	if !ok {
+		return Info{}, fmt.Errorf("task not found: %s", id)
+	}
+
+	// Give an already-settled task deterministic precedence over a context that
+	// was cancelled at the same boundary. The second probe closes the small race
+	// where both cases become ready before select chooses the context branch.
+	select {
+	case <-task.Done():
+		return task.GetInfo(), nil
+	default:
+	}
+	select {
+	case <-task.Done():
+		return task.GetInfo(), nil
+	case <-ctx.Done():
+		select {
+		case <-task.Done():
+			return task.GetInfo(), nil
+		default:
+			return task.GetInfo(), ctx.Err()
+		}
+	}
+}
+
 // Cancel cancels a running task.
 func (m *Manager) Cancel(id string) error {
 	m.mu.RLock()
@@ -188,7 +258,9 @@ func (m *Manager) Cancel(id string) error {
 		return fmt.Errorf("task not found: %s", id)
 	}
 
-	task.Cancel()
+	if !task.Cancel() {
+		return fmt.Errorf("task is not running: %s", id)
+	}
 	return nil
 }
 
@@ -201,6 +273,7 @@ func (m *Manager) List() []Info {
 	for _, task := range m.tasks {
 		result = append(result, task.GetInfo())
 	}
+	sortTaskInfoNewestFirst(result)
 	return result
 }
 
@@ -215,6 +288,7 @@ func (m *Manager) ListRunning() []Info {
 			result = append(result, task.GetInfo())
 		}
 	}
+	sortTaskInfoNewestFirst(result)
 	return result
 }
 
@@ -229,7 +303,17 @@ func (m *Manager) ListCompleted() []Info {
 			result = append(result, task.GetInfo())
 		}
 	}
+	sortTaskInfoNewestFirst(result)
 	return result
+}
+
+func sortTaskInfoNewestFirst(infos []Info) {
+	sort.Slice(infos, func(i, j int) bool {
+		if infos[i].StartTime.Equal(infos[j].StartTime) {
+			return infos[i].ID < infos[j].ID
+		}
+		return infos[i].StartTime.After(infos[j].StartTime)
+	})
 }
 
 // Cleanup removes completed tasks older than the given duration.
@@ -244,7 +328,11 @@ func (m *Manager) Cleanup(maxAge time.Duration) int {
 		if task.IsCompleteAndBefore(cutoff) {
 			// Clean up output file if it exists
 			if fp := task.Output.FilePath(); fp != "" {
-				os.Remove(fp)
+				if err := removeTaskOutputFile(fp); err != nil && !os.IsNotExist(err) {
+					// Retain the task so a later cleanup can retry and the orphan is
+					// still discoverable through its output path.
+					continue
+				}
 			}
 			delete(m.tasks, id)
 			count++
@@ -266,6 +354,48 @@ func (m *Manager) CancelAll() {
 
 	for _, task := range tasks {
 		task.Cancel()
+	}
+}
+
+// Close permanently rejects new tasks, cancels every task that is still
+// running, and waits until process/output cleanup and completion observers have
+// finished. Repeated calls are safe; a call whose context expires can be
+// retried with a fresh context to wait for the same completion barriers.
+func (m *Manager) Close(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.mu.Lock()
+	m.closed = true
+	all := make([]*Task, 0, len(m.tasks))
+	for _, task := range m.tasks {
+		all = append(all, task)
+	}
+	if !m.monitorWaitStarted {
+		m.monitorWaitStarted = true
+		go func() {
+			m.monitorWG.Wait()
+			close(m.monitorsDone)
+		}()
+	}
+	monitorsDone := m.monitorsDone
+	m.mu.Unlock()
+
+	for _, task := range all {
+		task.Cancel()
+	}
+	for _, task := range all {
+		select {
+		case <-task.Done():
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	select {
+	case <-monitorsDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

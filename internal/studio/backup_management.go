@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -21,6 +22,13 @@ const preImportPrefix = ".gokin-studio.pre-import-"
 // surface (list/delete/restore + auto-cleanup).
 const preRestorePrefix = ".gokin-studio.pre-restore-"
 
+// restoreClaimPrefix is still covered by preRestorePrefix, so a process crash
+// after claiming a snapshot cannot strand it outside the normal backup list.
+// The claim closes the check/rename pathname race in RestorePreImportBackup:
+// validation and promotion operate on the same renamed directory, while a new
+// object planted at the user-facing name remains unrelated.
+const restoreClaimPrefix = preRestorePrefix + "claim-"
+
 // snapshotPrefixes is the full list of folder-name prefixes that
 // ListPreImportBackups, DeletePreImportBackup, RestorePreImportBackup, and
 // the cleanup sweepers should recognise. Adding a new prefix here makes
@@ -31,6 +39,164 @@ const preRestorePrefix = ".gokin-studio.pre-restore-"
 // of all snapshot prefixes. Internal helpers use the generalised
 // `validateBackupName` accordingly.
 var snapshotPrefixes = []string{preImportPrefix, preRestorePrefix}
+
+// archivePathNow is a narrow test seam for proving same-second operations do
+// not collide. Production always uses time.Now.
+var (
+	archivePathNow  = time.Now
+	configDirRename = os.Rename
+)
+
+// moveDirToUniqueSnapshot moves src to a collision-resistant snapshot name.
+// MkdirTemp reserves an unpredictable sibling atomically; removing the empty
+// placeholder immediately before Rename keeps the final on-disk shape backward
+// compatible (config.yaml remains at the snapshot root). If another process
+// wins the tiny handoff window, retry with a new random name.
+func moveDirToUniqueSnapshot(src, parent, prefix string) (string, error) {
+	const attempts = 8
+	createdAt := archivePathNow()
+	pattern := prefix + createdAt.Format("20060102-150405") + "-"
+	for range attempts {
+		reserved, err := os.MkdirTemp(parent, pattern)
+		if err != nil {
+			return "", err
+		}
+		if err := os.Remove(reserved); err != nil {
+			return "", err
+		}
+		if err := configDirRename(src, reserved); err == nil {
+			// Rename preserves the source directory's potentially old mtime, while
+			// ListPreImportBackups uses it as CreatedAtMs and its sort key.
+			// Touch best-effort only: after a successful move, reporting a failure
+			// would strand the active config behind an apparent error.
+			_ = os.Chtimes(reserved, createdAt, createdAt)
+			return reserved, nil
+		} else if _, collisionErr := os.Lstat(reserved); collisionErr == nil {
+			continue
+		} else {
+			return "", err
+		}
+	}
+	return "", errors.New("could not allocate a unique snapshot path")
+}
+
+// claimSnapshotDir atomically detaches one selected snapshot from its public
+// name into a collision-resistant, still-discoverable sibling. It remembers
+// the snapshot's age for rollback, while the on-disk claim gets a fresh mtime
+// so a concurrent cleanup process cannot classify active restore work as old.
+type snapshotClaim struct {
+	path            string
+	originalPath    string
+	originalModTime time.Time
+	originalMode    os.FileMode
+	restoreModTime  bool
+}
+
+func claimSnapshotDir(src, parent string) (snapshotClaim, error) {
+	const attempts = 8
+	claimedAt := archivePathNow()
+	pattern := restoreClaimPrefix + strconv.FormatInt(claimedAt.UnixMilli(), 10) + "-"
+	for range attempts {
+		claimed, err := os.MkdirTemp(parent, pattern)
+		if err != nil {
+			return snapshotClaim{}, err
+		}
+		if err := os.Remove(claimed); err != nil {
+			return snapshotClaim{}, err
+		}
+		if err := configDirRename(src, claimed); err == nil {
+			info, statErr := os.Lstat(claimed)
+			if statErr != nil {
+				claim := snapshotClaim{path: claimed, originalPath: src}
+				return snapshotClaim{}, returnClaimedSnapshot(claim, fmt.Errorf("cannot inspect claimed backup: %w", statErr))
+			}
+			claim := snapshotClaim{
+				path:            claimed,
+				originalPath:    src,
+				originalModTime: info.ModTime(),
+				originalMode:    info.Mode().Perm(),
+				restoreModTime:  info.Mode()&os.ModeSymlink == 0 && info.IsDir(),
+			}
+			if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+				return claim, nil
+			}
+			// Cleanup uses directory mtime as snapshot age. Refresh it while the
+			// claim is live so another Studio process cannot reap a freshly claimed
+			// but historically old backup in the middle of validation/promotion.
+			if err := os.Chtimes(claimed, claimedAt, claimedAt); err != nil {
+				return snapshotClaim{}, returnClaimedSnapshot(claim, fmt.Errorf("cannot protect claimed backup from cleanup: %w", err))
+			}
+			return claim, nil
+		} else if _, collisionErr := os.Lstat(claimed); collisionErr == nil {
+			continue
+		} else {
+			return snapshotClaim{}, err
+		}
+	}
+	return snapshotClaim{}, errors.New("could not allocate a unique restore claim path")
+}
+
+func snapshotRetentionTime(name string, modTime time.Time) time.Time {
+	if !strings.HasPrefix(name, restoreClaimPrefix) {
+		return modTime
+	}
+	remainder := strings.TrimPrefix(name, restoreClaimPrefix)
+	separator := strings.IndexByte(remainder, '-')
+	if separator <= 0 {
+		return modTime
+	}
+	millis, err := strconv.ParseInt(remainder[:separator], 10, 64)
+	if err != nil || millis <= 0 {
+		return modTime
+	}
+	claimedAt := time.UnixMilli(millis)
+	if claimedAt.After(modTime) {
+		return claimedAt
+	}
+	return modTime
+}
+
+// returnClaimedSnapshot best-effort restores the original public backup name.
+// Never hide the only known copy: if that name has been recreated or rollback
+// fails, the error reports the exact claim path, which remains visible through
+// ListPreImportBackups because it uses restoreClaimPrefix.
+func returnClaimedSnapshot(claim snapshotClaim, cause error) error {
+	if _, err := os.Lstat(claim.originalPath); err == nil {
+		return fmt.Errorf("%w; backup name was recreated; selected backup remains at %s", cause, claim.path)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("%w; cannot inspect original backup name: %v; selected backup remains at %s", cause, err, claim.path)
+	}
+	if err := configDirRename(claim.path, claim.originalPath); err != nil {
+		return fmt.Errorf("%w; could not return selected backup to its original name: %v; selected backup remains at %s", cause, err, claim.path)
+	}
+	if claim.restoreModTime {
+		if err := os.Chmod(claim.originalPath, claim.originalMode); err != nil {
+			return fmt.Errorf("%w; selected backup returned to %s but its original permissions could not be restored: %v", cause, claim.originalPath, err)
+		}
+		if !claim.originalModTime.IsZero() {
+			if err := os.Chtimes(claim.originalPath, claim.originalModTime, claim.originalModTime); err != nil {
+				return fmt.Errorf("%w; selected backup returned to %s but its original timestamp could not be restored: %v", cause, claim.originalPath, err)
+			}
+		}
+	}
+	return cause
+}
+
+// promoteConfigDir installs replacement at liveDir and restores the safety
+// snapshot if promotion fails. A failed rollback is surfaced with the exact
+// recovery path instead of being silently discarded.
+func promoteConfigDir(replacement, liveDir, safetyPath string) error {
+	if err := configDirRename(replacement, liveDir); err != nil {
+		if safetyPath == "" {
+			return fmt.Errorf("promotion failed: %w", err)
+		}
+		if rollbackErr := configDirRename(safetyPath, liveDir); rollbackErr != nil {
+			return fmt.Errorf("promotion failed: %w; rollback failed: %v; previous data remains at %s", err, rollbackErr, safetyPath)
+		}
+		return fmt.Errorf("promotion failed: %w (previous data restored)", err)
+	}
+	return nil
+}
 
 // hasSnapshotPrefix returns the matching prefix (or "") so a caller can
 // log it / surface the snapshot kind. Used by listing + cleanup.
@@ -58,6 +224,9 @@ type PreImportBackup struct {
 // ImportAllDataBase64 / CleanupOldData, so anything created by Restore or
 // pruned by Auto-cleanup is consistent.
 func (s *Studio) ListPreImportBackups() ([]PreImportBackup, error) {
+	configDataMu.RLock()
+	defer configDataMu.RUnlock()
+
 	dir := configDir()
 	parent := filepath.Dir(dir)
 	entries, err := os.ReadDir(parent)
@@ -78,10 +247,11 @@ func (s *Studio) ListPreImportBackups() ([]PreImportBackup, error) {
 			continue
 		}
 		full := filepath.Join(parent, name)
+		createdAt := snapshotRetentionTime(name, info.ModTime())
 		out = append(out, PreImportBackup{
 			Name:        name,
 			Path:        full,
-			CreatedAtMs: info.ModTime().UnixMilli(),
+			CreatedAtMs: createdAt.UnixMilli(),
 			Size:        dirSize(full),
 		})
 	}
@@ -136,6 +306,8 @@ func (s *Studio) DeletePreImportBackup(name string) error {
 	if err := validateBackupName(name); err != nil {
 		return err
 	}
+	configDataMu.Lock()
+	defer configDataMu.Unlock()
 	parent := filepath.Dir(configDir())
 	target := filepath.Join(parent, name)
 	// Confirm target really IS a sibling of configDir — protects against
@@ -176,42 +348,55 @@ func (s *Studio) RestorePreImportBackup(name string) (*ImportResult, error) {
 	if err := validateBackupName(name); err != nil {
 		return nil, err
 	}
+	configDataMu.Lock()
+	defer configDataMu.Unlock()
 	dir := configDir()
 	parent := filepath.Dir(dir)
 	target := filepath.Join(parent, name)
 
-	info, err := os.Lstat(target)
+	claim, err := claimSnapshotDir(target, parent)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, errors.New("backup not found")
 		}
-		return nil, fmt.Errorf("cannot stat backup: %w", err)
+		return nil, fmt.Errorf("cannot claim backup for restore: %w", err)
 	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return nil, errors.New("refusing to follow symlink at backup path")
-	}
-	if !info.IsDir() {
-		return nil, errors.New("backup path is not a directory")
+	returnClaim := func(cause error) error {
+		return returnClaimedSnapshot(claim, cause)
 	}
 
-	stamp := time.Now().Format("20060102-150405")
+	info, err := os.Lstat(claim.path)
+	if err != nil {
+		return nil, returnClaim(fmt.Errorf("cannot stat claimed backup: %w", err))
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, returnClaim(errors.New("refusing to follow symlink at backup path"))
+	}
+	if !info.IsDir() {
+		return nil, returnClaim(errors.New("backup path is not a directory"))
+	}
+	if err := validateStudioConfigFile(filepath.Join(claim.path, "config.yaml")); err != nil {
+		return nil, returnClaim(fmt.Errorf("backup has invalid config.yaml: %w", err))
+	}
+	// The snapshot may predate the 0700 config-root invariant or have been
+	// copied in manually with broader permissions. Harden it before promotion
+	// so active secrets are never exposed even transiently after the rename.
+	if err := os.Chmod(claim.path, 0o700); err != nil {
+		return nil, returnClaim(fmt.Errorf("cannot secure backup before restore: %w", err))
+	}
 
 	// Move current config aside as a pre-restore safety backup.
 	preRestorePath := ""
 	if _, err := os.Stat(dir); err == nil {
-		preRestorePath = filepath.Join(parent, ".gokin-studio.pre-restore-"+stamp)
-		if err := os.Rename(dir, preRestorePath); err != nil {
-			return nil, fmt.Errorf("could not move current config aside: %w", err)
+		preRestorePath, err = moveDirToUniqueSnapshot(dir, parent, preRestorePrefix)
+		if err != nil {
+			return nil, returnClaim(fmt.Errorf("could not move current config aside: %w", err))
 		}
 	}
 
-	// Promote the target backup into the configDir slot.
-	if err := os.Rename(target, dir); err != nil {
-		// Try to roll back the safety move.
-		if preRestorePath != "" {
-			_ = os.Rename(preRestorePath, dir)
-		}
-		return nil, fmt.Errorf("could not promote backup to active: %w", err)
+	// Promote the exact claimed directory, not the reusable public pathname.
+	if err := promoteConfigDir(claim.path, dir, preRestorePath); err != nil {
+		return nil, returnClaim(fmt.Errorf("could not promote backup to active: %w", err))
 	}
 
 	s.logf("info", "backup", "restored from pre-import backup %q (safety backup at %s)", name, preRestorePath)

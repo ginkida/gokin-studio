@@ -61,13 +61,17 @@ type ReflectorSnapshot struct {
 
 // SaveCheckpoint creates and persists a checkpoint.
 func (a *Agent) SaveCheckpoint(reason string) (*AgentCheckpoint, error) {
+	state := a.GetState()
+	a.stateMu.RLock()
+	scratchpad := a.Scratchpad
+	a.stateMu.RUnlock()
 	cp := &AgentCheckpoint{
-		AgentState:        a.GetState(),
+		AgentState:        state,
 		Timestamp:         time.Now(),
 		CheckpointID:      fmt.Sprintf("%s-%d", a.ID, time.Now().UnixNano()),
 		TriggerReason:     reason,
 		TurnNumber:        a.GetTurnCount(),
-		ScratchpadContent: a.Scratchpad,
+		ScratchpadContent: scratchpad,
 	}
 
 	// Capture shared memory if available
@@ -75,12 +79,10 @@ func (a *Agent) SaveCheckpoint(reason string) (*AgentCheckpoint, error) {
 		cp.SharedMemorySnapshot = a.exportSharedMemory()
 	}
 
-	// Capture plan tree if active
-	a.stateMu.RLock()
-	planTree := a.activePlan
-	a.stateMu.RUnlock()
-	if planTree != nil {
-		cp.PlanTreeSnapshot = serializePlanTree(planTree)
+	// Keep the compact legacy snapshot for backward compatibility. AgentState
+	// already owns a full deep copy and is the authoritative restore source.
+	if state.ActivePlan != nil {
+		cp.PlanTreeSnapshot = serializePlanTree(state.ActivePlan)
 	}
 
 	// Capture reflector state if available
@@ -100,6 +102,9 @@ func (a *Agent) SaveCheckpoint(reason string) (*AgentCheckpoint, error) {
 
 // RestoreFromCheckpoint restores agent state from checkpoint.
 func (a *Agent) RestoreFromCheckpoint(cp *AgentCheckpoint) error {
+	if cp == nil || cp.AgentState == nil {
+		return fmt.Errorf("cannot restore nil checkpoint state")
+	}
 	// Restore core history and state
 	if err := a.RestoreHistory(cp.AgentState); err != nil {
 		return fmt.Errorf("failed to restore history: %w", err)
@@ -110,12 +115,17 @@ func (a *Agent) RestoreFromCheckpoint(cp *AgentCheckpoint) error {
 		a.importSharedMemory(cp.SharedMemorySnapshot)
 	}
 
-	// Restore plan tree
-	if cp.PlanTreeSnapshot != nil {
-		a.activePlan = deserializePlanTree(cp.PlanTreeSnapshot)
-		if a.activePlan != nil {
-			a.planningMode = true
-		}
+	// AgentState contains the lossless plan representation used by current
+	// versions. Fall back to the compact snapshot for older checkpoints.
+	a.stateMu.RLock()
+	hasActivePlan := a.activePlan != nil
+	a.stateMu.RUnlock()
+	if !hasActivePlan && cp.PlanTreeSnapshot != nil {
+		restoredPlan := deserializePlanTree(cp.PlanTreeSnapshot)
+		a.stateMu.Lock()
+		a.activePlan = restoredPlan
+		a.planningMode = restoredPlan != nil
+		a.stateMu.Unlock()
 	}
 
 	// Restore reflector state
@@ -124,7 +134,9 @@ func (a *Agent) RestoreFromCheckpoint(cp *AgentCheckpoint) error {
 	}
 
 	// Restore scratchpad
+	a.stateMu.Lock()
 	a.Scratchpad = cp.ScratchpadContent
+	a.stateMu.Unlock()
 
 	return nil
 }
@@ -141,18 +153,17 @@ func (a *Agent) exportSharedMemory() map[string]*SharedEntry {
 
 // importSharedMemory imports shared memory entries from checkpoint.
 func (a *Agent) importSharedMemory(snapshot map[string]*SharedEntry) {
-	for key, entry := range snapshot {
-		// Skip expired entries
-		if entry.IsExpired() {
-			continue
-		}
-		a.sharedMemory.WriteWithTTL(key, entry.Value, entry.Type, entry.Source, entry.TTL)
-	}
+	a.sharedMemory.restoreEntries(snapshot)
 }
 
 // serializePlanTree converts a PlanTree to serializable form.
 func serializePlanTree(tree *PlanTree) *SerializedPlanTree {
-	if tree == nil || tree.Root == nil {
+	if tree == nil {
+		return nil
+	}
+	tree.mu.RLock()
+	defer tree.mu.RUnlock()
+	if tree.Root == nil {
 		return nil
 	}
 
@@ -161,10 +172,15 @@ func serializePlanTree(tree *PlanTree) *SerializedPlanTree {
 		Nodes:      make(map[string]*SerializedPNode),
 		TotalNodes: tree.TotalNodes,
 	}
+	if tree.Goal != nil {
+		st.Goal = tree.Goal.Description
+	}
 
 	// Serialize current path
 	for _, node := range tree.BestPath {
-		st.CurrentPath = append(st.CurrentPath, node.ID)
+		if node != nil {
+			st.CurrentPath = append(st.CurrentPath, node.ID)
+		}
 	}
 
 	// Serialize all nodes
@@ -191,7 +207,7 @@ func serializeNode(node *PlanNode, nodes map[string]*SerializedPNode) {
 			AgentType: string(node.Action.AgentType),
 			Prompt:    node.Action.Prompt,
 			ToolName:  node.Action.ToolName,
-			ToolArgs:  node.Action.ToolArgs,
+			ToolArgs:  cloneStringAnyMap(node.Action.ToolArgs),
 		}
 	}
 
@@ -218,9 +234,15 @@ func deserializePlanTree(st *SerializedPlanTree) *PlanTree {
 		TotalNodes: st.TotalNodes,
 		nodeIndex:  make(map[string]*PlanNode),
 	}
+	if st.Goal != "" {
+		tree.Goal = &PlanGoal{Description: st.Goal}
+	}
 
 	// Reconstruct nodes
 	for id, sn := range st.Nodes {
+		if sn == nil {
+			continue
+		}
 		node := &PlanNode{
 			ID:     id,
 			Status: PlanNodeStatus(sn.Status),
@@ -233,15 +255,21 @@ func deserializePlanTree(st *SerializedPlanTree) *PlanTree {
 				AgentType: AgentType(sn.Action.AgentType),
 				Prompt:    sn.Action.Prompt,
 				ToolName:  sn.Action.ToolName,
-				ToolArgs:  sn.Action.ToolArgs,
+				ToolArgs:  cloneStringAnyMap(sn.Action.ToolArgs),
 				NodeID:    id,
 			}
 		}
 
 		if sn.Result != "" || sn.Error != "" {
+			status := AgentStatusCompleted
+			if sn.Error != "" {
+				status = AgentStatusFailed
+			}
 			node.Result = &AgentResult{
-				Output: sn.Result,
-				Error:  sn.Error,
+				Status:    status,
+				Output:    sn.Result,
+				Error:     sn.Error,
+				Completed: true,
 			}
 		}
 
@@ -251,6 +279,9 @@ func deserializePlanTree(st *SerializedPlanTree) *PlanTree {
 	// Reconstruct parent-child relationships
 	for id, sn := range st.Nodes {
 		node := tree.nodeIndex[id]
+		if sn == nil || node == nil {
+			continue
+		}
 		for _, childID := range sn.Children {
 			if child, ok := tree.nodeIndex[childID]; ok {
 				node.Children = append(node.Children, child)
@@ -261,12 +292,20 @@ func deserializePlanTree(st *SerializedPlanTree) *PlanTree {
 
 	// Set root
 	tree.Root = tree.nodeIndex[st.RootID]
+	if tree.Root == nil {
+		return nil
+	}
 
 	// Reconstruct best path
 	for _, nodeID := range st.CurrentPath {
 		if node, ok := tree.nodeIndex[nodeID]; ok {
 			tree.BestPath = append(tree.BestPath, node)
 		}
+	}
+	if len(tree.BestPath) > 0 {
+		tree.CurrentNode = tree.BestPath[len(tree.BestPath)-1]
+	} else {
+		tree.CurrentNode = tree.Root
 	}
 
 	return tree

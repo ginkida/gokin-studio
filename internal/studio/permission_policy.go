@@ -115,6 +115,14 @@ func hardGatedTool(name string, args map[string]any) bool {
 			return true
 		}
 		return false
+	case "delegate":
+		// Committing another project to paid work under its own permission
+		// mode is reviewed exactly, every time, and is never rememberable.
+		switch strings.ToLower(strings.TrimSpace(stringArg(args, "action"))) {
+		case "ask", "run", "batch":
+			return true
+		}
+		return false
 	case "document_create":
 		replace, _ := args["replace"].(bool)
 		return replace

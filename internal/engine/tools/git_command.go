@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"github.com/ginkida/gokin-studio/internal/engine/wsl"
 	"os/exec"
 )
 
@@ -18,5 +19,7 @@ func newGitCommand(ctx context.Context, workDir string, args ...string) *exec.Cm
 	safeArgs = append(safeArgs, args...)
 	cmd := exec.CommandContext(ctx, "git", safeArgs...)
 	cmd.Dir = workDir
+	// Inert for every non-WSL directory, which is every directory off Windows.
+	wsl.ApplyGit(cmd, workDir, append([]string{"git"}, safeArgs...))
 	return cmd
 }

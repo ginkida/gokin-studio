@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
 import { useSettingsStore, Settings, SETTINGS_FIELD_KEYS, settingsEqual } from '../../stores/settingsStore'
 import { useProjectStore } from '../../stores/projectStore'
 import { useChatStore } from '../../stores/chatStore'
-import { UpdateSettings, GetClipboardText, CheckProviderHealth, CheckProviderHealthWithKey, GetProviderCredentialSources, ListUserSnippets, SaveUserSnippet, DeleteUserSnippet, GetBuildInfo, GetUpdateStatus, CheckForUpdates, GetQuickEntryStatus, GetSpeechDictationStatus, RequestSpeechDictationPermissions, GetWakeStatus, GetWorkspaceIsolationStatus, ListLocalEnvironment, SaveLocalEnvironment, ListExternalBrowserPermissions, RevokeExternalBrowserPermission, GetDiagnostics, DiagnosticsReport, GetRecentLogs, ClearLogs, ExportAllDataBase64, ImportAllDataBase64, CleanupOldData, CleanupPreviewDefaults, ListPreImportBackups, DeletePreImportBackup, RestorePreImportBackup, ListAutoBackups, DeleteAutoBackup, RestoreAutoBackup, OpenConfigDir, OpenAutoBackupsDir, ExportLogsCSV, ListMCPServers, SaveMCPServer, RemoveMCPServer, TestMCPServer, AuthorizeMCPServer, DisconnectMCPServerOAuth, SelectMCPBundle, InstallMCPBundle, BrowseMCPBundleConfigPath, ListInstalledPlugins, SelectPluginBundle, InstallPluginBundle, SetPluginEnabled, RemovePlugin, InspectPluginMCPConnectors, ImportPluginMCPConnector, InspectPluginHooks, SetPluginHooksEnabled } from '../../../wailsjs/go/studio/Studio'
+import { UpdateSettings, GetClipboardText, CheckProviderHealth, CheckProviderHealthWithKey, GetProviderCredentialSources, ListUserSnippets, SaveUserSnippet, DeleteUserSnippet, GetBuildInfo, GetUpdateStatus, CheckForUpdates, GetQuickEntryStatus, GetSpeechDictationStatus, RequestSpeechDictationPermissions, GetWakeStatus, GetWorkspaceIsolationStatus, ListLocalEnvironment, SaveLocalEnvironment, ListExternalBrowserPermissions, RevokeExternalBrowserPermission, GetDiagnostics, DiagnosticsReport, GetRecentLogs, ClearLogs, ExportAllDataBase64, ExportAllDataToFile, ImportAllDataBase64, SelectRestoreArchiveFile, ConfirmSelectedRestoreArchive, DiscardSelectedRestoreArchive, CleanupOldData, CleanupPreviewDefaults, ListPreImportBackups, DeletePreImportBackup, RestorePreImportBackup, ListAutoBackups, DeleteAutoBackup, RestoreAutoBackup, OpenConfigDir, OpenAutoBackupsDir, ExportLogsCSV, ListMCPServers, SaveMCPServer, RemoveMCPServer, TestMCPServer, AuthorizeMCPServer, DisconnectMCPServerOAuth, SelectMCPBundle, InstallMCPBundle, BrowseMCPBundleConfigPath, ListInstalledPlugins, SelectPluginBundle, InstallPluginBundle, SetPluginEnabled, RemovePlugin, InspectPluginMCPConnectors, ImportPluginMCPConnector, InspectPluginHooks, SetPluginHooksEnabled } from '../../../wailsjs/go/studio/Studio'
 import { Eye, EyeOff, Save, Sun, Moon, Monitor, CheckCircle, AlertCircle, Keyboard, Info, Clipboard, Brain, Wifi, Loader2, DollarSign, Trash2, Plus, RotateCcw, Activity, Download, AlertTriangle, FileText, Archive, Upload, Sparkle, History, FolderOpen, LogIn, LogOut, ShieldCheck, Bell, BellOff, X, Mic, GitPullRequest } from 'lucide-react'
 import { resetAllPreferences } from '../../lib/mutedProjects'
 import { formatContextWindow } from '../../lib/modelCapabilities'
@@ -10,9 +10,11 @@ import { formatModelLabel, formatProviderModelLabel } from '../../lib/providerCa
 import { studioReasoningControlKind } from '../../lib/studioModelIds'
 import { applyThemePreference } from '../../lib/theme'
 import { scrollIntoViewWithMotion, scrollToWithMotion } from '../../lib/motion'
+import { decodeBackupBase64Chunks, validateBackupImportFile } from '../../lib/backupImport'
 import { useConfirmDialog } from '../common/AppDialog'
 import { hasOpenModal } from '../../hooks/useModalFocusManagement'
 import { BrowserOpenURL, ClipboardSetText } from '../../../wailsjs/runtime/runtime'
+import { downloadBlob } from '../../lib/download'
 
 const KEY_PROVIDER_MAP: Record<string, keyof Settings> = {
   glm: 'glmKey',
@@ -69,6 +71,10 @@ type LocalEnvironmentStatus = {
 }
 
 type BrowserPermission = { origin: string }
+
+type PendingRestore =
+  | { source: 'native'; filename: string; size: number; token: string }
+  | { source: 'bridge'; filename: string; size: number; base64: string }
 
 type MCPServerStatus = {
   name: string
@@ -755,6 +761,7 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
   const [autoLoading, setAutoLoading] = useState(false)
   const [autoError, setAutoError] = useState<string | null>(null)
   const [confirmDeleteAuto, setConfirmDeleteAuto] = useState<string | null>(null)
+  const [autoDeleteBusy, setAutoDeleteBusy] = useState(false)
   const [confirmRestoreAuto, setConfirmRestoreAuto] = useState<any>(null)
   const [autoRestoreBusy, setAutoRestoreBusy] = useState(false)
   const [autoRestoreSuccess, setAutoRestoreSuccess] = useState<string | null>(null)
@@ -771,17 +778,23 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
   }
   useEffect(() => { refreshAutoBackupsList() }, [])
   const handleAutoDelete = async (name: string) => {
+    setAutoDeleteBusy(true)
+    setAutoError(null)
+    setAutoRestoreSuccess(null)
     try {
       await DeleteAutoBackup(name)
       setConfirmDeleteAuto(null)
       refreshAutoBackupsList()
     } catch (e: any) {
       setAutoError(String(e?.message || e || 'delete failed'))
+    } finally {
+      setAutoDeleteBusy(false)
     }
   }
   const handleAutoRestore = async (name: string) => {
     setAutoRestoreBusy(true)
     setAutoError(null)
+    setAutoRestoreSuccess(null)
     try {
       const result: any = await RestoreAutoBackup(name)
       setAutoRestoreSuccess(
@@ -804,6 +817,7 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
   const [backupsLoading, setBackupsLoading] = useState(false)
   const [backupsError, setBackupsError] = useState<string | null>(null)
   const [confirmDeleteBackup, setConfirmDeleteBackup] = useState<string | null>(null)
+  const [backupDeleteBusy, setBackupDeleteBusy] = useState(false)
   const [confirmRestoreBackup, setConfirmRestoreBackup] = useState<any>(null)
   const [restoreBackupBusy, setRestoreBackupBusy] = useState(false)
   const [restoreBackupSuccess, setRestoreBackupSuccess] = useState<string | null>(null)
@@ -821,17 +835,23 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
   }
   useEffect(() => { refreshBackupsList() }, [])
   const handleBackupDelete = async (name: string) => {
+    setBackupDeleteBusy(true)
+    setBackupsError(null)
+    setRestoreBackupSuccess(null)
     try {
       await DeletePreImportBackup(name)
       setConfirmDeleteBackup(null)
       refreshBackupsList()
     } catch (e: any) {
       setBackupsError(String(e?.message || e || 'delete failed'))
+    } finally {
+      setBackupDeleteBusy(false)
     }
   }
   const handleBackupRestore = async (name: string) => {
     setRestoreBackupBusy(true)
     setBackupsError(null)
+    setRestoreBackupSuccess(null)
     try {
       const result: any = await RestorePreImportBackup(name)
       setRestoreBackupSuccess(
@@ -857,6 +877,12 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
   const [cleanupError, setCleanupError] = useState<string | null>(null)
   const [cleanupPreview, setCleanupPreview] = useState<any>(null)
   const [cleanupResult, setCleanupResult] = useState<any>(null)
+  const cleanupRemovedCount = (value: any) =>
+    (value?.staleReplaysRemoved || 0) +
+    (value?.preImportDirsRemoved || 0) +
+    (value?.stagingDirsRemoved || 0) +
+    (value?.autoBackupsRemoved || 0) +
+    (value?.delegationRunsRemoved || 0)
 
   const handleCleanupPreview = async () => {
     setCleanupBusy(true)
@@ -875,7 +901,7 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
     setCleanupBusy(true)
     setCleanupError(null)
     try {
-      const result: any = await CleanupOldData({ replayAgeDays: 7, preImportDays: 30, dryRun: false })
+      const result: any = await CleanupOldData({ replayAgeDays: 7, preImportDays: 30, delegationAgeDays: 30, dryRun: false })
       setCleanupResult(result)
       setCleanupPreview(null)
       // Refresh diagnostics so the stale-replays check updates.
@@ -911,12 +937,13 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         if ((e as any).isComposing || e.keyCode === 229) return
+        if (cleanupBusy) return
         setShowDiag(false)
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [showDiag])
+  }, [showDiag, cleanupBusy])
 
   // Logs viewer modal (iter 710+). Companion to diagnostics — surfaces
   // recent backend events (errors, warnings, retries) so users can debug
@@ -1033,29 +1060,74 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
   const [backupError, setBackupError] = useState<string | null>(null)
   const [backupSuccess, setBackupSuccess] = useState<string | null>(null)
   const [restoreBusy, setRestoreBusy] = useState(false)
+  const [restoreSelectionBusy, setRestoreSelectionBusy] = useState(false)
   const [restoreError, setRestoreError] = useState<string | null>(null)
   const [restoreSuccess, setRestoreSuccess] = useState<string | null>(null)
-  const [confirmRestore, setConfirmRestore] = useState<{ filename: string; base64: string; size: number } | null>(null)
+  const [restoreFileReading, setRestoreFileReading] = useState<string | null>(null)
+  const [confirmRestore, setConfirmRestore] = useState<PendingRestore | null>(null)
+  const restoreFileInputRef = useRef<HTMLInputElement | null>(null)
+  const restoreFileRequestRef = useRef(0)
+  const restoreNativeRequestRef = useRef(0)
+  const restoreNativeTokenRef = useRef<string | null>(null)
+  const restoreFileReaderRef = useRef<FileReader | null>(null)
+  // These operations all read or replace the same config tree. The backend
+  // serializes them for correctness; mirror that ownership in the UI so a
+  // second request cannot sit behind a destructive restore with stale intent.
+  const dataOperationBusy = backupBusy || restoreSelectionBusy || restoreBusy || backupDeleteBusy || restoreBackupBusy || autoDeleteBusy || autoRestoreBusy || cleanupBusy
+  const dataOperationLabel = (() => {
+    if (backupBusy) return 'Creating and saving a backup…'
+    if (restoreSelectionBusy) return 'Staging the selected backup for review…'
+    if (restoreBusy) return 'Restoring the selected backup…'
+    if (restoreBackupBusy) return 'Restoring the selected rollback snapshot…'
+    if (backupDeleteBusy) return 'Deleting the selected rollback snapshot…'
+    if (autoRestoreBusy) return 'Restoring the selected automatic backup…'
+    if (autoDeleteBusy) return 'Deleting the selected automatic backup…'
+    if (cleanupBusy) return 'Checking and cleaning old data…'
+    return ''
+  })()
+
+  useEffect(() => () => {
+    restoreFileRequestRef.current++
+    restoreNativeRequestRef.current++
+    const activeReader = restoreFileReaderRef.current
+    restoreFileReaderRef.current = null
+    if (activeReader?.readyState === FileReader.LOADING) activeReader.abort()
+    const nativeToken = restoreNativeTokenRef.current
+    restoreNativeTokenRef.current = null
+    const nativeBridge = (window as any)?.go?.studio?.Studio
+    if (nativeToken && typeof nativeBridge?.DiscardSelectedRestoreArchive === 'function') {
+      void DiscardSelectedRestoreArchive(nativeToken).catch(() => {})
+    }
+  }, [])
 
   const handleBackup = async () => {
     setBackupBusy(true)
     setBackupError(null)
     setBackupSuccess(null)
     try {
+      const nativeBridge = (window as any)?.go?.studio?.Studio
+      if (typeof nativeBridge?.ExportAllDataToFile === 'function') {
+        const result: any = await ExportAllDataToFile()
+        if (result.canceled) return
+        const kb = (result.size / 1024).toFixed(1)
+        setBackupSuccess(
+          `Saved ${result.filesCount} file${result.filesCount === 1 ? '' : 's'} (${kb} KB) to:\n${result.path}`,
+        )
+        setTimeout(() => setBackupSuccess(null), 8000)
+        return
+      }
+
+      // Compatibility path for a frontend temporarily paired with an older
+      // backend binding (for example during browser-only UI development).
       const result: any = await ExportAllDataBase64()
-      // Decode base64 → Uint8Array → Blob → download link.
-      const binary = atob(result.base64)
-      const bytes = new Uint8Array(binary.length)
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
-      const blob = new Blob([bytes], { type: 'application/gzip' })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = result.filename
-      document.body.appendChild(a)
-      a.click()
-      document.body.removeChild(a)
-      URL.revokeObjectURL(url)
+      // Decode in bounded chunks: a near-limit archive must not allocate an
+      // additional archive-sized binary string in the WebView.
+      const decoded = decodeBackupBase64Chunks(result.base64)
+      if (!Number.isSafeInteger(result.size) || result.size !== decoded.byteLength) {
+        throw new Error('Backup export size did not match the downloaded archive.')
+      }
+      const blob = new Blob(decoded.chunks, { type: 'application/gzip' })
+      downloadBlob(blob, result.filename)
       const kb = (result.size / 1024).toFixed(1)
       setBackupSuccess(`Saved ${result.filesCount} file${result.filesCount === 1 ? '' : 's'} (${kb} KB).`)
       setTimeout(() => setBackupSuccess(null), 6000)
@@ -1067,10 +1139,26 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
   }
 
   const handleRestoreFile = (file: File) => {
+    const requestID = ++restoreFileRequestRef.current
+    const previousReader = restoreFileReaderRef.current
+    restoreFileReaderRef.current = null
+    if (previousReader?.readyState === FileReader.LOADING) previousReader.abort()
+    setRestoreFileReading(null)
     setRestoreError(null)
     setRestoreSuccess(null)
+    setConfirmRestore(null)
+    const validationError = validateBackupImportFile(file)
+    if (validationError) {
+      setRestoreError(validationError)
+      return
+    }
     const reader = new FileReader()
+    restoreFileReaderRef.current = reader
+    setRestoreFileReading(file.name)
     reader.onload = () => {
+      if (restoreFileRequestRef.current !== requestID || restoreFileReaderRef.current !== reader) return
+      restoreFileReaderRef.current = null
+      setRestoreFileReading(null)
       const result = reader.result
       if (typeof result !== 'string') {
         setRestoreError('Could not read file as data URL')
@@ -1079,28 +1167,75 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
       // data URL prefix: "data:application/gzip;base64,XXXX" — strip up to comma.
       const commaIdx = result.indexOf(',')
       const base64 = commaIdx >= 0 ? result.slice(commaIdx + 1) : result
-      const sizeKB = (file.size / 1024).toFixed(1)
-      setConfirmRestore({ filename: file.name, base64, size: file.size })
+      setConfirmRestore({ source: 'bridge', filename: file.name, base64, size: file.size })
       setRestoreSuccess(null)
       setRestoreError(null)
-      // 100 MB sanity guard pre-upload too.
-      if (file.size > 100 * 1024 * 1024) {
-        setRestoreError(`File too large (${sizeKB} KB). Cap is 100 MB.`)
-        setConfirmRestore(null)
-      }
     }
     reader.onerror = () => {
+      if (restoreFileRequestRef.current !== requestID || restoreFileReaderRef.current !== reader) return
+      restoreFileReaderRef.current = null
+      setRestoreFileReading(null)
       setRestoreError('Failed to read file')
     }
     reader.readAsDataURL(file)
   }
 
+  const handleChooseRestore = async () => {
+    const nativeBridge = (window as any)?.go?.studio?.Studio
+    if (typeof nativeBridge?.SelectRestoreArchiveFile !== 'function') {
+      restoreFileInputRef.current?.click()
+      return
+    }
+    const requestID = ++restoreNativeRequestRef.current
+    const previousToken = restoreNativeTokenRef.current
+    restoreNativeTokenRef.current = null
+    setConfirmRestore(null)
+    setRestoreSelectionBusy(true)
+    setRestoreError(null)
+    setRestoreSuccess(null)
+    try {
+      if (previousToken) await DiscardSelectedRestoreArchive(previousToken).catch(() => {})
+      const review: any = await SelectRestoreArchiveFile()
+      if (review.canceled) return
+      if (restoreNativeRequestRef.current !== requestID) {
+        await DiscardSelectedRestoreArchive(review.token).catch(() => {})
+        return
+      }
+      restoreNativeTokenRef.current = review.token
+      setConfirmRestore({ source: 'native', filename: review.filename, size: review.size, token: review.token })
+    } catch (e: any) {
+      if (restoreNativeRequestRef.current === requestID) {
+        setRestoreError(String(e?.message || e || 'could not select restore archive'))
+      }
+    } finally {
+      if (restoreNativeRequestRef.current === requestID) setRestoreSelectionBusy(false)
+    }
+  }
+
+  const handleCancelRestore = () => {
+    const pending = confirmRestore
+    setConfirmRestore(null)
+    if (pending?.source !== 'native') return
+    restoreNativeTokenRef.current = null
+    // A concurrent new selection may already have invalidated this token;
+    // either outcome means there is no longer anything for this UI to retain.
+    void DiscardSelectedRestoreArchive(pending.token).catch(() => {})
+  }
+
   const handleConfirmRestore = async () => {
     if (!confirmRestore) return
+    const pending = confirmRestore
     setRestoreBusy(true)
     setRestoreError(null)
     try {
-      const result: any = await ImportAllDataBase64(confirmRestore.base64)
+      if (pending.source === 'native') {
+        // Native review tokens are single-use, including failed validation.
+        restoreNativeTokenRef.current = null
+        setConfirmRestore(null)
+      }
+      const result: any = pending.source === 'native'
+        ? await ConfirmSelectedRestoreArchive(pending.token)
+        : await ImportAllDataBase64(pending.base64)
       setRestoreSuccess(
         `Imported ${result.filesImported} file${result.filesImported === 1 ? '' : 's'}. ` +
         (result.preBackupPath ? `Previous data backed up at:\n${result.preBackupPath}\n\n` : '') +
@@ -3458,49 +3593,66 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
       {/* Backup & Restore (iter 750+) */}
       <div className="settings-section" id="settings-data">
         <h3 className="settings-section-header"><Archive size={14} /> Backup & Restore</h3>
-        <div className="settings-section-content">
+        <div className="settings-section-content" aria-busy={dataOperationBusy || restoreFileReading !== null}>
           <p className="settings-hint">
-            One-click snapshot of all your data: config, projects, chat history, drafts, pins, memory, snippets, and templates. Useful before upgrades, for machine migration, or for troubleshooting. Restore puts your current data aside as a pre-import backup before overwriting.
+            One-click snapshot of all your data: config, projects, chat history, drafts, pins, memory, snippets, and templates. Useful before upgrades, for machine migration, or for troubleshooting. Restore puts your current data aside as a pre-import backup before overwriting. Manual archives and file imports are limited to 100 MB so every export remains restorable without unbounded WebView memory use.
           </p>
           <div className="backup-actions">
-            <button className="btn-secondary" onClick={handleBackup} disabled={backupBusy}>
+            <button className="btn-secondary" onClick={handleBackup} disabled={dataOperationBusy}>
               {backupBusy ? <Loader2 size={13} className="spin" /> : <Download size={13} />}
-              Back up all data…
+              {backupBusy ? 'Backing up…' : 'Back up all data…'}
             </button>
-            <label className="btn-secondary" style={{ cursor: 'pointer' }}>
-              <Upload size={13} />
-              Restore from backup…
-              <input
-                type="file"
-                accept=".tar.gz,.gz,application/gzip"
-                style={{ display: 'none' }}
-                onChange={(e) => {
-                  const f = e.target.files?.[0]
-                  if (f) handleRestoreFile(f)
-                  // Reset so re-selecting the same file works again.
-                  e.target.value = ''
-                }}
-                disabled={restoreBusy}
-              />
-            </label>
+            <button
+              type="button"
+              className="btn-secondary"
+              onClick={handleChooseRestore}
+              disabled={dataOperationBusy}
+              aria-controls="settings-restore-file"
+            >
+              {restoreSelectionBusy || restoreFileReading ? <Loader2 size={13} className="spin" /> : <Upload size={13} />}
+              {restoreSelectionBusy ? 'Selecting backup…' : restoreFileReading ? 'Reading backup…' : 'Restore from backup…'}
+            </button>
+            <input
+              ref={restoreFileInputRef}
+              id="settings-restore-file"
+              type="file"
+              accept=".tar.gz,.gz,application/gzip"
+              hidden
+              onChange={(e) => {
+                const f = e.target.files?.[0]
+                if (f) handleRestoreFile(f)
+                // Reset so re-selecting the same file works again.
+                e.target.value = ''
+              }}
+              disabled={dataOperationBusy}
+            />
           </div>
-          {backupSuccess && <div className="settings-toast success" style={{ marginTop: 10 }}><CheckCircle size={13} /> {backupSuccess}</div>}
-          {backupError && <div className="settings-toast error" style={{ marginTop: 10 }}><AlertCircle size={13} /> {backupError}</div>}
-          {restoreError && <div className="settings-toast error" style={{ marginTop: 10 }}><AlertCircle size={13} /> {restoreError}</div>}
+          {(dataOperationLabel || restoreFileReading) && (
+            <div className="settings-hint" role="status" aria-live="polite" aria-atomic="true" style={{ marginTop: 10 }}>
+              {dataOperationLabel || `Reading ${restoreFileReading} before confirmation…`}
+            </div>
+          )}
+          {backupSuccess && (
+            <div className="settings-toast success" role="status" aria-live="polite" aria-atomic="true" style={{ marginTop: 10, whiteSpace: 'pre-wrap', alignItems: 'flex-start' }}>
+              <CheckCircle size={13} /> <span style={{ flex: 1 }}>{backupSuccess}</span>
+            </div>
+          )}
+          {backupError && <div className="settings-toast error" role="alert" style={{ marginTop: 10 }}><AlertCircle size={13} /> {backupError}</div>}
+          {restoreError && <div className="settings-toast error" role="alert" style={{ marginTop: 10 }}><AlertCircle size={13} /> {restoreError}</div>}
           {restoreSuccess && (
-            <div className="settings-toast success" style={{ marginTop: 10, whiteSpace: 'pre-wrap', alignItems: 'flex-start' }}>
+            <div className="settings-toast success" role="status" aria-live="polite" aria-atomic="true" style={{ marginTop: 10, whiteSpace: 'pre-wrap', alignItems: 'flex-start' }}>
               <CheckCircle size={13} />
               <span style={{ flex: 1 }}>{restoreSuccess}</span>
             </div>
           )}
           {confirmRestore && (
-            <div className="reset-prefs-confirm" style={{ marginTop: 10 }}>
-              <span className="reset-prefs-confirm-text">
+            <div className="reset-prefs-confirm" role="group" aria-label={`Confirm restore from ${confirmRestore.filename}`} style={{ marginTop: 10 }}>
+              <span className="reset-prefs-confirm-text" role="status" aria-live="polite">
                 Restore from <b>{confirmRestore.filename}</b> ({(confirmRestore.size / 1024).toFixed(1)} KB)? This will replace your current data. The existing data will be moved aside as a pre-import backup, but a restart will be required.
               </span>
               <div className="reset-prefs-actions">
-                <button className="btn-secondary" onClick={() => setConfirmRestore(null)} disabled={restoreBusy}>Cancel</button>
-                <button className="btn-danger" onClick={handleConfirmRestore} disabled={restoreBusy}>
+                <button className="btn-secondary" onClick={handleCancelRestore} disabled={dataOperationBusy}>Cancel</button>
+                <button className="btn-danger" onClick={handleConfirmRestore} disabled={dataOperationBusy}>
                   {restoreBusy ? <Loader2 size={13} className="spin" /> : null}
                   Restore (replaces current data)
                 </button>
@@ -3508,7 +3660,7 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
             </div>
           )}
           {/* iter 810+: pre-import backups list */}
-          <div className="backups-list-section">
+          <div className="backups-list-section" aria-busy={backupsLoading || backupDeleteBusy || restoreBackupBusy}>
             <div className="backups-list-header">
               <span className="backups-list-title">
                 <History size={12} /> Rollback snapshots
@@ -3517,7 +3669,8 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
                 className="btn-icon-tiny"
                 onClick={refreshBackupsList}
                 title="Refresh list"
-                disabled={backupsLoading}
+                aria-label="Refresh rollback snapshots"
+                disabled={backupsLoading || dataOperationBusy}
               >
                 {backupsLoading ? <Loader2 size={12} className="spin" /> : <RotateCcw size={12} />}
               </button>
@@ -3526,15 +3679,16 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
               Snapshots created automatically before each Restore. Useful as undo points; auto-cleanup removes them after 90 days.
             </p>
             {restoreBackupSuccess && (
-              <div className="settings-toast success" style={{ marginBottom: 10, whiteSpace: 'pre-wrap', alignItems: 'flex-start' }}>
+              <div className="settings-toast success" role="status" aria-live="polite" aria-atomic="true" style={{ marginBottom: 10, whiteSpace: 'pre-wrap', alignItems: 'flex-start' }}>
                 <CheckCircle size={13} /> <span style={{ flex: 1 }}>{restoreBackupSuccess}</span>
               </div>
             )}
             {backupsError && (
-              <div className="settings-toast error" style={{ marginBottom: 10 }}>
+              <div className="settings-toast error" role="alert" style={{ marginBottom: 10 }}>
                 <AlertCircle size={13} /> {backupsError}
               </div>
             )}
+            {backupsLoading && <div className="backups-empty" role="status" aria-live="polite">Loading rollback snapshots…</div>}
             {!backupsLoading && backupsList.length === 0 && (
               <div className="backups-empty">No rollback snapshots yet.</div>
             )}
@@ -3549,13 +3703,16 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
                 <div className="backup-row-actions">
                   {confirmDeleteBackup === b.name ? (
                     <>
-                      <button className="btn-secondary" onClick={() => setConfirmDeleteBackup(null)}>Cancel</button>
-                      <button className="btn-danger" onClick={() => handleBackupDelete(b.name)}>Confirm</button>
+                      <button className="btn-secondary" onClick={() => setConfirmDeleteBackup(null)} disabled={dataOperationBusy}>Cancel</button>
+                      <button className="btn-danger" onClick={() => handleBackupDelete(b.name)} disabled={dataOperationBusy}>
+                        {backupDeleteBusy ? <Loader2 size={12} className="spin" /> : null}
+                        {backupDeleteBusy ? 'Deleting…' : 'Confirm'}
+                      </button>
                     </>
                   ) : confirmRestoreBackup?.name === b.name ? (
                     <>
-                      <button className="btn-secondary" onClick={() => setConfirmRestoreBackup(null)} disabled={restoreBackupBusy}>Cancel</button>
-                      <button className="btn-danger" onClick={() => handleBackupRestore(b.name)} disabled={restoreBackupBusy}>
+                      <button className="btn-secondary" onClick={() => setConfirmRestoreBackup(null)} disabled={dataOperationBusy}>Cancel</button>
+                      <button className="btn-danger" onClick={() => handleBackupRestore(b.name)} disabled={dataOperationBusy}>
                         {restoreBackupBusy ? <Loader2 size={12} className="spin" /> : null}
                         Restore
                       </button>
@@ -3566,6 +3723,8 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
                         className="btn-icon-tiny"
                         onClick={() => setConfirmRestoreBackup(b)}
                         title="Restore from this snapshot"
+                        aria-label={`Restore rollback snapshot ${b.name}`}
+                        disabled={dataOperationBusy}
                       >
                         <Upload size={11} />
                       </button>
@@ -3573,6 +3732,8 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
                         className="btn-icon-tiny btn-icon-danger"
                         onClick={() => setConfirmDeleteBackup(b.name)}
                         title="Delete this snapshot"
+                        aria-label={`Delete rollback snapshot ${b.name}`}
+                        disabled={dataOperationBusy}
                       >
                         <Trash2 size={11} />
                       </button>
@@ -3596,7 +3757,7 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
               <span>Auto-clean stale data on startup</span>
             </label>
             <p className="settings-hint">
-              Once per 24h, remove replay logs older than 30 days and pre-import backups older than 90 days. Disable if you want full manual control via the "Clean up" button in Diagnostics. Save to apply.
+              Once per 24h, remove replay logs older than 30 days, rollback backups and safely disposable completed delegation chats older than 90 days. Active, changed, pinned, drafted, subsequently used, or archived-project delegation chats are always retained. Disable if you want full manual control via the "Clean up" button in Diagnostics. Save to apply.
             </p>
           </div>
 
@@ -3618,7 +3779,7 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
           </div>
 
           {/* iter 850+: auto-backups list + restore */}
-          <div className="backups-list-section">
+          <div className="backups-list-section" aria-busy={autoLoading || autoDeleteBusy || autoRestoreBusy}>
             <div className="backups-list-header">
               <span className="backups-list-title">
                 <Archive size={12} /> Auto-backups
@@ -3628,6 +3789,8 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
                   className="btn-icon-tiny"
                   onClick={() => { OpenAutoBackupsDir().catch((e) => setAutoError(String(e?.message || e))) }}
                   title="Reveal backups folder in OS file manager"
+                  aria-label="Reveal automatic backups folder"
+                  disabled={dataOperationBusy}
                 >
                   <FolderOpen size={12} />
                 </button>
@@ -3635,7 +3798,8 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
                   className="btn-icon-tiny"
                   onClick={refreshAutoBackupsList}
                   title="Refresh list"
-                  disabled={autoLoading}
+                  aria-label="Refresh automatic backups"
+                  disabled={autoLoading || dataOperationBusy}
                 >
                   {autoLoading ? <Loader2 size={12} className="spin" /> : <RotateCcw size={12} />}
                 </button>
@@ -3645,15 +3809,16 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
               Daily snapshots from the auto-backup feature above. Click a snapshot to restore (current data → safety backup).
             </p>
             {autoRestoreSuccess && (
-              <div className="settings-toast success" style={{ marginBottom: 10, whiteSpace: 'pre-wrap', alignItems: 'flex-start' }}>
+              <div className="settings-toast success" role="status" aria-live="polite" aria-atomic="true" style={{ marginBottom: 10, whiteSpace: 'pre-wrap', alignItems: 'flex-start' }}>
                 <CheckCircle size={13} /> <span style={{ flex: 1 }}>{autoRestoreSuccess}</span>
               </div>
             )}
             {autoError && (
-              <div className="settings-toast error" style={{ marginBottom: 10 }}>
+              <div className="settings-toast error" role="alert" style={{ marginBottom: 10 }}>
                 <AlertCircle size={13} /> {autoError}
               </div>
             )}
+            {autoLoading && <div className="backups-empty" role="status" aria-live="polite">Loading automatic backups…</div>}
             {!autoLoading && autoList.length === 0 && (
               <div className="backups-empty">No auto-backups yet. {local.autoBackupEnabled ? 'First one will be written on next startup.' : 'Enable auto-backup above first.'}</div>
             )}
@@ -3668,13 +3833,16 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
                 <div className="backup-row-actions">
                   {confirmDeleteAuto === b.filename ? (
                     <>
-                      <button className="btn-secondary" onClick={() => setConfirmDeleteAuto(null)}>Cancel</button>
-                      <button className="btn-danger" onClick={() => handleAutoDelete(b.filename)}>Confirm</button>
+                      <button className="btn-secondary" onClick={() => setConfirmDeleteAuto(null)} disabled={dataOperationBusy}>Cancel</button>
+                      <button className="btn-danger" onClick={() => handleAutoDelete(b.filename)} disabled={dataOperationBusy}>
+                        {autoDeleteBusy ? <Loader2 size={12} className="spin" /> : null}
+                        {autoDeleteBusy ? 'Deleting…' : 'Confirm'}
+                      </button>
                     </>
                   ) : confirmRestoreAuto?.filename === b.filename ? (
                     <>
-                      <button className="btn-secondary" onClick={() => setConfirmRestoreAuto(null)} disabled={autoRestoreBusy}>Cancel</button>
-                      <button className="btn-danger" onClick={() => handleAutoRestore(b.filename)} disabled={autoRestoreBusy}>
+                      <button className="btn-secondary" onClick={() => setConfirmRestoreAuto(null)} disabled={dataOperationBusy}>Cancel</button>
+                      <button className="btn-danger" onClick={() => handleAutoRestore(b.filename)} disabled={dataOperationBusy}>
                         {autoRestoreBusy ? <Loader2 size={12} className="spin" /> : null}
                         Restore
                       </button>
@@ -3685,6 +3853,8 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
                         className="btn-icon-tiny"
                         onClick={() => setConfirmRestoreAuto(b)}
                         title="Restore from this snapshot"
+                        aria-label={`Restore automatic backup ${b.filename}`}
+                        disabled={dataOperationBusy}
                       >
                         <Upload size={11} />
                       </button>
@@ -3692,6 +3862,8 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
                         className="btn-icon-tiny btn-icon-danger"
                         onClick={() => setConfirmDeleteAuto(b.filename)}
                         title="Delete this snapshot"
+                        aria-label={`Delete automatic backup ${b.filename}`}
+                        disabled={dataOperationBusy}
                       >
                         <Trash2 size={11} />
                       </button>
@@ -3866,20 +4038,20 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
 
       {/* Diagnostics modal (iter 700+) */}
       {showDiag && (
-        <div className="dispatch-backdrop diag-backdrop" onClick={() => setShowDiag(false)}>
-          <div className="dispatch-modal diag-modal" role="dialog" aria-modal="true" aria-label="Diagnostics" onClick={(e) => e.stopPropagation()}>
+        <div className="dispatch-backdrop diag-backdrop" onClick={() => { if (!cleanupBusy) setShowDiag(false) }}>
+          <div className="dispatch-modal diag-modal" role="dialog" aria-modal="true" aria-label="Diagnostics" aria-busy={diagLoading || cleanupBusy} onClick={(e) => e.stopPropagation()}>
             <div className="dispatch-modal-header">
               <Activity size={14} />
               <span>Diagnostics</span>
             </div>
             <div className="dispatch-modal-body">
               {diagLoading && (
-                <div className="diag-loading">
+                <div className="diag-loading" role="status" aria-live="polite">
                   <Loader2 size={14} className="spin" /> Running health checks…
                 </div>
               )}
               {diagError && (
-                <div className="diag-error">
+                <div className="diag-error" role="alert">
                   <AlertCircle size={14} /> {diagError}
                 </div>
               )}
@@ -3902,6 +4074,7 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
                       className="btn-icon-tiny"
                       onClick={() => { OpenConfigDir().catch((e) => setDiagError(String(e?.message || e))) }}
                       title="Reveal in OS file manager"
+                      aria-label="Reveal config folder"
                       style={{ marginLeft: 'auto' }}
                     >
                       <FolderOpen size={11} />
@@ -3927,12 +4100,19 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
               )}
             </div>
             {/* Cleanup preview + result (iter 770+) — inline above actions */}
+            {dataOperationBusy && (
+              <div className="settings-hint" role="status" aria-live="polite" aria-atomic="true" style={{ margin: '0 0 12px' }}>
+                {cleanupBusy
+                  ? (cleanupPreview ? 'Deleting the reviewed stale data…' : 'Checking for stale data…')
+                  : dataOperationLabel}
+              </div>
+            )}
             {cleanupPreview && (
-              <div className="cleanup-preview">
+              <div className="cleanup-preview" role="group" aria-label="Confirm cleanup">
                 <Sparkle size={13} />
-                <div className="cleanup-preview-body">
+                <div className="cleanup-preview-body" role="status" aria-live="polite">
                   <strong>
-                    {(cleanupPreview.staleReplaysRemoved || 0) + (cleanupPreview.preImportDirsRemoved || 0) + (cleanupPreview.stagingDirsRemoved || 0) + (cleanupPreview.autoBackupsRemoved || 0)} item(s) to clean up
+                    {cleanupRemovedCount(cleanupPreview)} item(s) to clean up
                   </strong>
                   {' — '}
                   {(() => {
@@ -3941,52 +4121,62 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
                     if (cleanupPreview.preImportDirsRemoved > 0) parts.push(`${cleanupPreview.preImportDirsRemoved} old pre-import backup(s)`)
                     if (cleanupPreview.stagingDirsRemoved > 0) parts.push(`${cleanupPreview.stagingDirsRemoved} orphaned staging dir(s)`)
                     if (cleanupPreview.autoBackupsRemoved > 0) parts.push(`${cleanupPreview.autoBackupsRemoved} excess auto-backup(s)`)
+                    if (cleanupPreview.delegationRunsRemoved > 0) parts.push(`${cleanupPreview.delegationRunsRemoved} old delegation chat(s)`)
+                    if (cleanupPreview.delegationRunsSkipped > 0) parts.push(`${cleanupPreview.delegationRunsSkipped} protected delegation chat(s) kept`)
                     return parts.join(', ')
                   })()}
                   {' '}({formatBytes(cleanupPreview.bytesFreed)})
+                  {cleanupPreview.errors?.length > 0 && (
+                    <div className="settings-hint">Preview is incomplete: {cleanupPreview.errors[0]}</div>
+                  )}
                 </div>
                 <div className="cleanup-preview-actions">
-                  <button className="btn-secondary" onClick={() => setCleanupPreview(null)}>Cancel</button>
-                  <button className="btn-danger" onClick={handleCleanupConfirm} disabled={cleanupBusy}>
+                  <button className="btn-secondary" onClick={() => setCleanupPreview(null)} disabled={dataOperationBusy}>Cancel</button>
+                  <button className="btn-danger" onClick={handleCleanupConfirm} disabled={dataOperationBusy}>
                     {cleanupBusy ? <Loader2 size={12} className="spin" /> : null}
                     Delete
                   </button>
                 </div>
               </div>
             )}
-            {cleanupResult && (
-              <div className="settings-toast success" style={{ margin: '0 0 12px' }}>
-                <CheckCircle size={13} /> Cleaned up {(cleanupResult.staleReplaysRemoved || 0) + (cleanupResult.preImportDirsRemoved || 0) + (cleanupResult.stagingDirsRemoved || 0) + (cleanupResult.autoBackupsRemoved || 0)} item(s), freed {formatBytes(cleanupResult.bytesFreed)}.
+            {cleanupResult && !cleanupResult.errors?.length && (
+              <div className="settings-toast success" role="status" aria-live="polite" aria-atomic="true" style={{ margin: '0 0 12px' }}>
+                <CheckCircle size={13} /> Cleaned up {cleanupRemovedCount(cleanupResult)} item(s), freed {formatBytes(cleanupResult.bytesFreed)}.{cleanupResult.delegationRunsSkipped > 0 ? ` Kept ${cleanupResult.delegationRunsSkipped} protected delegation chat(s).` : ''}
+              </div>
+            )}
+            {cleanupResult?.errors?.length > 0 && (
+              <div className="settings-toast error" role="alert" style={{ margin: '0 0 12px' }}>
+                <AlertCircle size={13} /> Cleanup removed {cleanupRemovedCount(cleanupResult)} item(s) and freed {formatBytes(cleanupResult.bytesFreed)}, but {cleanupResult.errors.length} operation(s) failed: {cleanupResult.errors[0]}
               </div>
             )}
             {cleanupError && (
-              <div className="settings-toast error" style={{ margin: '0 0 12px' }}>
+              <div className="settings-toast error" role="alert" style={{ margin: '0 0 12px' }}>
                 <AlertCircle size={13} /> {cleanupError}
               </div>
             )}
             <div className="dispatch-modal-actions">
-              <button className="btn-secondary" onClick={openDiagnostics} disabled={diagLoading}>
+              <button className="btn-secondary" onClick={openDiagnostics} disabled={diagLoading || cleanupBusy}>
                 <RotateCcw size={14} /> Refresh
               </button>
-              <button className="btn-secondary" onClick={() => { setShowDiag(false); openLogs() }}>
+              <button className="btn-secondary" onClick={() => { setShowDiag(false); openLogs() }} disabled={cleanupBusy}>
                 <FileText size={14} /> View logs
               </button>
               <button
                 className="btn-secondary"
                 onClick={handleCleanupPreview}
-                disabled={cleanupBusy || cleanupPreview !== null}
-                title="Find and remove stale replay logs (>7 days) and old pre-import backups (>30 days)"
+                disabled={dataOperationBusy || cleanupPreview !== null}
+                title="Find stale replay logs (>7 days), rollback backups and safely disposable delegation chats (>30 days)"
               >
                 {cleanupBusy && !cleanupPreview ? <Loader2 size={14} className="spin" /> : <Sparkle size={14} />}
                 Clean up
               </button>
-              <button className="btn-secondary" onClick={handleCopyDiagnostics} disabled={diagLoading || !diagInfo}>
+              <button className="btn-secondary" onClick={handleCopyDiagnostics} disabled={diagLoading || cleanupBusy || !diagInfo}>
                 <Clipboard size={14} /> {diagCopied ? 'Copied!' : 'Copy report'}
               </button>
-              <button className="btn-secondary" onClick={() => downloadDiagnostics(diagInfo)} disabled={diagLoading || !diagInfo}>
+              <button className="btn-secondary" onClick={() => downloadDiagnostics(diagInfo)} disabled={diagLoading || cleanupBusy || !diagInfo}>
                 <Download size={14} /> Save as file
               </button>
-              <button className="btn-primary" onClick={() => setShowDiag(false)}>Close</button>
+              <button className="btn-primary" onClick={() => setShowDiag(false)} disabled={cleanupBusy}>Close</button>
             </div>
           </div>
         </div>
@@ -4091,14 +4281,7 @@ export function SettingsPage({ isActive = true }: { isActive?: boolean }) {
                   try {
                     const csv = await ExportLogsCSV()
                     const blob = new Blob([csv], { type: 'text/csv' })
-                    const url = URL.createObjectURL(blob)
-                    const a = document.createElement('a')
-                    a.href = url
-                    a.download = `gokin-studio-logs-${new Date().toISOString().slice(0, 10)}.csv`
-                    document.body.appendChild(a)
-                    a.click()
-                    document.body.removeChild(a)
-                    URL.revokeObjectURL(url)
+                    downloadBlob(blob, `gokin-studio-logs-${new Date().toISOString().slice(0, 10)}.csv`)
                     setLogsActionFeedback({ type: 'success', text: `Exported ${logs.length} log entr${logs.length === 1 ? 'y' : 'ies'} as CSV.` })
                   } catch (e: any) {
                     console.error('ExportLogsCSV failed:', e)
@@ -4157,12 +4340,5 @@ function downloadDiagnostics(info: any) {
     if (c.detail) for (const ln of String(c.detail).split('\n')) lines.push('        ' + ln)
   }
   const blob = new Blob([lines.join('\n')], { type: 'text/plain' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = `gokin-diagnostics-${new Date().toISOString().slice(0, 10)}.txt`
-  document.body.appendChild(a)
-  a.click()
-  document.body.removeChild(a)
-  URL.revokeObjectURL(url)
+  downloadBlob(blob, `gokin-diagnostics-${new Date().toISOString().slice(0, 10)}.txt`)
 }

@@ -8,7 +8,11 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/ginkida/gokin-studio/internal/engine/fileutil"
 )
+
+const maxProviderHealthFileBytes int64 = 4 << 20
 
 type providerHealth struct {
 	Score         int
@@ -33,7 +37,7 @@ func ensureHealthLoadedLocked() {
 	if err != nil {
 		return
 	}
-	data, err := os.ReadFile(path)
+	data, err := fileutil.ReadRegularFileLimited(path, maxProviderHealthFileBytes)
 	if err != nil {
 		return
 	}
@@ -59,14 +63,16 @@ func persistHealthLocked() {
 	if err != nil {
 		return
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
-		return
-	}
-	_ = os.Rename(tmp, path)
+	_ = fileutil.AtomicWrite(path, data, 0o600)
 }
 
 func healthFilePath() (string, error) {
+	// Honor XDG explicitly on every host so tests, portable installations, and
+	// sandboxed launches can keep health telemetry with the rest of their
+	// selected config rather than the platform default.
+	if configBase := os.Getenv("XDG_CONFIG_HOME"); configBase != "" {
+		return filepath.Join(configBase, "gokin", "provider_health.json"), nil
+	}
 	configBase, err := os.UserConfigDir()
 	if err != nil {
 		return "", err
@@ -83,7 +89,10 @@ func getProviderHealth(provider string) *providerHealth {
 		stats = &providerHealth{}
 		providerStats[provider] = stats
 	}
-	return stats
+	// Callers derive retry policy after this lock is released. Return a value
+	// snapshot so concurrent success/failure recording cannot race with them.
+	snapshot := *stats
+	return &snapshot
 }
 
 func recordProviderSuccess(provider string) {

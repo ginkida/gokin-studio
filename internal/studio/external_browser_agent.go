@@ -39,17 +39,27 @@ func newExternalBrowserAgentRegistry() *externalBrowserAgentRegistry {
 	return &externalBrowserAgentRegistry{pending: make(map[string]*externalBrowserAgentPending)}
 }
 
-func (r *externalBrowserAgentRegistry) register(id string, pending *externalBrowserAgentPending) chan string {
-	pending.ch = make(chan string, 1)
+func (r *externalBrowserAgentRegistry) register(id string, pending *externalBrowserAgentPending) (chan string, error) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.pending[id]; exists {
+		return nil, fmt.Errorf("external browser request identity already exists")
+	}
+	for _, existing := range r.pending {
+		if existing.projectID == pending.projectID && existing.sessionID == pending.sessionID && existing.tabID == pending.tabID {
+			return nil, fmt.Errorf("another external Browser action is already in progress for this tab")
+		}
+	}
+	pending.ch = make(chan string, 1)
 	r.pending[id] = pending
-	r.mu.Unlock()
-	return pending.ch
+	return pending.ch, nil
 }
 
-func (r *externalBrowserAgentRegistry) cleanup(id string) {
+func (r *externalBrowserAgentRegistry) cleanup(id string, owner *externalBrowserAgentPending) {
 	r.mu.Lock()
-	delete(r.pending, id)
+	if r.pending[id] == owner {
+		delete(r.pending, id)
+	}
 	r.mu.Unlock()
 }
 
@@ -279,8 +289,11 @@ func (s *Studio) requestExternalBrowserAgent(ctx context.Context, projectID, ses
 	}
 	id := uuid.NewString()
 	pending := &externalBrowserAgentPending{projectID: projectID, sessionID: sessionID, tabID: tab.ID, bridgeToken: tab.BridgeToken, origin: tab.Origin}
-	ch := s.externalBrowserAgent.register(id, pending)
-	defer s.externalBrowserAgent.cleanup(id)
+	ch, err := s.externalBrowserAgent.register(id, pending)
+	if err != nil {
+		return "", err
+	}
+	defer s.externalBrowserAgent.cleanup(id, pending)
 	event := map[string]any{"requestID": id, "projectID": projectID, "sessionID": sessionID, "tabID": tab.ID, "bridgeToken": tab.BridgeToken, "origin": tab.Origin, "url": tab.URL, "args": args}
 	if s.testExternalBrowserAgentEmitter != nil {
 		s.testExternalBrowserAgentEmitter(event)

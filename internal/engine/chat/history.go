@@ -2,11 +2,17 @@ package chat
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/ginkida/gokin-studio/internal/engine/fileutil"
 )
+
+const maxChatHistoryFileBytes int64 = 128 << 20
 
 // HistoryEntry represents a saved history entry.
 type HistoryEntry struct {
@@ -25,7 +31,10 @@ type HistoryFile struct {
 
 // HistoryManager manages session history persistence.
 type HistoryManager struct {
-	dataDir string
+	dataDir            string
+	sessionsDir        string
+	mu                 sync.RWMutex
+	beforeFullSaveLock func() // deterministic publication-order test seam
 }
 
 // NewHistoryManager creates a new history manager.
@@ -40,24 +49,40 @@ func NewHistoryManager() (*HistoryManager, error) {
 	if err := os.MkdirAll(dataDir, 0700); err != nil {
 		return nil, err
 	}
+	sessionsDir, err := getSessionsDir()
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(sessionsDir, 0o700); err != nil {
+		return nil, err
+	}
 
 	return &HistoryManager{
-		dataDir: dataDir,
+		dataDir:     dataDir,
+		sessionsDir: sessionsDir,
 	}, nil
 }
 
 // Save saves a session history to disk.
 func (m *HistoryManager) Save(session *Session) error {
-	history := session.GetHistory()
+	if session == nil {
+		return fmt.Errorf("cannot save nil session")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	state := session.GetState()
+	if err := fileutil.ValidateStoreID("session", state.ID); err != nil {
+		return err
+	}
 
 	file := HistoryFile{
-		SessionID: session.ID,
-		StartTime: session.StartTime,
+		SessionID: state.ID,
+		StartTime: state.StartTime,
 		EndTime:   time.Now(),
 		Entries:   make([]HistoryEntry, 0),
 	}
 
-	for _, content := range history {
+	for _, content := range state.History {
 		var text string
 		for _, part := range content.Parts {
 			if part.Text != "" {
@@ -79,15 +104,20 @@ func (m *HistoryManager) Save(session *Session) error {
 	}
 
 	// Write file (0600: only owner can read/write session data)
-	filename := filepath.Join(m.dataDir, session.ID+".json")
-	return os.WriteFile(filename, data, 0600)
+	filename := filepath.Join(m.dataDir, state.ID+".json")
+	return fileutil.AtomicWrite(filename, data, 0o600)
 }
 
 // Load loads a session history from disk.
 func (m *HistoryManager) Load(sessionID string) (*HistoryFile, error) {
+	if err := fileutil.ValidateStoreID("session", sessionID); err != nil {
+		return nil, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	filename := filepath.Join(m.dataDir, sessionID+".json")
 
-	data, err := os.ReadFile(filename)
+	data, err := fileutil.ReadRegularFileLimited(filename, maxChatHistoryFileBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -96,12 +126,17 @@ func (m *HistoryManager) Load(sessionID string) (*HistoryFile, error) {
 	if err := json.Unmarshal(data, &file); err != nil {
 		return nil, err
 	}
+	if file.SessionID != sessionID {
+		return nil, fmt.Errorf("session ID mismatch: requested %s, file contains %s", sessionID, file.SessionID)
+	}
 
 	return &file, nil
 }
 
 // List lists all saved sessions.
 func (m *HistoryManager) List() ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	entries, err := os.ReadDir(m.dataDir)
 	if err != nil {
 		return nil, err
@@ -110,7 +145,10 @@ func (m *HistoryManager) List() ([]string, error) {
 	var sessions []string
 	for _, entry := range entries {
 		if !entry.IsDir() && filepath.Ext(entry.Name()) == ".json" {
-			sessions = append(sessions, entry.Name()[:len(entry.Name())-5])
+			sessionID := entry.Name()[:len(entry.Name())-5]
+			if fileutil.SafeFilenameComponent(sessionID) && fileutil.RegularFileExists(filepath.Join(m.dataDir, entry.Name())) {
+				sessions = append(sessions, sessionID)
+			}
 		}
 	}
 
@@ -119,6 +157,11 @@ func (m *HistoryManager) List() ([]string, error) {
 
 // Delete deletes a session history.
 func (m *HistoryManager) Delete(sessionID string) error {
+	if err := fileutil.ValidateStoreID("session", sessionID); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	filename := filepath.Join(m.dataDir, sessionID+".json")
 	return os.Remove(filename)
 }
@@ -158,17 +201,18 @@ func getSessionsDir() (string, error) {
 // SaveFull saves a complete session state including all content.
 // Uses atomic write (tmp + rename) to prevent corruption on crash.
 func (m *HistoryManager) SaveFull(session *Session) error {
-	sessionsDir, err := getSessionsDir()
-	if err != nil {
-		return err
+	if session == nil {
+		return fmt.Errorf("cannot save nil session")
 	}
-
-	// Create directory if it doesn't exist (0700: only owner can access session data)
-	if err := os.MkdirAll(sessionsDir, 0700); err != nil {
-		return err
+	if m.beforeFullSaveLock != nil {
+		m.beforeFullSaveLock()
 	}
-
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	state := session.GetState()
+	if err := fileutil.ValidateStoreID("session", state.ID); err != nil {
+		return err
+	}
 
 	// Marshal to JSON
 	data, err := json.MarshalIndent(state, "", "  ")
@@ -176,26 +220,24 @@ func (m *HistoryManager) SaveFull(session *Session) error {
 		return err
 	}
 
-	// Atomic write: write to temp file first, then rename
-	filename := filepath.Join(sessionsDir, session.ID+".json")
-	tmpFilename := filename + ".tmp"
-
-	if err := os.WriteFile(tmpFilename, data, 0600); err != nil {
-		return err
-	}
-	return os.Rename(tmpFilename, filename)
+	filename := filepath.Join(m.sessionsDir, state.ID+".json")
+	return fileutil.AtomicWrite(filename, data, 0o600)
 }
 
 // LoadFull loads a complete session state.
 func (m *HistoryManager) LoadFull(sessionID string) (*SessionState, error) {
-	sessionsDir, err := getSessionsDir()
-	if err != nil {
+	if err := fileutil.ValidateStoreID("session", sessionID); err != nil {
 		return nil, err
 	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.loadFullLocked(sessionID)
+}
 
-	filename := filepath.Join(sessionsDir, sessionID+".json")
+func (m *HistoryManager) loadFullLocked(sessionID string) (*SessionState, error) {
+	filename := filepath.Join(m.sessionsDir, sessionID+".json")
 
-	data, err := os.ReadFile(filename)
+	data, err := fileutil.ReadRegularFileLimited(filename, maxChatHistoryFileBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -204,23 +246,18 @@ func (m *HistoryManager) LoadFull(sessionID string) (*SessionState, error) {
 	if err := json.Unmarshal(data, &state); err != nil {
 		return nil, err
 	}
+	if state.ID != sessionID {
+		return nil, fmt.Errorf("session ID mismatch: requested %s, file contains %s", sessionID, state.ID)
+	}
 
 	return &state, nil
 }
 
 // ListSessions returns information about all saved sessions.
 func (m *HistoryManager) ListSessions() ([]SessionInfo, error) {
-	sessionsDir, err := getSessionsDir()
-	if err != nil {
-		return nil, err
-	}
-
-	// Create directory if it doesn't exist (0700: only owner can access session data)
-	if err := os.MkdirAll(sessionsDir, 0700); err != nil {
-		return nil, err
-	}
-
-	entries, err := os.ReadDir(sessionsDir)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	entries, err := os.ReadDir(m.sessionsDir)
 	if err != nil {
 		return nil, err
 	}
@@ -232,7 +269,10 @@ func (m *HistoryManager) ListSessions() ([]SessionInfo, error) {
 		}
 
 		sessionID := strings.TrimSuffix(entry.Name(), ".json")
-		state, err := m.LoadFull(sessionID)
+		if !fileutil.SafeFilenameComponent(sessionID) || !fileutil.RegularFileExists(filepath.Join(m.sessionsDir, entry.Name())) {
+			continue
+		}
+		state, err := m.loadFullLocked(sessionID)
 		if err != nil {
 			continue // Skip invalid files
 		}
@@ -252,11 +292,11 @@ func (m *HistoryManager) ListSessions() ([]SessionInfo, error) {
 
 // DeleteSession deletes a saved session.
 func (m *HistoryManager) DeleteSession(sessionID string) error {
-	sessionsDir, err := getSessionsDir()
-	if err != nil {
+	if err := fileutil.ValidateStoreID("session", sessionID); err != nil {
 		return err
 	}
-
-	filename := filepath.Join(sessionsDir, sessionID+".json")
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	filename := filepath.Join(m.sessionsDir, sessionID+".json")
 	return os.Remove(filename)
 }

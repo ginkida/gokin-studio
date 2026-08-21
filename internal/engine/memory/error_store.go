@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ginkida/gokin-studio/internal/engine/fileutil"
 	"github.com/ginkida/gokin-studio/internal/engine/logging"
 )
 
@@ -37,12 +38,13 @@ type ErrorStore struct {
 	dirty     bool
 	saveMu    sync.Mutex
 	saveTimer *time.Timer
+	writer    fileutil.LatestFileWriter
 }
 
 // NewErrorStore creates a new error store.
 func NewErrorStore(configDir string) (*ErrorStore, error) {
 	errDir := filepath.Join(configDir, "memory")
-	if err := os.MkdirAll(errDir, 0755); err != nil {
+	if err := os.MkdirAll(errDir, 0o700); err != nil {
 		return nil, fmt.Errorf("failed to create error store directory: %w", err)
 	}
 
@@ -69,7 +71,7 @@ func (es *ErrorStore) storagePath() string {
 
 // load loads entries from disk.
 func (es *ErrorStore) load() error {
-	data, err := os.ReadFile(es.storagePath())
+	data, err := fileutil.ReadRegularFileLimited(es.storagePath(), maxLearningStoreFileBytes)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -85,6 +87,9 @@ func (es *ErrorStore) load() error {
 	es.mu.Lock()
 	defer es.mu.Unlock()
 	for _, entry := range entries {
+		if entry == nil || entry.ID == "" {
+			continue
+		}
 		es.entries[entry.ID] = entry
 		es.byType[entry.ErrorType] = append(es.byType[entry.ErrorType], entry.ID)
 	}
@@ -104,7 +109,7 @@ func (es *ErrorStore) save() error {
 		return err
 	}
 
-	return os.WriteFile(es.storagePath(), data, 0644)
+	return es.writer.Write(es.storagePath(), data, 0o600)
 }
 
 // scheduleSave schedules a debounced save operation.
@@ -122,25 +127,31 @@ func (es *ErrorStore) scheduleSave() {
 			es.mu.Unlock()
 			return
 		}
-		// Snapshot entries under lock
+		// Serialize and reserve the generation before releasing the data lock.
+		// A Flush or mutation that follows can then only receive a newer
+		// generation; an old timer can never publish after it.
 		entries := make([]*ErrorEntry, 0, len(es.entries))
 		for _, entry := range es.entries {
 			entries = append(entries, entry)
 		}
-		es.dirty = false
-		es.mu.Unlock()
-
-		// Save outside lock
 		data, err := json.MarshalIndent(entries, "", "  ")
 		if err != nil {
+			es.mu.Unlock()
 			return
 		}
-		if err := os.WriteFile(es.storagePath(), data, 0644); err != nil {
+		es.dirty = false
+		es.writer.ScheduleTracked(es.storagePath(), data, 0o600, func(generation uint64, err error) {
+			if err == nil {
+				return
+			}
 			logging.Warn("failed to save error store", "path", es.storagePath(), "error", err)
 			es.mu.Lock()
-			es.dirty = true
+			if es.writer.IsLatest(generation) {
+				es.dirty = true
+			}
 			es.mu.Unlock()
-		}
+		})
+		es.mu.Unlock()
 	})
 }
 
@@ -156,14 +167,8 @@ func (es *ErrorStore) Flush() error {
 	es.mu.Lock()
 	defer es.mu.Unlock()
 
-	if !es.dirty {
-		return nil
-	}
-
 	err := es.save()
-	if err == nil {
-		es.dirty = false
-	}
+	es.dirty = err != nil
 	return err
 }
 

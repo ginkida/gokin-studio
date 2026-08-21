@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/ginkida/gokin-studio/internal/engine/tasks"
 
@@ -61,19 +62,30 @@ func (t *TaskStopTool) Declaration() *genai.FunctionDeclaration {
 
 func (t *TaskStopTool) Validate(args map[string]any) error {
 	taskID, ok := GetString(args, "task_id")
-	if !ok || taskID == "" {
+	if !ok || strings.TrimSpace(taskID) == "" {
 		return NewValidationError("task_id", "is required")
+	}
+	if _, exists := args["reason"]; exists {
+		if _, ok := GetString(args, "reason"); !ok {
+			return NewValidationError("reason", "must be a string")
+		}
 	}
 	return nil
 }
 
 func (t *TaskStopTool) Execute(ctx context.Context, args map[string]any) (ToolResult, error) {
-	taskID, _ := GetString(args, "task_id")
+	if err := t.Validate(args); err != nil {
+		return NewErrorResult("validation error: " + err.Error()), nil
+	}
+	taskID := strings.TrimSpace(GetStringDefault(args, "task_id", ""))
 	reason := GetStringDefault(args, "reason", "")
 
-	// Check if this is an agent task
-	if isAgentTaskID(taskID) {
-		return t.stopAgent(taskID, reason)
+	// Agent IDs are opaque; route by exact runner membership instead of a
+	// fragile UUID/prefix heuristic.
+	if t.runner != nil {
+		if _, ok := t.runner.GetResult(taskID); ok {
+			return t.stopAgent(taskID, reason)
+		}
 	}
 
 	// Fall back to shell task

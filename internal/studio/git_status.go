@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"github.com/ginkida/gokin-studio/internal/engine/wsl"
 	"io"
 	"os/exec"
 	"path/filepath"
@@ -307,6 +308,7 @@ func runBoundedGitReview(dir string, limit int, args ...string) ([]byte, bool, e
 	full := []string{"-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-C", dir}
 	full = append(full, args...)
 	cmd := exec.CommandContext(ctx, "git", full...)
+	wsl.ApplyGit(cmd, dir, append([]string{"git"}, full...))
 	cmd.WaitDelay = gitWaitDelay
 	output := &cappedCommandOutput{limit: limit}
 	cmd.Stdout = output
@@ -582,6 +584,10 @@ func runGitWithTimeout(dir string, timeout time.Duration, args ...string) string
 	defer cancel()
 	full := append([]string{"-C", dir}, args...)
 	cmd := exec.CommandContext(ctx, "git", full...)
+	// A WSL project's repository lives inside the distro, so Windows-side git
+	// would read it over 9P and disagree with the distro about permissions and
+	// line endings. Off Windows this is a no-op that leaves cmd untouched.
+	wsl.ApplyGit(cmd, dir, append([]string{"git"}, full...))
 	cmd.WaitDelay = gitWaitDelay
 	output := &cappedCommandOutput{limit: maxGitOutputBytes}
 	cmd.Stdout = output

@@ -67,6 +67,7 @@ export function FileEditor({
   active = true,
   onRequestClose,
   onDirtyChange,
+  onSavingChange,
 }: {
   projectID: string
   sessionID: string
@@ -74,6 +75,7 @@ export function FileEditor({
   active?: boolean
   onRequestClose: () => void
   onDirtyChange?: (dirty: boolean) => void
+  onSavingChange?: (saving: boolean) => void
 }) {
   const [snapshot, setSnapshot] = useState<SessionFileSnapshot | null>(null)
   const [draft, setDraft] = useState('')
@@ -83,14 +85,46 @@ export function FileEditor({
   const [notice, setNotice] = useState<string | null>(null)
   const [conflict, setConflict] = useState<SessionFileSnapshot | null>(null)
   const [copied, setCopied] = useState(false)
-  const requestRef = useRef(0)
-  const snapshotRef = useRef<SessionFileSnapshot | null>(null)
-  const noticeTimerRef = useRef<number | null>(null)
-  const textareaRef = useRef<HTMLTextAreaElement>(null)
   const dirty = !!snapshot && draft !== snapshot.content
   const draftKey = fileDraftKey(projectID, sessionID, path)
+  const requestRef = useRef(0)
+  const saveRequestRef = useRef(0)
+  const copyRequestRef = useRef(0)
+  const snapshotRef = useRef<SessionFileSnapshot | null>(null)
+  const noticeTimerRef = useRef<number | null>(null)
+  const copyTimerRef = useRef<number | null>(null)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const scopeRef = useRef({ generation: 0, mounted: false })
   snapshotRef.current = snapshot
   const lines = useMemo(() => lineCount(draft), [draft])
+
+  useEffect(() => {
+    scopeRef.current.generation += 1
+    scopeRef.current.mounted = true
+    const generation = scopeRef.current.generation
+    return () => {
+      if (scopeRef.current.generation === generation) {
+        scopeRef.current.mounted = false
+        scopeRef.current.generation += 1
+      }
+      requestRef.current += 1
+      saveRequestRef.current += 1
+      copyRequestRef.current += 1
+      onSavingChange?.(false)
+      if (noticeTimerRef.current !== null) {
+        window.clearTimeout(noticeTimerRef.current)
+        noticeTimerRef.current = null
+      }
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current)
+        copyTimerRef.current = null
+      }
+    }
+  }, [draftKey, onSavingChange])
+
+  const ownsScope = useCallback((generation: number) => (
+    scopeRef.current.mounted && scopeRef.current.generation === generation
+  ), [])
 
   const showNotice = useCallback((message: string) => {
     setNotice(message)
@@ -99,12 +133,13 @@ export function FileEditor({
   }, [])
 
   const load = useCallback(async (preserveDraft = false) => {
+    const scope = scopeRef.current.generation
     const request = ++requestRef.current
     setLoading(true)
     setError(null)
     try {
       const raw: any = await GetSessionFileSnapshot(projectID, sessionID, path)
-      if (requestRef.current !== request) return
+      if (!ownsScope(scope) || requestRef.current !== request) return
       const next = raw as SessionFileSnapshot
       const opened = snapshotRef.current
       if (preserveDraft && opened) {
@@ -122,11 +157,11 @@ export function FileEditor({
         }
       }
     } catch (reason: any) {
-      if (requestRef.current === request) setError(String(reason?.message || reason))
+      if (ownsScope(scope) && requestRef.current === request) setError(String(reason?.message || reason))
     } finally {
-      if (requestRef.current === request) setLoading(false)
+      if (ownsScope(scope) && requestRef.current === request) setLoading(false)
     }
-  }, [draftKey, path, projectID, sessionID])
+  }, [draftKey, ownsScope, path, projectID, sessionID])
 
   useEffect(() => {
     setSnapshot(null)
@@ -167,35 +202,53 @@ export function FileEditor({
     return () => window.removeEventListener('gokin:discard-session-file-draft', discard)
   }, [draftKey, path, projectID, sessionID])
 
-  useEffect(() => () => {
-    if (noticeTimerRef.current !== null) window.clearTimeout(noticeTimerRef.current)
-  }, [])
-
   const save = useCallback(async (revision?: string) => {
     if (!snapshot || saving || snapshot.readOnly) return
+    const scope = scopeRef.current.generation
+    const request = ++saveRequestRef.current
+    const content = draft
+    const sourceRevision = snapshot.revision
+    const expectedRevision = revision || snapshot.revision
+    const savedDraftKey = draftKey
+    const savedProjectID = projectID
+    const savedSessionID = sessionID
+    const savedPath = path
     setSaving(true)
+    onSavingChange?.(true)
     setError(null)
     setNotice(null)
     try {
-      const raw: any = await SaveSessionFileContent(projectID, sessionID, path, draft, revision || snapshot.revision)
+      const raw: any = await SaveSessionFileContent(savedProjectID, savedSessionID, savedPath, content, expectedRevision)
       const result = raw as SessionFileSaveResult
       if (result.conflict) {
-        setConflict(result.current)
+        if (ownsScope(scope) && saveRequestRef.current === request) setConflict(result.current)
         return
       }
       if (!result.saved || !result.current) throw new Error('The file save returned no updated snapshot.')
+      // The disk write is authoritative even if this editor was replaced while
+      // the RPC was in flight. Notify other panes with the captured exact path,
+      // but never project its result into a different editor generation.
+      const cached = sessionFileDraftCache.get(savedDraftKey)
+      if (ownsScope(scope) || (cached?.snapshot.revision === sourceRevision && cached.draft === content)) {
+        sessionFileDraftCache.delete(savedDraftKey)
+      }
+      window.dispatchEvent(new CustomEvent('gokin:session-file-saved', {
+        detail: { projectID: savedProjectID, sessionID: savedSessionID, path: savedPath },
+      }))
+      if (!ownsScope(scope) || saveRequestRef.current !== request) return
       setSnapshot(result.current)
       setDraft(result.current.content)
       setConflict(null)
-      sessionFileDraftCache.delete(draftKey)
       showNotice('Saved')
-      window.dispatchEvent(new CustomEvent('gokin:session-file-saved', { detail: { projectID, sessionID, path } }))
     } catch (reason: any) {
-      setError(String(reason?.message || reason))
+      if (ownsScope(scope) && saveRequestRef.current === request) setError(String(reason?.message || reason))
     } finally {
-      setSaving(false)
+      if (ownsScope(scope) && saveRequestRef.current === request) {
+        setSaving(false)
+        onSavingChange?.(false)
+      }
     }
-  }, [draft, draftKey, path, projectID, saving, sessionID, showNotice, snapshot])
+  }, [draft, draftKey, onSavingChange, ownsScope, path, projectID, saving, sessionID, showNotice, snapshot])
 
   useEffect(() => {
     if (!active) return
@@ -220,12 +273,22 @@ export function FileEditor({
 
   const copyPath = async () => {
     if (!snapshot?.absolutePath) return
+    const scope = scopeRef.current.generation
+    const request = ++copyRequestRef.current
+    const absolutePath = snapshot.absolutePath
     try {
-      await ClipboardSetText(snapshot.absolutePath)
+      await ClipboardSetText(absolutePath)
+      if (!ownsScope(scope) || copyRequestRef.current !== request) return
       setCopied(true)
-      window.setTimeout(() => setCopied(false), 1500)
+      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current)
+      copyTimerRef.current = window.setTimeout(() => {
+        if (ownsScope(scope) && copyRequestRef.current === request) setCopied(false)
+        copyTimerRef.current = null
+      }, 1500)
     } catch (reason: any) {
-      setError(String(reason?.message || reason || 'Clipboard unavailable'))
+      if (ownsScope(scope) && copyRequestRef.current === request) {
+        setError(String(reason?.message || reason || 'Clipboard unavailable'))
+      }
     }
   }
 
@@ -265,7 +328,7 @@ export function FileEditor({
         {dirty && <span className="session-file-editor-dirty" title="Unsaved changes" aria-label="Unsaved changes" />}
         <button onClick={() => composeInChat(`${formatFileMention(path)} `, 'replace')} title="Add file to chat"><MessageSquare size={12} /></button>
         <button onClick={() => void copyPath()} title="Copy absolute path" aria-label="Copy absolute file path"><Copy size={12} /></button>
-        <button onClick={onRequestClose} title="Close file" aria-label="Close file editor"><X size={13} /></button>
+        <button onClick={onRequestClose} disabled={saving} title={saving ? 'Wait for the current save to finish' : 'Close file'} aria-label="Close file editor"><X size={13} /></button>
       </header>
 
       {snapshot.readOnly && <div className="session-file-editor-banner warning"><AlertTriangle size={12} /><span>This file is read-only. You can inspect and copy it, but Studio will not overwrite it.</span></div>}

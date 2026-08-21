@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -135,6 +136,68 @@ func TestProjectSettersPersistenceFailureLeaveMemoryAndClientUntouched(t *testin
 				t.Fatalf("cached client changed after failed commit: closes=%d retained=%v", closeCalls, retained)
 			}
 		})
+	}
+}
+
+func TestComputerUseDisablePersistenceFailureStillStopsDelegation(t *testing.T) {
+	s, from, target, events := delegationTestStudio(t)
+	configRoot := configDir()
+	p := s.projects[target.ID]
+	p.mu.Lock()
+	p.ComputerUseEnabled = true
+	p.mu.Unlock()
+	run := DelegationRun{
+		ID: "disable-write-failure", Kind: "run", Status: "running", Task: "work",
+		FromProjectID: from.ID, FromSessionID: "default",
+		ToProjectID: target.ID, ToSessionID: "default", StartedAt: time.Now().UnixMilli(),
+	}
+	child := p.GetSession("default")
+	child.mu.Lock()
+	child.queueWorker = true
+	child.mu.Unlock()
+	if _, _, err := s.publishAndStartDelegation(run, delegationHandle{
+		fromProjectID: from.ID, fromSessionID: "default",
+		toProjectID: target.ID, toSessionID: "default",
+		session: child, cancel: func() { child.Stop() }, run: run,
+	}, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	blocked := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocked, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOKIN_CONFIG_DIR", blocked)
+	if err := s.SetProjectComputerUse(target.ID, false); err == nil {
+		t.Fatal("expected computer-use persistence failure")
+	}
+	p.mu.RLock()
+	enabled := p.ComputerUseEnabled
+	p.mu.RUnlock()
+	if !enabled {
+		t.Fatal("failed policy commit changed in-memory computer-use setting")
+	}
+	child.mu.RLock()
+	halted := child.queueHalt
+	child.mu.RUnlock()
+	if !halted {
+		t.Fatal("failed policy commit allowed the already stopped child to continue")
+	}
+	select {
+	case event := <-events:
+		if event.RunID != run.ID || event.Status != "error" || event.ErrorType != DelegationErrorStorage {
+			t.Fatalf("storage-failure event = %+v", event)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("storage failure while disabling computer use was not surfaced")
+	}
+	// Restore the authoritative directory and prove the failed terminal write
+	// did not overwrite or delete recoverable evidence.
+	if err := os.Setenv("GOKIN_CONFIG_DIR", configRoot); err != nil {
+		t.Fatal(err)
+	}
+	stored, ok := mustLoadDelegationRun(t, run.ID)
+	if !ok || stored.Status != "running" {
+		t.Fatalf("failed terminal write changed durable evidence: %+v, ok=%v", stored, ok)
 	}
 }
 

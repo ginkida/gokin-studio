@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/ginkida/gokin-studio/internal/engine/security"
+	"github.com/ginkida/gokin-studio/internal/engine/wsl"
 	"os"
 	"os/exec"
 	"regexp"
@@ -435,6 +437,26 @@ func executePluginCommandHook(parent context.Context, handler pluginHookHandler,
 		"CLAUDE_PLUGIN_ROOT="+handler.Root,
 		"CLAUDE_PROJECT_DIR="+input.CWD,
 	)
+	// A repository hook in a WSL project is Linux shell script written for the
+	// distro; running it through cmd.exe against a UNC path would fail or, worse,
+	// do something unintended. The two CLAUDE_* variables have to be translated
+	// too, because inside the distro a Windows path names nothing.
+	if target := wsl.DetectFor(input.CWD); target.IsWSL() {
+		inject := security.WorkspaceEnvironmentSnapshot()
+		if root, ok := wsl.LinuxPathFor(target, handler.Root); ok {
+			inject["CLAUDE_PLUGIN_ROOT"] = root
+		}
+		if cwd, ok := wsl.LinuxPathFor(target, input.CWD); ok {
+			inject["CLAUDE_PROJECT_DIR"] = cwd
+		}
+		script := handler.Command
+		if len(handler.Args) > 0 {
+			// The host form passes args after `--`; preserve that contract by
+			// quoting them into the script's positional parameters.
+			script = handler.Command + " " + wsl.JoinArgv(handler.Args)
+		}
+		wsl.ApplyShell(cmd, target, script, inject)
+	}
 	cmd.Stdin = strings.NewReader(string(payload))
 	stdout := &cappedCommandOutput{limit: maxPluginHookOutputBytes}
 	stderr := &cappedCommandOutput{limit: maxPluginHookErrorBytes}
@@ -531,7 +553,7 @@ func canonicalPluginHookToolName(name string) string {
 		return "Glob"
 	case "grep":
 		return "Grep"
-	case "plugin_agent", "ask_agent":
+	case "plugin_agent", "delegate", "session_agent":
 		return "Agent"
 	case "web_fetch":
 		return "WebFetch"

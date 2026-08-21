@@ -7,11 +7,17 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 
+	"github.com/ginkida/gokin-studio/internal/engine/fileutil"
 	"github.com/ginkida/gokin-studio/internal/engine/logging"
 
 	"gopkg.in/yaml.v3"
 )
+
+const maxConfigFileBytes int64 = 8 << 20
+
+var configFileMu sync.RWMutex
 
 // Load loads configuration from file and environment variables.
 // It merges global config with per-project config (.gokin/config.yaml) if present.
@@ -116,7 +122,9 @@ func getConfigPath() string {
 
 // loadFromFile loads configuration from a YAML file.
 func loadFromFile(cfg *Config, path string) error {
-	data, err := os.ReadFile(path)
+	configFileMu.RLock()
+	defer configFileMu.RUnlock()
+	data, err := fileutil.ReadRegularFileLimited(path, maxConfigFileBytes)
 	if err != nil {
 		return err
 	}
@@ -342,10 +350,16 @@ func GetConfigPath() string {
 
 // Save saves the configuration to the config file.
 func (c *Config) Save() error {
+	if c == nil {
+		return fmt.Errorf("cannot save nil config")
+	}
 	configPath := getConfigPath()
 	if configPath == "" {
 		return fmt.Errorf("could not determine config path")
 	}
+
+	configFileMu.Lock()
+	defer configFileMu.Unlock()
 
 	// Ensure config directory exists (0700 for security - only owner can access)
 	configDir := filepath.Dir(configPath)
@@ -359,19 +373,10 @@ func (c *Config) Save() error {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
 
-	// Write to file atomically (write to temp file then rename)
-	// Use 0600 permissions for security - config may contain API keys
-	tmpPath := configPath + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
+	// Config may contain API keys, so publish a private, fsynced candidate and
+	// never fall back to truncating the live file if replacement fails.
+	if err := fileutil.AtomicWrite(configPath, data, 0o600); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
-	}
-
-	// Rename temp file to actual config file (atomic on POSIX systems)
-	if err := os.Rename(tmpPath, configPath); err != nil {
-		// If rename fails, try direct write (Windows filesystem)
-		if err := os.WriteFile(configPath, data, 0600); err != nil {
-			return fmt.Errorf("failed to write config file: %w", err)
-		}
 	}
 
 	return nil

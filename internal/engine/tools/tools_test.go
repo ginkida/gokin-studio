@@ -17,41 +17,6 @@ import (
 )
 
 // ──────────────────────────────────────────────────────────────────────────────
-// request_tool
-// ──────────────────────────────────────────────────────────────────────────────
-
-func TestRequestTool_NilRequester(t *testing.T) {
-	tool := NewRequestToolTool()
-	result, err := tool.Execute(context.Background(), map[string]any{"tool_name": "bash"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result.Success {
-		t.Error("expected failure when requester is nil")
-	}
-	if !strings.Contains(result.Error, "tools_list") {
-		t.Errorf("error %q should mention tools_list", result.Error)
-	}
-}
-
-func TestRequestTool_ValidateMissingArg(t *testing.T) {
-	tool := NewRequestToolTool()
-	if err := tool.Validate(map[string]any{}); err == nil {
-		t.Error("expected validation error for missing tool_name")
-	}
-	if err := tool.Validate(map[string]any{"tool_name": ""}); err == nil {
-		t.Error("expected validation error for empty tool_name")
-	}
-}
-
-func TestRequestTool_Name(t *testing.T) {
-	tool := NewRequestToolTool()
-	if tool.Name() != "request_tool" {
-		t.Errorf("Name() = %q, want %q", tool.Name(), "request_tool")
-	}
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
 // pin_context
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -569,8 +534,6 @@ func TestToolsList_WithRegistry(t *testing.T) {
 	reg := NewRegistry()
 	reg.MustRegister(&minimalTool{name: "alpha", desc: "does alpha"})
 	reg.MustRegister(&minimalTool{name: "beta", desc: "does beta"})
-	// request_tool must be in registry for the hint to appear (hasRequestTool check).
-	reg.MustRegister(&minimalTool{name: "request_tool", desc: "request a tool"})
 
 	tool := NewToolsListTool(reg)
 	result, err := tool.Execute(context.Background(), nil)
@@ -583,8 +546,8 @@ func TestToolsList_WithRegistry(t *testing.T) {
 	if !strings.Contains(result.Content, "alpha") {
 		t.Errorf("output should contain tool name 'alpha', got: %q", result.Content)
 	}
-	if !strings.Contains(result.Content, "request_tool") {
-		t.Errorf("output should mention request_tool, got: %q", result.Content)
+	if !strings.Contains(result.Content, "beta") {
+		t.Errorf("output should contain tool name 'beta', got: %q", result.Content)
 	}
 }
 
@@ -1339,31 +1302,6 @@ func TestGitCommit_ValidateWithMessage(t *testing.T) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// ask_agent tool (Validate only — Execute requires a live messenger)
-// ──────────────────────────────────────────────────────────────────────────────
-
-func TestAskAgent_ValidateMissingRole(t *testing.T) {
-	tool := NewAskAgentTool()
-	if err := tool.Validate(map[string]any{"query": "q"}); err == nil {
-		t.Error("expected validation error for missing target_role")
-	}
-}
-
-func TestAskAgent_ValidateMissingQuery(t *testing.T) {
-	tool := NewAskAgentTool()
-	if err := tool.Validate(map[string]any{"target_role": "role"}); err == nil {
-		t.Error("expected validation error for missing query")
-	}
-}
-
-func TestAskAgent_ValidateValid(t *testing.T) {
-	tool := NewAskAgentTool()
-	if err := tool.Validate(map[string]any{"target_role": "backend", "query": "what is the status?"}); err != nil {
-		t.Errorf("unexpected validation error: %v", err)
-	}
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
 // grep tool (Validate only)
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -1893,62 +1831,12 @@ func TestGetPlanStatus_ExecuteNoActivePlan(t *testing.T) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// request_tool.Execute — requester success and error paths
-// ──────────────────────────────────────────────────────────────────────────────
-
-// mockRequester implements ToolRequester for testing.
-type mockRequester struct {
-	err error
-}
-
-func (m *mockRequester) RequestTool(name string) error {
-	return m.err
-}
-
-func TestRequestToolTool_ExecuteSuccess(t *testing.T) {
-	tool := NewRequestToolTool()
-	tool.SetRequester(&mockRequester{})
-	result, err := tool.Execute(context.Background(), map[string]any{"tool_name": "bash"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !result.Success {
-		t.Fatalf("expected success, got: %s", result.Error)
-	}
-	if !strings.Contains(result.Content, "bash") {
-		t.Errorf("expected tool name in result: %q", result.Content)
-	}
-}
-
-func TestRequestToolTool_ExecuteRequesterError(t *testing.T) {
-	tool := NewRequestToolTool()
-	tool.SetRequester(&mockRequester{err: fmt.Errorf("tool not available")})
-	result, err := tool.Execute(context.Background(), map[string]any{"tool_name": "bash"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result.Success {
-		t.Error("expected failure when requester returns error")
-	}
-	if !strings.Contains(result.Error, "failed to request tool") {
-		t.Errorf("unexpected error message: %q", result.Error)
-	}
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
 // Valid-return-nil paths missing from Validate functions
 // ──────────────────────────────────────────────────────────────────────────────
 
 func TestAskUserTool_ValidateValid(t *testing.T) {
 	tool := NewAskUserTool()
 	if err := tool.Validate(map[string]any{"question": "What would you like?"}); err != nil {
-		t.Errorf("unexpected validation error: %v", err)
-	}
-}
-
-func TestRequestToolTool_ValidateValid(t *testing.T) {
-	tool := NewRequestToolTool()
-	if err := tool.Validate(map[string]any{"tool_name": "bash"}); err != nil {
 		t.Errorf("unexpected validation error: %v", err)
 	}
 }
@@ -1973,6 +1861,29 @@ func TestRegistry_RegisterDuplicate(t *testing.T) {
 	dup := &minimalTool{name: "alpha", desc: "duplicate"}
 	if err := reg.Register(dup); err == nil {
 		t.Error("expected error for duplicate tool registration")
+	}
+}
+
+func TestRegistry_UnregisterUpdatesRegistryBackedViews(t *testing.T) {
+	reg := NewRegistry()
+	reg.MustRegister(&minimalTool{name: "alpha", desc: "first"})
+	lister := NewToolsListTool(reg)
+
+	if !reg.Unregister("alpha") {
+		t.Fatal("Unregister reported an existing tool as absent")
+	}
+	if reg.Unregister("alpha") {
+		t.Fatal("second Unregister reported success")
+	}
+	if _, ok := reg.Get("alpha"); ok {
+		t.Fatal("unregistered tool is still addressable")
+	}
+	result, err := lister.Execute(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(result.Content, "**alpha**") {
+		t.Fatalf("tools_list retained unregistered tool: %q", result.Content)
 	}
 }
 

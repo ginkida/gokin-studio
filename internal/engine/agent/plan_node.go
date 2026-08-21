@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"encoding/json"
 	"sync"
 	"time"
 )
@@ -118,6 +119,156 @@ type PlanGoal struct {
 	MaxNodes        int           `json:"max_nodes"`
 	Timeout         time.Duration `json:"timeout"`
 	MinSuccessProb  float64       `json:"min_success_prob,omitempty"`
+}
+
+type planTreeJSON struct {
+	ID            string    `json:"id"`
+	Root          *PlanNode `json:"root"`
+	CurrentNodeID string    `json:"current_node_id,omitempty"`
+	BestPathIDs   []string  `json:"best_path_ids,omitempty"`
+	Goal          *PlanGoal `json:"goal"`
+	TotalNodes    int       `json:"total_nodes"`
+	MaxDepth      int       `json:"max_depth"`
+	CurrentDepth  int       `json:"current_depth"`
+	ExpandedNodes int       `json:"expanded_nodes"`
+	ReplanCount   int       `json:"replan_count"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+// MarshalJSON snapshots the tree under its own lock and includes the pointer-
+// derived navigation state that the default JSON representation historically
+// dropped. The added fields are optional, so existing state files remain valid.
+func (t *PlanTree) MarshalJSON() ([]byte, error) {
+	if t == nil {
+		return []byte("null"), nil
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	payload := planTreeJSON{
+		ID:            t.ID,
+		Root:          t.Root,
+		Goal:          t.Goal,
+		TotalNodes:    t.TotalNodes,
+		MaxDepth:      t.MaxDepth,
+		CurrentDepth:  t.CurrentDepth,
+		ExpandedNodes: t.ExpandedNodes,
+		ReplanCount:   t.ReplanCount,
+		CreatedAt:     t.CreatedAt,
+		UpdatedAt:     t.UpdatedAt,
+	}
+	if t.CurrentNode != nil {
+		payload.CurrentNodeID = t.CurrentNode.ID
+	}
+	for _, node := range t.BestPath {
+		if node != nil {
+			payload.BestPathIDs = append(payload.BestPathIDs, node.ID)
+		}
+	}
+	return json.Marshal(payload)
+}
+
+// UnmarshalJSON restores the node index and navigation pointers omitted by
+// older state files. When old data has no current-node field, the root is the
+// safest continuation point.
+func (t *PlanTree) UnmarshalJSON(data []byte) error {
+	var payload planTreeJSON
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return err
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.ID = payload.ID
+	t.Root = payload.Root
+	t.Goal = payload.Goal
+	t.TotalNodes = payload.TotalNodes
+	t.MaxDepth = payload.MaxDepth
+	t.CurrentDepth = payload.CurrentDepth
+	t.ExpandedNodes = payload.ExpandedNodes
+	t.ReplanCount = payload.ReplanCount
+	t.CreatedAt = payload.CreatedAt
+	t.UpdatedAt = payload.UpdatedAt
+	t.nodeIndex = make(map[string]*PlanNode)
+	t.rebuildIndex()
+	t.CurrentNode = t.nodeIndex[payload.CurrentNodeID]
+	if t.CurrentNode == nil {
+		t.CurrentNode = t.Root
+	}
+	t.BestPath = nil
+	for _, nodeID := range payload.BestPathIDs {
+		if node := t.nodeIndex[nodeID]; node != nil {
+			t.BestPath = append(t.BestPath, node)
+		}
+	}
+	return nil
+}
+
+func clonePlanTreeSnapshot(tree *PlanTree) *PlanTree {
+	if tree == nil {
+		return nil
+	}
+	tree.mu.RLock()
+	defer tree.mu.RUnlock()
+
+	clonedNodes := make(map[*PlanNode]*PlanNode)
+	var cloneNode func(*PlanNode) *PlanNode
+	cloneNode = func(node *PlanNode) *PlanNode {
+		if node == nil {
+			return nil
+		}
+		if existing := clonedNodes[node]; existing != nil {
+			return existing
+		}
+		cloned := *node
+		cloned.Action = nil
+		cloned.Result = nil
+		cloned.Children = nil
+		clonedNodes[node] = &cloned
+		if node.Action != nil {
+			action := *node.Action
+			action.ToolArgs = cloneStringAnyMap(node.Action.ToolArgs)
+			action.Prerequisites = append([]string(nil), node.Action.Prerequisites...)
+			cloned.Action = &action
+		}
+		cloned.Result = cloneAgentResult(node.Result)
+		for _, child := range node.Children {
+			cloned.Children = append(cloned.Children, cloneNode(child))
+		}
+		return &cloned
+	}
+
+	snapshot := &PlanTree{
+		ID:            tree.ID,
+		Root:          cloneNode(tree.Root),
+		TotalNodes:    tree.TotalNodes,
+		MaxDepth:      tree.MaxDepth,
+		CurrentDepth:  tree.CurrentDepth,
+		ExpandedNodes: tree.ExpandedNodes,
+		ReplanCount:   tree.ReplanCount,
+		CreatedAt:     tree.CreatedAt,
+		UpdatedAt:     tree.UpdatedAt,
+		nodeIndex:     make(map[string]*PlanNode),
+	}
+	if tree.Goal != nil {
+		goal := *tree.Goal
+		goal.SuccessCriteria = append([]string(nil), tree.Goal.SuccessCriteria...)
+		snapshot.Goal = &goal
+	}
+	for _, cloned := range clonedNodes {
+		snapshot.nodeIndex[cloned.ID] = cloned
+	}
+	snapshot.CurrentNode = clonedNodes[tree.CurrentNode]
+	if snapshot.CurrentNode == nil {
+		snapshot.CurrentNode = snapshot.Root
+	}
+	for _, node := range tree.BestPath {
+		if cloned := clonedNodes[node]; cloned != nil {
+			snapshot.BestPath = append(snapshot.BestPath, cloned)
+		}
+	}
+	return snapshot
 }
 
 // NewPlanTree creates a new plan tree with the given goal.

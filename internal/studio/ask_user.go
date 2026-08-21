@@ -16,18 +16,29 @@ import (
 type askUserRegistry struct {
 	mu      sync.Mutex
 	pending map[string]chan string
+	routes  map[askUserRoute]*askUserRouteGate
 }
 
 func newAskUserRegistry() *askUserRegistry {
-	return &askUserRegistry{pending: make(map[string]chan string)}
+	return &askUserRegistry{
+		pending: make(map[string]chan string),
+		routes:  make(map[askUserRoute]*askUserRouteGate),
+	}
 }
 
-func (r *askUserRegistry) register(id string) chan string {
+// register installs one exact owner for id. A duplicate must never replace an
+// existing question: its waiter would otherwise remain blocked with no way for
+// the frontend to address the orphaned channel.
+func (r *askUserRegistry) register(id string) (chan string, bool) {
 	ch := make(chan string, 1)
 	r.mu.Lock()
+	if _, exists := r.pending[id]; exists {
+		r.mu.Unlock()
+		return nil, false
+	}
 	r.pending[id] = ch
 	r.mu.Unlock()
-	return ch
+	return ch, true
 }
 
 func (r *askUserRegistry) resolve(id, answer string) bool {
@@ -47,9 +58,13 @@ func (r *askUserRegistry) resolve(id, answer string) bool {
 	return true
 }
 
-func (r *askUserRegistry) cleanup(id string) {
+// cleanup removes id only when ch is still its exact owner. This protects a
+// newly registered owner from an old waiter's deferred cleanup (the ABA case).
+func (r *askUserRegistry) cleanup(id string, ch chan string) {
 	r.mu.Lock()
-	delete(r.pending, id)
+	if current, ok := r.pending[id]; ok && current == ch {
+		delete(r.pending, id)
+	}
 	r.mu.Unlock()
 }
 
@@ -67,6 +82,77 @@ func (r *askUserRegistry) cancel(id string) bool {
 	}
 	close(ch)
 	return true
+}
+
+// The frontend intentionally renders one question card per chat. Route gates
+// serialize questions for that exact project/session so concurrent MCP App,
+// browser, and agent approvals cannot overwrite one another. Other chats stay
+// independent.
+type askUserRoute struct {
+	projectID string
+	sessionID string
+}
+
+type askUserRouteGate struct {
+	token chan struct{}
+	refs  int
+}
+
+func (r *askUserRegistry) acquireRoute(ctx context.Context, projectID, sessionID string) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	route := askUserRoute{projectID: projectID, sessionID: sessionID}
+	r.mu.Lock()
+	gate := r.routes[route]
+	if gate == nil {
+		gate = &askUserRouteGate{token: make(chan struct{}, 1)}
+		gate.token <- struct{}{}
+		r.routes[route] = gate
+	}
+	gate.refs++
+	r.mu.Unlock()
+
+	var once sync.Once
+	release := func() {
+		once.Do(func() { r.releaseRoute(route, gate) })
+	}
+	select {
+	case <-gate.token:
+		// Prefer cancellation if it raced with acquisition; do not surface a
+		// question after its owning operation has already ended.
+		if err := ctx.Err(); err != nil {
+			release()
+			return nil, err
+		}
+		return release, nil
+	case <-ctx.Done():
+		r.abandonRoute(route, gate)
+		return nil, ctx.Err()
+	}
+}
+
+func (r *askUserRegistry) releaseRoute(route askUserRoute, gate *askUserRouteGate) {
+	r.mu.Lock()
+	gate.refs--
+	if gate.refs == 0 {
+		if r.routes[route] == gate {
+			delete(r.routes, route)
+		}
+		r.mu.Unlock()
+		return
+	}
+	r.mu.Unlock()
+	gate.token <- struct{}{}
+}
+
+func (r *askUserRegistry) abandonRoute(route askUserRoute, gate *askUserRouteGate) {
+	r.mu.Lock()
+	gate.refs--
+	if gate.refs == 0 && r.routes[route] == gate {
+		delete(r.routes, route)
+	}
+	r.mu.Unlock()
 }
 
 // Context keys for routing ask_user calls from tool execution back to the
@@ -118,9 +204,38 @@ func (s *Studio) makeAskUserHandler(wailsCtx context.Context) func(ctx context.C
 // use the same registry, cancellation, and race-safe single-resolution path.
 func (s *Studio) waitForUserAnswer(wailsCtx, ctx context.Context, event AskUserEvent) (string, error) {
 	event.ProjectID, event.SessionID = askUserRouting(ctx)
-	event.QuestionID = uuid.New().String()[:12]
-	ch := s.askUsers.register(event.QuestionID)
-	defer s.askUsers.cleanup(event.QuestionID)
+	if event.SessionID == "" {
+		event.SessionID = "default"
+	}
+	if s.askUsers == nil {
+		return "", fmt.Errorf("ask-user registry not initialised")
+	}
+	releaseRoute, err := s.askUsers.acquireRoute(ctx, event.ProjectID, event.SessionID)
+	if err != nil {
+		return "", err
+	}
+	defer releaseRoute()
+
+	var ch chan string
+	for {
+		event.QuestionID = uuid.New().String()
+		var registered bool
+		ch, registered = s.askUsers.register(event.QuestionID)
+		if registered {
+			break
+		}
+	}
+	defer func() {
+		// Remove this exact owner before telling the UI it closed, then release
+		// the route only after the close event has been emitted. This preserves
+		// lifecycle order even when another approval is already queued.
+		s.askUsers.cleanup(event.QuestionID, ch)
+		wailsRuntime.EventsEmit(wailsCtx, EventAskUserClosed, AskUserClosedEvent{
+			ProjectID:  event.ProjectID,
+			SessionID:  event.SessionID,
+			QuestionID: event.QuestionID,
+		})
+	}()
 
 	wailsRuntime.EventsEmit(wailsCtx, EventAskUser, event)
 

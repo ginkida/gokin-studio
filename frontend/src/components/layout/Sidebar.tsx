@@ -3,13 +3,14 @@ import { useProjectStore, ProjectInfo } from '../../stores/projectStore'
 import { useChatStore } from '../../stores/chatStore'
 import { ProviderSelect } from '../project/ProviderSelect'
 import { Zap, FolderPlus, Trash2, GitBranch, Settings, FolderOpen, Folder, Search, X, Pin, PinOff, Download, Upload, Volume2, VolumeX, Archive, ArchiveRestore, Loader2, AlertTriangle, CheckCircle } from 'lucide-react'
-import { AddProject, ArchiveProject, ListArchivedProjects, RestoreProject, RemoveProject, BrowseDirectory, RenameProject, SetProjectPinned, ExportProjectJSON, ImportProjectJSON, GetProjectOrder, ReorderProjects } from '../../../wailsjs/go/studio/Studio'
+import { AddProject, ArchiveProject, ListArchivedProjects, RestoreProject, RemoveProject, BrowseDirectory, RenameProject, SetProjectPinned, ExportProjectJSON, ImportProjectJSON, GetProjectOrder, ReorderProjects, GetWSLStatus } from '../../../wailsjs/go/studio/Studio'
 import { isProjectMuted, toggleProjectMute, unmuteProject, clearProjectLocalStorage } from '../../lib/mutedProjects'
 import { hasOpenModal } from '../../hooks/useModalFocusManagement'
 import { useConfirmDialog } from '../common/AppDialog'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { formatContextWindow } from '../../lib/modelCapabilities'
 import { formatProviderModelLabel } from '../../lib/providerCatalog'
+import { downloadBlob } from '../../lib/download'
 
 interface SidebarProps {
   onOpenSettings?: () => void
@@ -35,6 +36,11 @@ export function Sidebar({ onOpenSettings, onToggleCollapse, onNavigate, collapse
   const activeProjectId = useProjectStore((s) => s.activeProjectId)
   const setActiveProject = useProjectStore((s) => s.setActiveProject)
   const addProjectToStore = useProjectStore((s) => s.addProject)
+  // The native folder picker cannot browse into a distro, so a WSL user would
+  // otherwise have to know and type \\wsl.localhost\<Distro>\... by hand.
+  // Empty on every platform without WSL, which is where the row stays hidden.
+  const [wslDistros, setWSLDistros] = useState<{ name: string; uncRoot: string; running: boolean; version: number }[]>([])
+
   const removeProjectFromStore = useProjectStore((s) => s.removeProject)
   const settings = useSettingsStore((s) => s.settings)
   const providers = useSettingsStore((s) => s.providers)
@@ -46,6 +52,21 @@ export function Sidebar({ onOpenSettings, onToggleCollapse, onNavigate, collapse
   const [newDir, setNewDir] = useState('')
   const [addBusy, setAddBusy] = useState(false)
   const [browseBusy, setBrowseBusy] = useState(false)
+
+  useEffect(() => {
+    if (!showAdd || wslDistros.length > 0) return
+    let cancelled = false
+    GetWSLStatus()
+      .then((status) => {
+        if (cancelled || !status?.available) return
+        setWSLDistros((status.distros || []).map((d: any) => ({
+          name: d.name, uncRoot: d.uncRoot, running: !!d.running, version: d.version || 0,
+        })))
+      })
+      .catch(() => { /* WSL absent is the normal case; the row simply stays hidden */ })
+    return () => { cancelled = true }
+  }, [showAdd, wslDistros.length])
+
   const [error, setError] = useState('')
   const [renameError, setRenameError] = useState<string | null>(null)
   const [removeError, setRemoveError] = useState<string | null>(null)
@@ -785,6 +806,30 @@ export function Sidebar({ onOpenSettings, onToggleCollapse, onNavigate, collapse
               {browseBusy ? <Loader2 size={14} className="spin" /> : <FolderOpen size={14} />}
             </button>
           </div>
+          {wslDistros.length > 0 && (
+            <div className="wsl-distro-row">
+              <span className="wsl-distro-label">WSL</span>
+              {wslDistros.map((distro) => (
+                <button
+                  key={distro.name}
+                  type="button"
+                  className="wsl-distro-chip"
+                  disabled={addBusy || browseBusy}
+                  title={`Start from ${distro.uncRoot}${distro.running ? '' : ' (distribution is stopped; it starts on first use)'}`}
+                  onClick={() => {
+                    // Prefill the root and let the user finish the path; the
+                    // native picker cannot browse into a distro.
+                    setNewDir(distro.uncRoot.replace(/\\+$/, '') + '\\')
+                    setError('')
+                  }}
+                >
+                  {distro.name}
+                  {distro.version === 1 && <small> v1</small>}
+                  {!distro.running && <span className="wsl-distro-stopped" aria-label="stopped" />}
+                </button>
+              ))}
+            </div>
+          )}
           <div className={`add-project-model-preview ${defaultSetupBlocked ? 'unavailable' : ''}`}>
             <span className={`provider-dot ${defaultProvider}`} aria-hidden />
             <span className="add-project-model-copy">
@@ -1264,12 +1309,7 @@ export function Sidebar({ onOpenSettings, onToggleCollapse, onNavigate, collapse
               try {
                 const json = await ExportProjectJSON(targetId)
                 const blob = new Blob([json], { type: 'application/json' })
-                const url = URL.createObjectURL(blob)
-                const a = document.createElement('a')
-                a.href = url
-                a.download = `${proj.name.replace(/[^a-zA-Z0-9_\-]/g, '_')}-project.json`
-                a.click()
-                URL.revokeObjectURL(url)
+                downloadBlob(blob, `${proj.name.replace(/[^a-zA-Z0-9_\-]/g, '_')}-project.json`)
                 showSidebarNotice('success', `Exported “${proj.name}” as JSON.`)
               } catch (e: any) {
                 console.error('ExportProjectJSON failed:', e)

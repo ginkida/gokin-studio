@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"github.com/ginkida/gokin-studio/internal/engine/client"
 	"github.com/ginkida/gokin-studio/internal/engine/config"
 	ctxmgr "github.com/ginkida/gokin-studio/internal/engine/context"
+	"github.com/ginkida/gokin-studio/internal/engine/fileutil"
 	"github.com/ginkida/gokin-studio/internal/engine/logging"
 	"github.com/ginkida/gokin-studio/internal/engine/memory"
 	"github.com/ginkida/gokin-studio/internal/engine/permission"
@@ -29,7 +31,7 @@ const (
 
 	// MaxTurnLimit is the absolute maximum number of turns an agent can take.
 	// This prevents infinite loops even if mental loop detection fails.
-	MaxTurnLimit = 100
+	MaxTurnLimit = tools.MaxTaskTurns
 
 	// Long-loop stability guardrails.
 	stagnationTurnThreshold   = 3
@@ -38,24 +40,23 @@ const (
 
 // Agent represents an isolated executor for subtasks.
 type Agent struct {
-	ID           string
-	Type         AgentType
-	Model        string
-	client       client.Client
-	registry     *tools.Registry
-	baseRegistry tools.ToolRegistry
-	workDir       string
+	ID             string
+	Type           AgentType
+	Model          string
+	client         client.Client
+	registry       *tools.Registry
+	baseRegistry   tools.ToolRegistry
+	workDir        string
 	originalPrompt string // Preserved for continuation after compaction
-	messenger     tools.Messenger
-	permissions  *permission.Manager
-	timeout      time.Duration
-	history      []*genai.Content
-	status       AgentStatus
-	startTime    time.Time
-	endTime      time.Time
-	maxTurns     int
-	thoroughness tools.Thoroughness
-	outputStyle  tools.OutputStyle
+	permissions    *permission.Manager
+	timeout        time.Duration
+	history        []*genai.Content
+	status         AgentStatus
+	startTime      time.Time
+	endTime        time.Time
+	maxTurns       int
+	thoroughness   tools.Thoroughness
+	outputStyle    tools.OutputStyle
 
 	// === IMPROVEMENT 4: Progress tracking ===
 	currentStep      int
@@ -80,6 +81,7 @@ type Agent struct {
 	// Project context injection for sub-agents
 	projectContext string            // Injected project guidelines/instructions
 	onText         func(text string) // Streaming callback for real-time output
+	onOutputFile   func(path string) // Publishes incremental output availability
 	onTextMu       sync.Mutex        // Protects onText from interleaving
 	onThinking     func(text string) // Streaming callback for thinking/reasoning output
 	onThinkingMu   sync.Mutex        // Protects onThinking from interleaving
@@ -152,13 +154,14 @@ type Agent struct {
 	lastCheckpointTurn int  // Last turn when checkpoint was saved
 
 	// Workspace isolation state
-	isolatedWorkspace     *isolatedWorkspace
-	allowedRequestedTools map[string]struct{}
+	isolatedWorkspace *isolatedWorkspace
 }
 
 // SetOnRateLimit sets the rate limit callback.
 func (a *Agent) SetOnRateLimit(cb func(rl *client.RateLimitMetadata)) {
+	a.stateMu.Lock()
 	a.onRateLimit = cb
+	a.stateMu.Unlock()
 }
 
 // ContextHealth represents a snapshot of the agent's current context state.
@@ -219,6 +222,9 @@ func NewAgent(agentType AgentType, c client.Client, baseRegistry tools.ToolRegis
 	if maxTurns <= 0 {
 		maxTurns = 15 // default — keep low to prevent excessive exploration
 	}
+	if maxTurns > MaxTurnLimit {
+		maxTurns = MaxTurnLimit
+	}
 
 	// Use a different model if specified
 	agentClient := c
@@ -258,12 +264,6 @@ func NewAgent(agentType AgentType, c client.Client, baseRegistry tools.ToolRegis
 	// Apply per-agent-type context budgets before other wiring
 	agent.applyAgentTypeDefaults()
 
-	// Wire up RequestTool tool if it exists in the registry
-	if rt, ok := agent.registry.Get("request_tool"); ok {
-		if rtt, ok := rt.(*tools.RequestToolTool); ok {
-			rtt.SetRequester(agent)
-		}
-	}
 	if bt, ok := agent.registry.Get("bash"); ok {
 		if bashTool, ok := bt.(*tools.BashTool); ok {
 			bashTool.SetWorkspaceBoundary(workDir)
@@ -332,7 +332,7 @@ func NewAgent(agentType AgentType, c client.Client, baseRegistry tools.ToolRegis
 				cb := agent.onScratchpadUpdate
 				agent.stateMu.Unlock()
 				if cb != nil {
-					cb(content)
+					callAgentObserver(agent.ID, "scratchpad", func() { cb(content) })
 				}
 			})
 		}
@@ -353,6 +353,9 @@ func NewAgentWithDynamicType(dynType *DynamicAgentType, c client.Client, baseReg
 
 	if maxTurns <= 0 {
 		maxTurns = 30
+	}
+	if maxTurns > MaxTurnLimit {
+		maxTurns = MaxTurnLimit
 	}
 
 	agentClient := c
@@ -394,12 +397,6 @@ func NewAgentWithDynamicType(dynType *DynamicAgentType, c client.Client, baseReg
 	// Apply per-agent-type context budgets before other wiring
 	agent.applyAgentTypeDefaults()
 
-	// Wire up RequestTool tool if it exists
-	if rt, ok := agent.registry.Get("request_tool"); ok {
-		if rtt, ok := rt.(*tools.RequestToolTool); ok {
-			rtt.SetRequester(agent)
-		}
-	}
 	if bt, ok := agent.registry.Get("bash"); ok {
 		if bashTool, ok := bt.(*tools.BashTool); ok {
 			bashTool.SetWorkspaceBoundary(workDir)
@@ -468,7 +465,7 @@ func NewAgentWithDynamicType(dynType *DynamicAgentType, c client.Client, baseReg
 				cb := agent.onScratchpadUpdate
 				agent.stateMu.Unlock()
 				if cb != nil {
-					cb(content)
+					callAgentObserver(agent.ID, "scratchpad", func() { cb(content) })
 				}
 			})
 		}
@@ -483,14 +480,6 @@ func NewAgentWithDynamicType(dynType *DynamicAgentType, c client.Client, baseReg
 func createFilteredRegistryFromList(allowedTools []string, baseRegistry tools.ToolRegistry) *tools.Registry {
 	filtered := tools.NewRegistry()
 
-	if len(allowedTools) == 0 {
-		// All tools allowed - copy all from base registry
-		for _, tool := range baseRegistry.List() {
-			_ = filtered.Register(cloneToolForAgent(tool))
-		}
-		return filtered
-	}
-
 	allowedMap := make(map[string]bool)
 	for _, name := range allowedTools {
 		allowedMap[name] = true
@@ -498,7 +487,15 @@ func createFilteredRegistryFromList(allowedTools []string, baseRegistry tools.To
 
 	for _, tool := range baseRegistry.List() {
 		if allowedMap[tool.Name()] {
+			if tool.Name() == "tools_list" {
+				continue
+			}
 			_ = filtered.Register(cloneToolForAgent(tool))
+		}
+	}
+	if allowedMap["tools_list"] {
+		if _, exists := baseRegistry.Get("tools_list"); exists {
+			filtered.MustRegister(tools.NewToolsListTool(filtered))
 		}
 	}
 
@@ -548,38 +545,29 @@ func (a *Agent) SetThoroughness(t tools.Thoroughness) {
 	a.thoroughness = t
 }
 
-// ApplyThoroughness sets thoroughness, adjusts maxTurns (if still at default),
-// sets per-agent timeout, loop detection threshold, and tool result compaction
-// based on type and thoroughness level.
-func (a *Agent) ApplyThoroughness(t tools.Thoroughness, defaultMaxTurns int) {
+// ApplyThoroughness sets thoroughness, applies the profile's recommended turn
+// budget without ever exceeding the caller's configured maximum, and adjusts
+// timeouts, loop detection, compaction, and planning behavior.
+func (a *Agent) ApplyThoroughness(t tools.Thoroughness) {
 	a.thoroughness = t
-	canOverrideMaxTurns := a.maxTurns == defaultMaxTurns
 
 	switch a.Type {
 	case AgentTypeExplore:
 		switch t {
 		case tools.ThoroughnessQuick:
-			if canOverrideMaxTurns {
-				a.maxTurns = 8
-			}
+			a.capMaxTurns(8)
 			a.timeout = 1 * time.Minute
 		case tools.ThoroughnessThorough:
-			if canOverrideMaxTurns {
-				a.maxTurns = 50
-			}
+			a.capMaxTurns(50)
 			a.timeout = 5 * time.Minute
 		}
 	case AgentTypeBash:
 		switch t {
 		case tools.ThoroughnessQuick:
-			if canOverrideMaxTurns {
-				a.maxTurns = 5
-			}
+			a.capMaxTurns(5)
 			a.timeout = 1 * time.Minute
 		case tools.ThoroughnessThorough:
-			if canOverrideMaxTurns {
-				a.maxTurns = 20
-			}
+			a.capMaxTurns(20)
 			a.timeout = 3 * time.Minute
 		}
 	case AgentTypeGeneral:
@@ -630,6 +618,12 @@ func (a *Agent) ApplyThoroughness(t tools.Thoroughness, defaultMaxTurns int) {
 
 	// Adjust context summarization settings per thoroughness
 	a.applyContextThoroughness(t)
+}
+
+func (a *Agent) capMaxTurns(profileLimit int) {
+	if profileLimit > 0 && a.maxTurns > profileLimit {
+		a.maxTurns = profileLimit
+	}
 }
 
 // applyContextThoroughness adjusts context summarization, history limits,
@@ -697,6 +691,24 @@ func (a *Agent) SetOnText(onText func(string)) {
 	a.stateMu.Unlock()
 }
 
+// SetOnOutputFile registers a callback invoked after output initialization.
+// path is empty when file backing is unavailable; Runner still uses the event
+// to transition a provisional result from pending to running.
+func (a *Agent) SetOnOutputFile(callback func(string)) {
+	a.stateMu.Lock()
+	a.onOutputFile = callback
+	a.stateMu.Unlock()
+}
+
+func (a *Agent) publishOutputFile(path string) {
+	a.stateMu.RLock()
+	callback := a.onOutputFile
+	a.stateMu.RUnlock()
+	if callback != nil {
+		callAgentObserver(a.ID, "output_file", func() { callback(path) })
+	}
+}
+
 // SetOnThinking sets the streaming callback for thinking/reasoning output.
 func (a *Agent) SetOnThinking(onThinking func(string)) {
 	a.stateMu.Lock()
@@ -730,10 +742,11 @@ func (a *Agent) SetPinnedContext(content string) {
 	if workDir != "" {
 		pinnedPath := filepath.Join(workDir, ".gokin", "pinned_context.md")
 		if content == "" {
-			os.Remove(pinnedPath)
+			_ = os.Remove(pinnedPath)
 		} else {
-			os.MkdirAll(filepath.Dir(pinnedPath), 0750)
-			os.WriteFile(pinnedPath, []byte(content), 0644)
+			if err := os.MkdirAll(filepath.Dir(pinnedPath), 0o700); err == nil {
+				_ = fileutil.AtomicWrite(pinnedPath, []byte(content), 0o600)
+			}
 		}
 	}
 }
@@ -748,7 +761,7 @@ func (a *Agent) LoadPinnedContext() {
 		return
 	}
 	pinnedPath := filepath.Join(workDir, ".gokin", "pinned_context.md")
-	data, err := os.ReadFile(pinnedPath)
+	data, err := fileutil.ReadRegularFileLimited(pinnedPath, 4<<20)
 	if err != nil {
 		return
 	}
@@ -838,21 +851,10 @@ func (a *Agent) SetOnPlanApproved(callback func(planSummary string)) {
 }
 
 // SetMessenger sets the messenger for inter-agent communication.
-func (a *Agent) SetMessenger(m tools.Messenger) {
-	a.messenger = m
-
-	// Wire up AskAgentTool if it exists in the registry
-	if askTool, ok := a.registry.Get("ask_agent"); ok {
-		if aat, ok := askTool.(*tools.AskAgentTool); ok {
-			aat.SetMessenger(m)
-		}
-	}
-
+func (a *Agent) SetMessenger(m *AgentMessenger) {
 	// Wire up delegation strategy with messenger
 	if a.delegation != nil {
-		if am, ok := m.(*AgentMessenger); ok {
-			a.delegation.SetMessenger(am)
-		}
+		a.delegation.SetMessenger(m)
 	}
 }
 
@@ -949,8 +951,9 @@ func (a *Agent) DisablePlanningMode() {
 // GetActivePlan returns the currently active plan tree.
 func (a *Agent) GetActivePlan() *PlanTree {
 	a.stateMu.RLock()
-	defer a.stateMu.RUnlock()
-	return a.activePlan
+	activePlan := a.activePlan
+	a.stateMu.RUnlock()
+	return clonePlanTreeSnapshot(activePlan)
 }
 
 // IsPlanningMode returns whether the agent is in planning mode.
@@ -990,7 +993,13 @@ func createFilteredRegistry(agentType AgentType, baseRegistry tools.ToolRegistry
 		// Copy all tools to a new Registry
 		filtered := tools.NewRegistry()
 		for _, tool := range baseRegistry.List() {
+			if tool.Name() == "tools_list" {
+				continue
+			}
 			_ = filtered.Register(cloneToolForAgent(tool))
+		}
+		if _, exists := baseRegistry.Get("tools_list"); exists {
+			filtered.MustRegister(tools.NewToolsListTool(filtered))
 		}
 		return filtered
 	}
@@ -1004,68 +1013,40 @@ func createFilteredRegistry(agentType AgentType, baseRegistry tools.ToolRegistry
 
 	for _, tool := range baseRegistry.List() {
 		if allowedMap[tool.Name()] {
+			if tool.Name() == "tools_list" {
+				continue
+			}
 			_ = filtered.Register(cloneToolForAgent(tool))
+		}
+	}
+	if allowedMap["tools_list"] {
+		if _, exists := baseRegistry.Get("tools_list"); exists {
+			filtered.MustRegister(tools.NewToolsListTool(filtered))
 		}
 	}
 
 	return filtered
 }
 
-// RequestTool dynamically adds a tool from the base registry to the agent's active registry.
-func (a *Agent) RequestTool(name string) error {
-	// Check if already in active registry
-	if _, ok := a.registry.Get(name); ok {
-		return nil // Already have this tool
-	}
-
-	if len(a.allowedRequestedTools) > 0 {
-		if _, ok := a.allowedRequestedTools[name]; !ok {
-			return fmt.Errorf("tool is not allowed in this agent environment: %s", name)
-		}
-	}
-
-	tool, ok := a.baseRegistry.Get(name)
-	if !ok {
-		return fmt.Errorf("tool not found in system: %s", name)
-	}
-
-	return a.registry.Register(cloneToolForAgentWithWorkDir(tool, a.workDir))
-}
-
-// SetAllowedRequestedTools restricts which tools may be added via request_tool.
-// A nil or empty list means no additional restriction.
-func (a *Agent) SetAllowedRequestedTools(names []string) {
-	if len(names) == 0 {
-		a.allowedRequestedTools = nil
-		return
-	}
-
-	allowed := make(map[string]struct{}, len(names))
-	for _, name := range names {
-		allowed[name] = struct{}{}
-	}
-	a.allowedRequestedTools = allowed
-}
-
-// SendMessage sends a message to another agent via the messenger.
-func (a *Agent) SendMessage(msgType string, toRole string, content string, data map[string]any) (string, error) {
-	if a.messenger == nil {
-		return "", fmt.Errorf("messenger not initialized for this agent")
-	}
-	return a.messenger.SendMessage(msgType, toRole, content, data)
-}
-
-// ReceiveResponse waits for a response to a previously sent message.
-func (a *Agent) ReceiveResponse(ctx context.Context, messageID string) (string, error) {
-	if a.messenger == nil {
-		return "", fmt.Errorf("messenger not initialized for this agent")
-	}
-	return a.messenger.ReceiveResponse(ctx, messageID)
-}
-
 // Run executes the agent with the given prompt and returns the result.
 func (a *Agent) Run(ctx context.Context, prompt string) (*AgentResult, error) {
 	a.stateMu.Lock()
+	if a.status == AgentStatusCancelled {
+		now := time.Now()
+		if a.startTime.IsZero() {
+			a.startTime = now
+		}
+		a.endTime = now
+		result := &AgentResult{
+			AgentID:   a.ID,
+			Type:      a.Type,
+			Status:    AgentStatusCancelled,
+			Error:     context.Canceled.Error(),
+			Completed: true,
+		}
+		a.stateMu.Unlock()
+		return result, context.Canceled
+	}
 	a.status = AgentStatusRunning
 	a.startTime = time.Now()
 	hasHistory := len(a.history) > 0
@@ -1079,7 +1060,10 @@ func (a *Agent) Run(ctx context.Context, prompt string) (*AgentResult, error) {
 
 	// Create file-backed output writer for streaming to disk
 	outputWriter := NewAgentOutputWriter(a.workDir, a.ID)
-	defer outputWriter.Close()
+	// The normal path closes explicitly below so Sync/Close errors affect the
+	// result. This defer is a panic-path guard and becomes a no-op afterwards.
+	defer func() { _ = outputWriter.Close() }()
+	a.publishOutputFile(outputWriter.FilePath())
 
 	result := &AgentResult{
 		AgentID:   a.ID,
@@ -1102,15 +1086,26 @@ func (a *Agent) Run(ctx context.Context, prompt string) (*AgentResult, error) {
 	}
 
 	// Execute the prompt through the function calling loop
-	var finalOutput strings.Builder
-	_, output, err := a.executeLoop(ctx, prompt, &finalOutput)
+	finalOutput := newAgentOutputBuffer(outputWriter)
+	_, _, err := a.executeLoop(ctx, prompt, finalOutput)
 
-	// Stream output to file-backed writer
-	outputWriter.WriteString(output)
+	outputErr := errors.Join(finalOutput.Err(), outputWriter.Close())
+	if outputErr != nil {
+		outputErr = fmt.Errorf("persist agent output: %w", outputErr)
+		if err == nil {
+			err = outputErr
+		} else {
+			err = errors.Join(err, outputErr)
+		}
+	}
 
 	if err != nil {
 		a.stateMu.Lock()
-		a.status = AgentStatusFailed
+		finalStatus := AgentStatusFailed
+		if a.status == AgentStatusCancelled {
+			finalStatus = AgentStatusCancelled
+		}
+		a.status = finalStatus
 		a.endTime = time.Now()
 		endTime := a.endTime
 		startTime := a.startTime
@@ -1119,15 +1114,18 @@ func (a *Agent) Run(ctx context.Context, prompt string) (*AgentResult, error) {
 		// Clear callHistory to prevent memory leak
 		a.clearCallHistory()
 
-		result.Status = AgentStatusFailed
+		result.Status = finalStatus
 		result.Error = err.Error()
 		result.Output = outputWriter.String() // Use writer's in-memory portion
 		result.OutputFile = outputWriter.FilePath()
 		result.Duration = endTime.Sub(startTime)
 		result.Completed = true
 
-		// Update progress with failure
-		a.SetProgress(a.currentStep, a.totalSteps, "Failed: "+err.Error())
+		progressPrefix := "Failed: "
+		if finalStatus == AgentStatusCancelled {
+			progressPrefix = "Cancelled: "
+		}
+		a.SetProgress(a.currentStep, a.totalSteps, progressPrefix+err.Error())
 
 		a.collectTreeMetrics(result)
 		return result, err
@@ -2217,7 +2215,7 @@ section:
 }
 
 // executeLoop runs the function calling loop for the agent.
-func (a *Agent) executeLoop(ctx context.Context, prompt string, output *strings.Builder) ([]*genai.Content, string, error) {
+func (a *Agent) executeLoop(ctx context.Context, prompt string, output *agentOutputBuffer) ([]*genai.Content, string, error) {
 	// Add user prompt to history (protected by mutex)
 	userContent := genai.NewContentFromText(prompt, genai.RoleUser)
 	a.stateMu.Lock()
@@ -2243,7 +2241,9 @@ func (a *Agent) executeLoop(ctx context.Context, prompt string, output *strings.
 		if err != nil {
 			logging.Warn("failed to build plan tree, falling back to reactive mode", "error", err)
 		} else {
+			a.stateMu.Lock()
 			a.activePlan = tree
+			a.stateMu.Unlock()
 			if onText != nil {
 				a.safeOnText(fmt.Sprintf("\n[Plan tree built: %d nodes, best path: %d steps]\n",
 					tree.TotalNodes, len(tree.BestPath)))
@@ -2252,7 +2252,7 @@ func (a *Agent) executeLoop(ctx context.Context, prompt string, output *strings.
 			// Notify plan approval callback for context compaction
 			if onPlanApproved != nil {
 				planSummary := a.treePlanner.GeneratePlanSummary(tree)
-				onPlanApproved(planSummary)
+				callAgentObserver(a.ID, "plan_approved", func() { onPlanApproved(planSummary) })
 			}
 
 			// Set total steps to best path length using SetProgress for thread safety
@@ -2356,7 +2356,7 @@ func (a *Agent) executeLoop(ctx context.Context, prompt string, output *strings.
 						a.safeOnText(fmt.Sprintf("\n[Executing planned step: %s %s]\n",
 							action.Type, action.AgentType))
 
-						result := a.executePlannedAction(ctx, action)
+						result := a.executePlannedActionSafely(ctx, action)
 
 						// Record result in tree (RecordResult is thread-safe)
 						if err := a.treePlanner.RecordResult(planTree, action.NodeID, result); err != nil {
@@ -2854,7 +2854,7 @@ func (a *Agent) executeLoop(ctx context.Context, prompt string, output *strings.
 	}
 
 	// Notify user if we hit the max turn limit
-	if i >= a.maxTurns {
+	if i >= effectiveMaxTurns {
 		a.safeOnText("\n[Reached maximum turn limit — stopping]\n")
 	}
 
@@ -3217,7 +3217,7 @@ func (a *Agent) forceCompactHistory(ctx context.Context) error {
 		return nil // Not enough to compact
 	}
 
-	keepStart := 3  // system prompt + greeting + original task prompt
+	keepStart := 3 // system prompt + greeting + original task prompt
 	keepEnd := 6
 	keepMiddle := 4 // Top N by importance from middle section
 
@@ -3554,8 +3554,11 @@ func (a *Agent) collectStream(ctx context.Context, stream *client.StreamingRespo
 			a.safeOnThinking(text)
 		},
 		OnRateLimit: func(rl *client.RateLimitMetadata) {
-			if a.onRateLimit != nil {
-				a.onRateLimit(rl)
+			a.stateMu.RLock()
+			onRateLimit := a.onRateLimit
+			a.stateMu.RUnlock()
+			if onRateLimit != nil {
+				callAgentObserver(a.ID, "rate_limit", func() { onRateLimit(rl) })
 			}
 		},
 	})
@@ -3846,12 +3849,15 @@ func (a *Agent) executeToolWithReflection(ctx context.Context, call *genai.Funct
 			attempt := a.autoFixAttempts[key]
 			a.autoFixAttemptsMu.Unlock()
 
-			if a.onToolActivity != nil {
-				a.stateMu.RLock()
-				agentID := a.ID
-				a.stateMu.RUnlock()
+			a.stateMu.RLock()
+			onToolActivity := a.onToolActivity
+			agentID := a.ID
+			a.stateMu.RUnlock()
+			if onToolActivity != nil {
 				args := map[string]any{"reason": reflection.Category}
-				a.onToolActivity(agentID, call.Name, args, "tool_recovery")
+				callAgentObserver(agentID, "tool_activity", func() {
+					onToolActivity(agentID, call.Name, args, "tool_recovery")
+				})
 			}
 
 			fixResult, handled := a.recoveryExecutor.AttemptAutoFix(ctx, a, call, reflection, attempt)
@@ -3997,13 +4003,17 @@ func (a *Agent) executeTool(ctx context.Context, call *genai.FunctionCall) tools
 
 	// Report tool start to UI
 	if onToolActivity != nil {
-		onToolActivity(a.ID, call.Name, call.Args, "start")
+		callAgentObserver(a.ID, "tool_activity", func() {
+			onToolActivity(a.ID, call.Name, call.Args, "start")
+		})
 	}
 
 	// Guarantee "end" event is sent regardless of outcome (panic, error, success)
 	defer func() {
 		if onToolActivity != nil {
-			onToolActivity(a.ID, call.Name, call.Args, "end")
+			callAgentObserver(a.ID, "tool_activity", func() {
+				onToolActivity(a.ID, call.Name, call.Args, "end")
+			})
 		}
 	}()
 
@@ -4085,21 +4095,28 @@ func (a *Agent) GetEndTime() time.Time {
 // Cancel cancels the agent's execution.
 func (a *Agent) Cancel() {
 	a.stateMu.Lock()
-	defer a.stateMu.Unlock()
-	if a.status == AgentStatusRunning {
+	if a.status == AgentStatusPending || a.status == AgentStatusRunning {
 		a.status = AgentStatusCancelled
 		a.endTime = time.Now()
-		if a.cancelFunc != nil {
-			a.cancelFunc()
+		cancel := a.cancelFunc
+		a.stateMu.Unlock()
+		if cancel != nil {
+			cancel()
 		}
+		return
 	}
+	a.stateMu.Unlock()
 }
 
 // SetCancelFunc sets the cancel function for explicit agent cancellation.
 func (a *Agent) SetCancelFunc(cancel context.CancelFunc) {
 	a.stateMu.Lock()
-	defer a.stateMu.Unlock()
+	alreadyCancelled := a.status == AgentStatusCancelled
 	a.cancelFunc = cancel
+	a.stateMu.Unlock()
+	if alreadyCancelled && cancel != nil {
+		cancel()
+	}
 }
 
 // safeOnText streams text to the UI in a thread-safe manner.
@@ -4112,7 +4129,7 @@ func (a *Agent) safeOnText(text string) {
 	}
 	a.onTextMu.Lock()
 	defer a.onTextMu.Unlock()
-	fn(text)
+	callAgentObserver(a.ID, "text", func() { fn(text) })
 }
 
 // safeOnThinking streams thinking content to the UI in a thread-safe manner.
@@ -4130,7 +4147,7 @@ func (a *Agent) safeOnThinking(text string) {
 	}
 	a.onThinkingMu.Lock()
 	defer a.onThinkingMu.Unlock()
-	fn(text)
+	callAgentObserver(a.ID, "thinking", func() { fn(text) })
 }
 
 // executePlannedAction executes a single planned action and returns the result.
@@ -4163,6 +4180,47 @@ func (a *Agent) executePlannedAction(ctx context.Context, action *PlannedAction)
 			Error:   fmt.Sprintf("unknown action type: %s", action.Type),
 		}
 	}
+}
+
+func (a *Agent) executePlannedActionSafely(ctx context.Context, action *PlannedAction) (result *AgentResult) {
+	started := time.Now()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			message := fmt.Sprintf("planned action panic: %v", recovered)
+			logging.Warn("planned action panicked", "agent_id", a.ID, "error", message)
+			result = &AgentResult{
+				AgentID:   a.ID,
+				Type:      a.Type,
+				Status:    AgentStatusFailed,
+				Error:     message,
+				Duration:  time.Since(started),
+				Completed: true,
+			}
+		}
+	}()
+	result = a.executePlannedAction(ctx, action)
+	if result == nil {
+		result = &AgentResult{
+			AgentID:   a.ID,
+			Type:      a.Type,
+			Status:    AgentStatusFailed,
+			Error:     "planned action returned nil result",
+			Duration:  time.Since(started),
+			Completed: true,
+		}
+	} else {
+		if result.AgentID == "" {
+			result.AgentID = a.ID
+		}
+		if result.Type == "" {
+			result.Type = a.Type
+		}
+		if result.Duration <= 0 {
+			result.Duration = time.Since(started)
+		}
+		result.Completed = true
+	}
+	return result
 }
 
 // executeDecomposeAction handles a decomposition milestone.
@@ -4462,7 +4520,7 @@ func (a *Agent) requestPlanApproval(ctx context.Context, tree *PlanTree) error {
 		a.safeOnText("Commands: [Enter] approve | e <n> <prompt> | d <n> | a [type] <prompt> | c cancel\n")
 		a.safeOnText("Types: explore, plan, general, bash, decompose (default: general)\n")
 
-		response, err := onInput("Plan approval > ")
+		response, err := callAgentInputCallback(a.ID, onInput, "Plan approval > ")
 		if err != nil {
 			return err
 		}

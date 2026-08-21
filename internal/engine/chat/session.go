@@ -519,7 +519,10 @@ func (s *Session) Fork(name string) *Session {
 	copy(tokenCountsCopy, s.tokenCounts)
 
 	branch := &Session{
-		ID:                generateSessionID() + "-" + name,
+		// The display name remains the map key. The persisted session ID is
+		// generated independently so arbitrary user-facing branch names never
+		// become filesystem components.
+		ID:                generateSessionID(),
 		StartTime:         time.Now(),
 		WorkDir:           s.WorkDir,
 		History:           historyCopy,

@@ -80,6 +80,20 @@ func (r *Registry) Register(tool Tool) error {
 	return nil
 }
 
+// Unregister removes a tool from the registry. Registry-backed helpers such
+// as tools_list observe the change because they retain the same registry
+// pointer. It returns whether a tool was present.
+func (r *Registry) Unregister(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if _, exists := r.tools[name]; !exists {
+		return false
+	}
+	delete(r.tools, name)
+	return true
+}
+
 // MustRegister adds a tool to the registry and logs a warning on error.
 func (r *Registry) MustRegister(tool Tool) {
 	if err := r.Register(tool); err != nil {
@@ -162,7 +176,7 @@ var toolSetDefinitions = map[ToolSet][]string{
 	ToolSetCore: {
 		"read", "write", "edit", "bash", "glob", "grep",
 		"ask_user", "list_dir", "tree", "diff", "todo",
-		"tools_list", "request_tool", "document_create", "scheduled_task",
+		"tools_list", "document_create", "scheduled_task",
 	},
 	ToolSetGit: {
 		"git_status", "git_diff", "git_add", "git_commit",
@@ -174,7 +188,7 @@ var toolSetDefinitions = map[ToolSet][]string{
 		"task", "task_output", "task_stop",
 	},
 	ToolSetAgent: {
-		"ask_agent", "coordinate", "shared_memory", "update_scratchpad", "session_agent", "search_session_transcripts",
+		"delegate", "coordinate", "shared_memory", "session_agent", "search_session_transcripts",
 	},
 	ToolSetWeb: {
 		"web_fetch", "web_search",
@@ -273,8 +287,7 @@ func DefaultRegistry(workDir string) *Registry {
 	r.MustRegister(NewExitPlanModeTool())
 	r.MustRegister(NewBatchTool(workDir))
 	r.MustRegister(NewToolsListTool(r))
-	r.MustRegister(NewRequestToolTool())
-	r.MustRegister(NewAskAgentTool())
+	r.MustRegister(NewDelegateTool())
 	r.MustRegister(NewSessionAgentTool())
 	r.MustRegister(NewSearchSessionTranscriptsTool())
 
@@ -301,7 +314,6 @@ func DefaultRegistry(workDir string) *Registry {
 	r.MustRegister(NewSharedMemoryTool())
 
 	// Agent Scratchpad tool (Phase 7)
-	r.MustRegister(NewUpdateScratchpadTool(nil))
 
 	// Testing, verification, and self-review tools
 	r.MustRegister(NewRunTestsTool(workDir))
@@ -519,6 +531,7 @@ func DefaultLazyRegistry(workDir string) *LazyRegistry {
 	r.RegisterFactory("task", func() Tool { return NewTaskTool() }, nil)
 	r.RegisterFactory("task_output", func() Tool { return NewTaskOutputTool() }, nil)
 	r.RegisterFactory("task_stop", func() Tool { return NewTaskStopTool() }, nil)
+	r.RegisterFactory("coordinate", func() Tool { return NewCoordinateTool() }, nil)
 	r.RegisterFactory("kill_shell", func() Tool { return NewKillShellTool() }, nil)
 
 	// Directory tools
@@ -538,7 +551,7 @@ func DefaultLazyRegistry(workDir string) *LazyRegistry {
 	// User interaction
 	r.RegisterFactory("ask_user", func() Tool { return NewAskUserTool() }, nil)
 	r.RegisterFactory("scheduled_task", func() Tool { return NewScheduledTaskTool() }, nil)
-	r.RegisterFactory("ask_agent", func() Tool { return NewAskAgentTool() }, nil)
+	r.RegisterFactory("delegate", func() Tool { return NewDelegateTool() }, nil)
 	r.RegisterFactory("session_agent", func() Tool { return NewSessionAgentTool() }, nil)
 	r.RegisterFactory("search_session_transcripts", func() Tool { return NewSearchSessionTranscriptsTool() }, nil)
 
@@ -570,9 +583,6 @@ func DefaultLazyRegistry(workDir string) *LazyRegistry {
 	r.RegisterFactory("git_pr", func() Tool { return NewGitPRTool(workDir) }, nil)
 
 	// Other tools
-	r.RegisterFactory("coordinate", func() Tool { return NewCoordinateTool() }, nil)
-	r.RegisterFactory("request_tool", func() Tool { return NewRequestToolTool() }, nil)
-	r.RegisterFactory("update_scratchpad", func() Tool { return NewUpdateScratchpadTool(nil) }, nil)
 	r.RegisterFactory("memorize", func() Tool { return NewMemorizeTool(nil) }, nil)
 
 	// Custom improvements

@@ -41,7 +41,7 @@ func TestGeminiToolsExcludingPlanMode(t *testing.T) {
 
 	// task*, editing tools, and core tools must REMAIN — only the interactive
 	// plan-mode CONTROL tools are dropped.
-	for _, n := range []string{"task", "task_output", "edit", "write", "read", "bash"} {
+	for _, n := range []string{"task", "task_output", "coordinate", "edit", "write", "read", "bash"} {
 		if full[n] && !excl[n] {
 			t.Errorf("%q must NOT be excluded — only plan-mode control tools are dropped", n)
 		}

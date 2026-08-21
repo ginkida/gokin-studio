@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/ginkida/gokin-studio/internal/engine/wsl"
 )
 
 const (
@@ -229,8 +231,13 @@ func (s *Studio) pullRequestStatusCore(parent context.Context, dir string, inclu
 	}
 	status.Remote = remote.Owner + "/" + remote.Repository
 	if s.testGHCommand == nil {
-		if _, err := exec.LookPath("gh"); err != nil {
-			status.Message = "Install and authenticate GitHub CLI (gh) to monitor pull requests."
+		// Same reason as the git_pr tool: gh installed inside the distro is not
+		// on the Windows PATH, so a host-only probe would leave this panel
+		// permanently dark for every WSL project.
+		target := wsl.DetectFor(dir)
+		if err := wsl.LookPathFor(parent, target, "gh"); err != nil {
+			status.Message = wsl.MissingCommandHint(target, "gh",
+				"Install and authenticate GitHub CLI (gh) to monitor pull requests.")
 			return status, nil
 		}
 	}
@@ -478,6 +485,28 @@ func (s *Studio) runGH(ctx context.Context, dir string, args ...string) ([]byte,
 	cmd.Dir = dir
 	cmd.WaitDelay = gitWaitDelay
 	cmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1", "PAGER=cat", "NO_COLOR=1")
+	// A WSL project's checkout is inside the distro, so host gh would read the
+	// repo over the 9P share while authenticating as the Windows user — likely a
+	// different `gh auth` identity than the one sitting next to the repo.
+	//
+	// ApplyExec also clears cmd.Dir, because a UNC path is not a legal working
+	// directory for the wsl.exe process; the distro-side directory travels in
+	// the plan. Assigning cmd.Dir afterwards would restore the illegal value.
+	//
+	// The three settings above must be repeated as an injection rather than
+	// relied on from cmd.Env: ApplyExec REPLACES cmd.Env with the host
+	// environment plus its overlay, because wsl.exe needs a real Windows
+	// environment to start, and the overlay is the only thing WSLENV carries
+	// into the distro. Assigning cmd.Env after this call would silently drop the
+	// overlay instead — that mistake has already been made twice here.
+	//
+	// Off Windows DetectFor yields a host target and ApplyExec is a no-op, so
+	// nothing above changes.
+	wsl.ApplyExec(cmd, wsl.DetectFor(dir), append([]string{"gh"}, args...), map[string]string{
+		"GH_PROMPT_DISABLED": "1",
+		"PAGER":              "cat",
+		"NO_COLOR":           "1",
+	})
 	output := &cappedCommandOutput{limit: pullRequestOutputMaxBytes}
 	cmd.Stdout = output
 	cmd.Stderr = output

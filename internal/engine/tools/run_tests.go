@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ginkida/gokin-studio/internal/engine/security"
+	"github.com/ginkida/gokin-studio/internal/engine/wsl"
 	"google.golang.org/genai"
 )
 
@@ -145,6 +146,12 @@ func (t *RunTestsTool) Execute(ctx context.Context, args map[string]any) (ToolRe
 			return NewErrorResult("failed to create isolated test environment: " + envErr.Error()), nil
 		}
 		cmd.Env = env
+		// A WSL project runs its tests with the distro's own toolchain. The
+		// curated host environment above is deliberately NOT carried across:
+		// its PATH and HOME are Windows values that mean nothing inside the
+		// distro, which supplies its own through the login shell.
+		wsl.ApplyExec(cmd, wsl.DetectFor(workDir), append([]string{cmdName}, cmdArgs...),
+			security.WorkspaceEnvironmentSnapshot())
 	}
 
 	start := time.Now()

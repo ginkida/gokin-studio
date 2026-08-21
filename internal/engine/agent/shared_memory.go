@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -71,6 +72,42 @@ type SharedEntry struct {
 	Version   int             `json:"version"`   // Incremented on each update
 }
 
+// UnmarshalJSON restores the concrete context-snapshot type stored behind the
+// Value interface. Without this, checkpoint JSON decodes it as map[string]any
+// and GetContextSnapshot can no longer recognize it after restart.
+func (e *SharedEntry) UnmarshalJSON(data []byte) error {
+	type sharedEntryJSON struct {
+		Key       string          `json:"key"`
+		Value     json.RawMessage `json:"value"`
+		Type      SharedEntryType `json:"type"`
+		Source    string          `json:"source"`
+		Timestamp time.Time       `json:"timestamp"`
+		TTL       time.Duration   `json:"ttl"`
+		Version   int             `json:"version"`
+	}
+	var decoded sharedEntryJSON
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var value any
+	if len(decoded.Value) > 0 && string(decoded.Value) != "null" {
+		if decoded.Type == SharedEntryTypeContextSnapshot {
+			var snapshot ContextSnapshot
+			if err := json.Unmarshal(decoded.Value, &snapshot); err != nil {
+				return err
+			}
+			value = &snapshot
+		} else if err := json.Unmarshal(decoded.Value, &value); err != nil {
+			return err
+		}
+	}
+	*e = SharedEntry{
+		Key: decoded.Key, Value: value, Type: decoded.Type, Source: decoded.Source,
+		Timestamp: decoded.Timestamp, TTL: decoded.TTL, Version: decoded.Version,
+	}
+	return nil
+}
+
 // IsExpired returns true if the entry has expired.
 func (e *SharedEntry) IsExpired() bool {
 	if e.TTL == 0 {
@@ -109,6 +146,7 @@ func (sm *SharedMemory) Write(key string, value any, entryType SharedEntryType, 
 func (sm *SharedMemory) WriteWithTTL(key string, value any, entryType SharedEntryType, sourceAgent string, ttl time.Duration) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	ownedValue := cloneSharedMemoryValue(value)
 
 	// Cleanup if we're at capacity
 	if len(sm.entries) >= MaxSharedEntries {
@@ -127,7 +165,7 @@ func (sm *SharedMemory) WriteWithTTL(key string, value any, entryType SharedEntr
 			sm.removeFromTypeIndexLocked(entry.Type, key)
 			sm.byType[entryType] = append(sm.byType[entryType], key)
 		}
-		entry.Value = value
+		entry.Value = ownedValue
 		entry.Type = entryType
 		entry.Source = sourceAgent
 		entry.Timestamp = time.Now()
@@ -136,7 +174,7 @@ func (sm *SharedMemory) WriteWithTTL(key string, value any, entryType SharedEntr
 	} else {
 		entry = &SharedEntry{
 			Key:       key,
-			Value:     value,
+			Value:     ownedValue,
 			Type:      entryType,
 			Source:    sourceAgent,
 			Timestamp: time.Now(),
@@ -152,7 +190,7 @@ func (sm *SharedMemory) WriteWithTTL(key string, value any, entryType SharedEntr
 	// Notify subscribers
 	for subscriberID, ch := range sm.subscribers {
 		select {
-		case ch <- entry:
+		case ch <- cloneSharedEntry(entry):
 		default:
 			// Non-blocking send, drop if subscriber is slow
 			dropped := sm.droppedMessages.Add(1)
@@ -179,7 +217,7 @@ func (sm *SharedMemory) Read(key string) (*SharedEntry, bool) {
 		return nil, false
 	}
 
-	return entry, true
+	return cloneSharedEntry(entry), true
 }
 
 // ReadByType returns all entries of a specific type.
@@ -195,7 +233,7 @@ func (sm *SharedMemory) ReadByType(entryType SharedEntryType) []*SharedEntry {
 	var results []*SharedEntry
 	for _, key := range keys {
 		if entry, exists := sm.entries[key]; exists && !entry.IsExpired() {
-			results = append(results, entry)
+			results = append(results, cloneSharedEntry(entry))
 		}
 	}
 
@@ -210,7 +248,7 @@ func (sm *SharedMemory) ReadAll() []*SharedEntry {
 	var results []*SharedEntry
 	for _, entry := range sm.entries {
 		if !entry.IsExpired() {
-			results = append(results, entry)
+			results = append(results, cloneSharedEntry(entry))
 		}
 	}
 
@@ -246,6 +284,9 @@ func (sm *SharedMemory) Subscribe(agentID string) <-chan *SharedEntry {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
+	if previous, exists := sm.subscribers[agentID]; exists {
+		close(previous)
+	}
 	ch := make(chan *SharedEntry, 100) // Buffered channel
 	sm.subscribers[agentID] = ch
 	return ch
@@ -265,17 +306,10 @@ func (sm *SharedMemory) Unsubscribe(agentID string) {
 	// a rapid re-subscribe from seeing a stale closingCh marker.
 	delete(sm.subscribers, agentID)
 
-	// Close the channel under the lock (close is non-blocking).
-	// Using recover to handle any potential panic from double-close.
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				logging.Warn("shared memory: recovered from channel close panic",
-					"agent_id", agentID, "panic", r)
-			}
-		}()
-		close(ch)
-	}()
+	// Writers and subscription replacement use the same lock, so this is the
+	// sole owner of the channel and no recovery-based double-close masking is
+	// necessary.
+	close(ch)
 
 	sm.mu.Unlock()
 }
@@ -449,20 +483,67 @@ func (sm *SharedMemory) Clear() {
 	sm.byType = make(map[SharedEntryType][]string)
 }
 
+// restoreEntries merges a checkpoint snapshot without publishing synthetic
+// change notifications. Unlike WriteWithTTL, it preserves the original
+// timestamp and version so restart does not extend TTLs or reset history.
+func (sm *SharedMemory) restoreEntries(snapshot map[string]*SharedEntry) int {
+	if len(snapshot) == 0 {
+		return 0
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	restored := 0
+	for checkpointKey, source := range snapshot {
+		if source == nil {
+			continue
+		}
+		entry := cloneSharedEntry(source)
+		if entry.Key == "" {
+			entry.Key = checkpointKey // compatibility with early checkpoints
+		}
+		if entry.Key == "" || (checkpointKey != "" && checkpointKey != entry.Key) {
+			continue
+		}
+		if entry.Timestamp.IsZero() {
+			entry.Timestamp = time.Now()
+		}
+		if entry.Version <= 0 {
+			entry.Version = 1
+		}
+		if entry.IsExpired() {
+			continue
+		}
+		if previous, exists := sm.entries[entry.Key]; exists {
+			sm.removeFromTypeIndexLocked(previous.Type, entry.Key)
+		}
+		sm.entries[entry.Key] = entry
+		sm.byType[entry.Type] = append(sm.byType[entry.Type], entry.Key)
+		restored++
+	}
+
+	sm.cleanupExpiredLocked()
+	if excess := len(sm.entries) - MaxSharedEntries; excess > 0 {
+		sm.removeOldestLocked(excess)
+	}
+	return restored
+}
+
 // SaveContextSnapshot saves a context snapshot for plan→execute transition.
 func (sm *SharedMemory) SaveContextSnapshot(snapshot *ContextSnapshot, sourceAgent string) {
 	if snapshot == nil {
 		return
 	}
-	snapshot.CreatedAt = time.Now()
-	snapshot.Source = sourceAgent
+	ownedSnapshot := cloneContextSnapshot(snapshot)
+	ownedSnapshot.CreatedAt = time.Now()
+	ownedSnapshot.Source = sourceAgent
 
-	sm.Write("context_snapshot", snapshot, SharedEntryTypeContextSnapshot, sourceAgent)
+	sm.Write("context_snapshot", ownedSnapshot, SharedEntryTypeContextSnapshot, sourceAgent)
 	logging.Debug("saved context snapshot",
 		"source", sourceAgent,
-		"key_files", len(snapshot.KeyFiles),
-		"discoveries", len(snapshot.Discoveries),
-		"requirements", len(snapshot.Requirements))
+		"key_files", len(ownedSnapshot.KeyFiles),
+		"discoveries", len(ownedSnapshot.Discoveries),
+		"requirements", len(ownedSnapshot.Requirements))
 }
 
 // GetContextSnapshot retrieves the latest context snapshot.
@@ -478,6 +559,54 @@ func (sm *SharedMemory) GetContextSnapshot() *ContextSnapshot {
 	}
 
 	return snapshot
+}
+
+func cloneSharedEntry(entry *SharedEntry) *SharedEntry {
+	if entry == nil {
+		return nil
+	}
+	cloned := *entry
+	cloned.Value = cloneSharedMemoryValue(entry.Value)
+	return &cloned
+}
+
+func cloneSharedMemoryValue(value any) any {
+	switch typed := value.(type) {
+	case *ContextSnapshot:
+		return cloneContextSnapshot(typed)
+	case ContextSnapshot:
+		cloned := cloneContextSnapshot(&typed)
+		if cloned == nil {
+			return ContextSnapshot{}
+		}
+		return *cloned
+	default:
+		return cloneJSONValue(value)
+	}
+}
+
+func cloneContextSnapshot(snapshot *ContextSnapshot) *ContextSnapshot {
+	if snapshot == nil {
+		return nil
+	}
+	cloned := *snapshot
+	if snapshot.KeyFiles != nil {
+		cloned.KeyFiles = make(map[string]string, len(snapshot.KeyFiles))
+		for key, value := range snapshot.KeyFiles {
+			cloned.KeyFiles[key] = value
+		}
+	}
+	cloned.Discoveries = append([]string(nil), snapshot.Discoveries...)
+	if snapshot.ErrorPatterns != nil {
+		cloned.ErrorPatterns = make(map[string]string, len(snapshot.ErrorPatterns))
+		for key, value := range snapshot.ErrorPatterns {
+			cloned.ErrorPatterns[key] = value
+		}
+	}
+	cloned.CriticalResults = append([]CriticalResult(nil), snapshot.CriticalResults...)
+	cloned.Requirements = append([]string(nil), snapshot.Requirements...)
+	cloned.Decisions = append([]string(nil), snapshot.Decisions...)
+	return &cloned
 }
 
 // GetContextSnapshotForPrompt returns a formatted context snapshot for injection into prompts.

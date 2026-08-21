@@ -2,6 +2,7 @@ package studio
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ginkida/gokin-studio/internal/engine/client"
+	"github.com/ginkida/gokin-studio/internal/engine/tasks"
 	"github.com/ginkida/gokin-studio/internal/engine/tools"
 )
 
@@ -147,10 +149,19 @@ func TestGitSessionsUsePersistentIndependentWorktrees(t *testing.T) {
 	if err := writeFile(filepath.Join(firstInfo.WorktreePath, "tracked.txt"), "root-v1\n"); err != nil {
 		t.Fatal(err)
 	}
+	// Deleting an isolated checkout permanently closes its path-bound task
+	// manager before Git removes the directory.
+	worktreeTasks := tasks.NewManager(firstInfo.WorktreePath)
+	first.mu.Lock()
+	first.taskManager = worktreeTasks
+	first.mu.Unlock()
 	checkout := firstInfo.WorktreePath
 	branch := firstInfo.WorktreeBranch
 	if err := s.DeleteChatSession(projectInfo.ID, "default"); err != nil {
 		t.Fatalf("delete clean isolated chat: %v", err)
+	}
+	if _, err := worktreeTasks.Start(context.Background(), "unused"); !errors.Is(err, tasks.ErrManagerClosed) {
+		t.Fatalf("worktree task manager remained open after deletion: %v", err)
 	}
 	if _, err := os.Stat(checkout); !os.IsNotExist(err) {
 		t.Fatalf("clean checkout still exists: %v", err)

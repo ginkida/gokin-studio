@@ -2,9 +2,12 @@ package studio
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ginkida/gokin-studio/internal/engine/tasks"
 )
 
 func TestShutdownClosesProviderAndMCPClients(t *testing.T) {
@@ -95,6 +98,27 @@ func TestShutdownCancelsRootContextAndRejectsSend(t *testing.T) {
 	}
 	if err := s.SendMessage(p.ID, "must not run", "default"); err == nil || !strings.Contains(err.Error(), "shutting down") {
 		t.Fatalf("SendMessage after shutdown error = %v, want shutting-down error", err)
+	}
+}
+
+func TestShutdownPermanentlyClosesBackgroundTaskManagers(t *testing.T) {
+	s := newStudioForTest(t)
+	p := NewProject(ProjectConfig{ID: "shutdown-tasks", Name: "Tasks", Directory: t.TempDir()})
+	p.studio = s
+	projectManager := tasks.NewManager(p.Directory)
+	sessionManager := tasks.NewManager(p.Directory)
+	p.taskManager = projectManager
+	p.sessions["default"].taskManager = sessionManager
+	s.projects[p.ID] = p
+
+	s.Shutdown(context.Background())
+	for name, manager := range map[string]*tasks.Manager{
+		"project": projectManager,
+		"session": sessionManager,
+	} {
+		if _, err := manager.Start(context.Background(), "unused"); !errors.Is(err, tasks.ErrManagerClosed) {
+			t.Fatalf("%s manager Start after Shutdown = %v, want ErrManagerClosed", name, err)
+		}
 	}
 }
 

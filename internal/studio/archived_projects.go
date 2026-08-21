@@ -3,6 +3,7 @@ package studio
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/ginkida/gokin-studio/internal/engine/wsl"
 	"io"
 	"os"
 	"path/filepath"
@@ -201,7 +202,7 @@ func (s *Studio) ArchiveProject(id string) error {
 	archiveErr := saveArchivedProjectsRaw(nextArchived)
 	var configErr error
 	if archiveErr == nil {
-		configErr = (&StudioConfig{Projects: nextActive, Settings: s.config.Settings}).Save()
+		configErr = (&StudioConfig{Projects: nextActive, Groups: s.config.Groups, Settings: s.config.Settings}).Save()
 	}
 	if configErr != nil {
 		_ = saveArchivedProjectsRaw(s.archived)
@@ -286,13 +287,13 @@ func (s *Studio) RestoreProject(id string) (*ProjectInfo, error) {
 	delete(nextArchived, id)
 
 	s.configSaveMu.Lock()
-	configErr := (&StudioConfig{Projects: nextActive, Settings: s.config.Settings}).Save()
+	configErr := (&StudioConfig{Projects: nextActive, Groups: s.config.Groups, Settings: s.config.Settings}).Save()
 	var archiveErr error
 	if configErr == nil {
 		archiveErr = saveArchivedProjectsRaw(nextArchived)
 	}
 	if archiveErr != nil {
-		_ = (&StudioConfig{Projects: activeProjectConfigsExcept(s.projects, ""), Settings: s.config.Settings}).Save()
+		_ = (&StudioConfig{Projects: activeProjectConfigsExcept(s.projects, ""), Groups: s.config.Groups, Settings: s.config.Settings}).Save()
 	}
 	s.configSaveMu.Unlock()
 	if configErr != nil {
@@ -321,7 +322,18 @@ func (s *Studio) RestoreProject(id string) (*ProjectInfo, error) {
 	return project.Info(), nil
 }
 
+// sameProjectDirectory reports whether two paths name the same project.
+//
+// For WSL paths the comparison is the canonical key, so the two UNC spellings
+// and a differently-cased distro all collapse to one project — otherwise one
+// repository could register twice and end up with two separate histories.
+// The os.SameFile arm is deliberately skipped there: a network redirector is
+// not required to supply unique file identifiers, and two zero IDs would make
+// every second WSL project look like a duplicate of the first.
 func sameProjectDirectory(left, right string) bool {
+	if remoteProjectDirectory(left) || remoteProjectDirectory(right) {
+		return wsl.CanonicalKey(left) == wsl.CanonicalKey(right)
+	}
 	leftInfo, leftErr := os.Stat(left)
 	rightInfo, rightErr := os.Stat(right)
 	if filepath.Clean(left) == filepath.Clean(right) {

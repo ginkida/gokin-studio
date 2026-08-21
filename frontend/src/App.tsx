@@ -1,17 +1,13 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useRef, useState, type CSSProperties } from 'react'
 import { Sidebar } from './components/layout/Sidebar'
 import { StatusBar } from './components/layout/StatusBar'
 import { TopBar } from './components/layout/TopBar'
 import { ToastStack } from './components/layout/ToastStack'
 import { SessionWorkspace } from './components/layout/SessionWorkspace'
 import { ErrorBoundary, installGlobalErrorHandlers } from './components/layout/ErrorBoundary'
-import { OnboardingWizard, shouldShowOnboarding } from './components/onboarding/OnboardingWizard'
-import { SettingsPage } from './components/settings/SettingsPage'
 import { FileBrowser } from './components/files/FileBrowser'
 import { FileContextMenuHost } from './components/files/FileContextMenu'
 import { ArtifactLibrary } from './components/files/ArtifactLibrary'
-import { CommandPalette } from './components/palette/CommandPalette'
-import { QuickEntryOverlay } from './components/quickentry/QuickEntryOverlay'
 import { useConfirmDialog } from './components/common/AppDialog'
 import { useWailsEvents } from './hooks/useWailsEvents'
 import { hasOpenModal, useModalFocusManagement } from './hooks/useModalFocusManagement'
@@ -29,14 +25,47 @@ import { sessionCycleShortcutDirection } from './lib/sessionCycleShortcuts'
 import { isNewSessionShortcut } from './lib/newSessionShortcut'
 import { paneShortcutAction, type PaneShortcutAction } from './lib/paneShortcuts'
 import type { PendingQuickEntryComposerAction, QuickEntryComposerAction } from './lib/quickEntry'
+import { shouldShowOnboarding } from './lib/onboarding'
 import { ListProjects, GetSettings, GetProviders, GetProviderCredentialSources, CreateChatSession, ListChatSessions, ListArchivedChatSessions, ArchiveChatSession, RestoreChatSession, DeleteChatSession, RenameChatSession, SetSessionPinned, ReorderChatSessions, SaveDraft, ShowQuickEntryWindow, HideQuickEntryWindow, StartDeepLinkEvents, StartNativeMenuEvents, CheckForUpdatesIfDue, GetSessionWorktreeStatus } from '../wailsjs/go/studio/Studio'
 import { BrowserOpenURL, EventsOn, WindowCenter, WindowFullscreen, WindowGetPosition, WindowGetSize, WindowIsFullscreen, WindowIsMaximised, WindowMaximise, WindowSetAlwaysOnTop, WindowSetPosition, WindowSetSize, WindowSetTitle, WindowUnfullscreen, WindowUnmaximise } from '../wailsjs/runtime/runtime'
 import { MessageSquare, Settings, FolderTree, Plus, X, GitFork, GitBranch, Pin, PinOff, PanelsTopLeft, Trash2, ListFilter, Search, Loader2, RefreshCw, AlertTriangle, Download, Archive, ArchiveRestore } from 'lucide-react'
 import './App.css'
 
+const DelegationsPanel = lazy(() => import('./components/dispatch/DelegationsPanel'))
+const SettingsPage = lazy(() => import('./components/settings/SettingsPage').then((module) => ({ default: module.SettingsPage })))
+const OnboardingWizard = lazy(() => import('./components/onboarding/OnboardingWizard').then((module) => ({ default: module.OnboardingWizard })))
+const CommandPalette = lazy(() => import('./components/palette/CommandPalette').then((module) => ({ default: module.CommandPalette })))
+const QuickEntryOverlay = lazy(() => import('./components/quickentry/QuickEntryOverlay').then((module) => ({ default: module.QuickEntryOverlay })))
+
 // Install once at module load — before any component mounts — so even
 // errors during initial bootstrap land in the event log.
 installGlobalErrorHandlers()
+
+function LazyViewFallback({ label }: { label: string }) {
+  return (
+    <div className="session-load-state" role="status" aria-live="polite">
+      <div className="session-load-state-icon"><Loader2 size={22} className="spin" /></div>
+      <h2>{label}</h2>
+    </div>
+  )
+}
+
+function LazyModalFallback({ label }: { label: string }) {
+  return (
+    <div className="app-dialog-backdrop">
+      <div
+        className="app-dialog lazy-modal-loading"
+        role="dialog"
+        aria-modal="true"
+        aria-label={label}
+        aria-busy="true"
+      >
+        <Loader2 size={18} className="spin" />
+        <span role="status" aria-live="polite">{label}</span>
+      </div>
+    </div>
+  )
+}
 
 interface SessionTab {
   id: string
@@ -55,6 +84,7 @@ interface SessionTab {
   lastUsedAt?: number
   messages?: number
   worktreeIsolated?: boolean
+  isolationSkippedReason?: string
   worktreePath?: string
   worktreeBranch?: string
   worktreeError?: string
@@ -82,6 +112,7 @@ function toSessionTab(session: any): SessionTab {
     lastUsedAt: Number(session?.lastUsedAt) || 0,
     messages: Number(session?.messages) || 0,
     worktreeIsolated: !!session?.worktreeIsolated,
+    isolationSkippedReason: session?.isolationSkippedReason || '',
     worktreePath: session?.worktreePath ? String(session.worktreePath) : undefined,
     worktreeBranch: session?.worktreeBranch ? String(session.worktreeBranch) : undefined,
     worktreeError: session?.worktreeError ? String(session.worktreeError) : undefined,
@@ -152,6 +183,7 @@ function AppContent() {
   // projects are configured AND the user hasn't explicitly skipped before.
   // Becomes false on any of: project added, "Start chatting" clicked, Skip clicked.
   const [showOnboarding, setShowOnboarding] = useState(false)
+  const [showDelegations, setShowDelegations] = useState(false)
 
   // view: session ID for chat tabs, or one of the standalone workspace views.
   const [view, setView] = useState<string>('default')
@@ -1972,18 +2004,20 @@ function AppContent() {
   if (quickEntryOpen) {
     const quickEntrySessions = sessionsProjectID === activeProjectId ? sessions : []
     return (
-      <QuickEntryOverlay
-        projectID={activeProjectId}
-        projectName={activeProject?.name}
-        sessions={quickEntrySessions}
-        activeSessionID={storedActiveSession || chatTabStop}
-        voiceActivationID={pendingQuickEntryVoiceActivations[0] ?? null}
-        onVoiceActivationHandled={(id) => setPendingQuickEntryVoiceActivations((pending) => pending.filter((item) => item !== id))}
-        onDismiss={() => { void exitQuickEntry(false) }}
-        onOpenStudio={() => { void exitQuickEntry(true) }}
-        onOpenSession={openQuickEntrySession}
-        onCreateSession={createQuickEntrySession}
-      />
+      <Suspense fallback={<div className="app loading"><div className="loading-content" role="status"><div className="loading-brand">Gokin Studio</div><div className="loading-text">Opening Quick Entry…</div></div></div>}>
+        <QuickEntryOverlay
+          projectID={activeProjectId}
+          projectName={activeProject?.name}
+          sessions={quickEntrySessions}
+          activeSessionID={storedActiveSession || chatTabStop}
+          voiceActivationID={pendingQuickEntryVoiceActivations[0] ?? null}
+          onVoiceActivationHandled={(id) => setPendingQuickEntryVoiceActivations((pending) => pending.filter((item) => item !== id))}
+          onDismiss={() => { void exitQuickEntry(false) }}
+          onOpenStudio={() => { void exitQuickEntry(true) }}
+          onOpenSession={openQuickEntrySession}
+          onCreateSession={createQuickEntrySession}
+        />
+      </Suspense>
     )
   }
 
@@ -2468,7 +2502,9 @@ function AppContent() {
         <div className={`content-area ${view === 'files' || view === 'settings' ? view : ''}`}>
           {(settingsMounted || view === 'settings') && (
             <div className={`settings-view-host ${view === 'settings' ? 'active' : 'hidden'}`} aria-hidden={view === 'settings' ? undefined : true}>
-              <SettingsPage isActive={view === 'settings'} />
+              <Suspense fallback={<LazyViewFallback label="Loading settings…" />}>
+                <SettingsPage isActive={view === 'settings'} />
+              </Suspense>
             </div>
           )}
           {(filesMounted || view === 'files') && (
@@ -2527,7 +2563,24 @@ function AppContent() {
             )}
         </div>
       </div>
-      <StatusBar />
+      <StatusBar onOpenDelegations={() => setShowDelegations(true)} />
+      {showDelegations && (
+        <Suspense fallback={<LazyModalFallback label="Loading delegations…" />}>
+          <DelegationsPanel
+            onClose={() => setShowDelegations(false)}
+            onOpenTarget={(projectID, sessionID) => {
+              setShowDelegations(false)
+              // Jump to the delegated chat in the target project so the user can
+              // read the full transcript, not just the summarised answer.
+              // `view` is what actually selects the rendered session, so setting
+              // only the two stores would leave the UI on whatever was open.
+              useProjectStore.getState().setActiveProject(projectID)
+              useChatStore.getState().setActiveSession(projectID, sessionID)
+              setView(sessionID)
+            }}
+          />
+        </Suspense>
+      )}
       <ToastStack />
       <FileContextMenuHost />
       {confirmationDialog}
@@ -2585,20 +2638,22 @@ function AppContent() {
         </>
       )}
       {showOnboarding && (
-        <OnboardingWizard
-          onComplete={(project, starterPrompt) => {
-            setShowOnboarding(false)
-            if (!starterPrompt) return
-            const projectID = project?.id || useProjectStore.getState().activeProjectId
-            if (!projectID) return
-            if (sessionsProjectIDRef.current === projectID && sessionsRef.current.length > 0) {
-              requestAnimationFrame(() => composeInChat(starterPrompt, 'replace'))
-            } else {
-              pendingComposeRef.current = { projectID, text: starterPrompt, mode: 'replace' }
-            }
-          }}
-          onSkip={() => setShowOnboarding(false)}
-        />
+        <Suspense fallback={<LazyModalFallback label="Preparing setup…" />}>
+          <OnboardingWizard
+            onComplete={(project, starterPrompt) => {
+              setShowOnboarding(false)
+              if (!starterPrompt) return
+              const projectID = project?.id || useProjectStore.getState().activeProjectId
+              if (!projectID) return
+              if (sessionsProjectIDRef.current === projectID && sessionsRef.current.length > 0) {
+                requestAnimationFrame(() => composeInChat(starterPrompt, 'replace'))
+              } else {
+                pendingComposeRef.current = { projectID, text: starterPrompt, mode: 'replace' }
+              }
+            }}
+            onSkip={() => setShowOnboarding(false)}
+          />
+        </Suspense>
       )}
       {tabCtxMenu && (() => {
         const MENU_W = 180, MENU_H = sessions.length > 1 ? 242 : 80
@@ -2718,17 +2773,19 @@ function AppContent() {
         )
       })()}
       {showPalette && (
-        <CommandPalette
-          onClose={() => setShowPalette(false)}
-          onSwitchProject={(id) => useProjectStore.getState().setActiveProject(id)}
-          onOpenSettings={() => setView('settings')}
-          onOpenFiles={() => setView('files')}
-          onOpenArtifacts={() => setView('artifacts')}
-          onNewChat={handleNewChat}
-          onClearChat={() => window.dispatchEvent(new CustomEvent('gokin:clear-chat'))}
-          onOpenMemory={() => window.dispatchEvent(new CustomEvent('gokin:open-memory'))}
-          onToggleSidebar={toggleSidebar}
-        />
+        <Suspense fallback={<LazyModalFallback label="Opening commands…" />}>
+          <CommandPalette
+            onClose={() => setShowPalette(false)}
+            onSwitchProject={(id) => useProjectStore.getState().setActiveProject(id)}
+            onOpenSettings={() => setView('settings')}
+            onOpenFiles={() => setView('files')}
+            onOpenArtifacts={() => setView('artifacts')}
+            onNewChat={handleNewChat}
+            onClearChat={() => window.dispatchEvent(new CustomEvent('gokin:clear-chat'))}
+            onOpenMemory={() => window.dispatchEvent(new CustomEvent('gokin:open-memory'))}
+            onToggleSidebar={toggleSidebar}
+          />
+        </Suspense>
       )}
     </div>
   )

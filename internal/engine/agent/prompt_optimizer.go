@@ -10,11 +10,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ginkida/gokin-studio/internal/engine/fileutil"
 	"github.com/ginkida/gokin-studio/internal/engine/logging"
 )
 
 // MaxPromptVariants is the maximum number of prompt variants to keep in memory.
 const MaxPromptVariants = 500
+
+const maxOptimizerStoreFileBytes int64 = 64 << 20
 
 // PromptVariant represents a variation of a prompt with its performance metrics.
 type PromptVariant struct {
@@ -55,6 +58,7 @@ type PromptOptimizer struct {
 	variants  map[string]*PromptVariant // variant ID -> variant
 	byBase    map[string][]string       // base prompt -> list of variant IDs
 	mu        sync.RWMutex
+	writer    fileutil.LatestFileWriter
 }
 
 // NewPromptOptimizer creates a new prompt optimizer.
@@ -79,7 +83,7 @@ func (po *PromptOptimizer) storagePath() string {
 
 // load loads variants from disk.
 func (po *PromptOptimizer) load() error {
-	data, err := os.ReadFile(po.storagePath())
+	data, err := fileutil.ReadRegularFileLimited(po.storagePath(), maxOptimizerStoreFileBytes)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -91,12 +95,19 @@ func (po *PromptOptimizer) load() error {
 	if err := json.Unmarshal(data, &variants); err != nil {
 		return err
 	}
+	if variants == nil {
+		variants = make(map[string]*PromptVariant)
+	}
 
 	po.variants = variants
 
 	// Rebuild base index
 	po.byBase = make(map[string][]string)
 	for id, v := range po.variants {
+		if v == nil {
+			delete(po.variants, id)
+			continue
+		}
 		po.byBase[v.BasePrompt] = append(po.byBase[v.BasePrompt], id)
 	}
 
@@ -116,10 +127,23 @@ func (po *PromptOptimizer) save() ([]byte, error) {
 // writeSnapshot writes pre-serialized data to disk without holding any locks.
 func (po *PromptOptimizer) writeSnapshot(data []byte) error {
 	dir := filepath.Dir(po.storagePath())
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(po.storagePath(), data, 0644)
+	return po.writer.Write(po.storagePath(), data, 0o600)
+}
+
+func (po *PromptOptimizer) scheduleSnapshot(data []byte) {
+	dir := filepath.Dir(po.storagePath())
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		logging.Debug("failed to create prompt optimizer directory", "error", err)
+		return
+	}
+	po.writer.Schedule(po.storagePath(), data, 0o600, func(err error) {
+		if err != nil {
+			logging.Debug("failed to save prompt optimizer", "error", err)
+		}
+	})
 }
 
 // generateVariantID creates a unique ID for a variant.
@@ -188,11 +212,7 @@ func (po *PromptOptimizer) RecordExecution(basePrompt, variation string, success
 		logging.Debug("failed to serialize prompt optimizer", "error", err)
 		return
 	}
-	go func() {
-		if err := po.writeSnapshot(snapshot); err != nil {
-			logging.Debug("failed to save prompt optimizer", "error", err)
-		}
-	}()
+	po.scheduleSnapshot(snapshot)
 }
 
 // evictOldest removes the oldest variants by LastUsed until map is at maxSize.

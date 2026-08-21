@@ -3,10 +3,12 @@ package studio
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -32,6 +34,9 @@ const (
 	// autoBackupFilenamePrefix is the prefix for tar.gz files we create.
 	// Used both when writing and when pruning by filename pattern.
 	autoBackupFilenamePrefix = "auto-backup-"
+	autoBackupTempPrefix     = ".auto-backup-writing-"
+	autoBackupTempSuffix     = ".tmp"
+	autoBackupTempGrace      = time.Hour
 )
 
 // autoBackupDir returns the absolute path to the auto-backup directory.
@@ -76,6 +81,49 @@ func pruneOldAutoBackups() (removed int, freed int64) {
 	return pruneOldAutoBackupsImpl(false)
 }
 
+var (
+	// All mutating backup operations share one lifecycle lock. Startup launches
+	// auto-cleanup and auto-backup independently, and Wails can invoke exported
+	// methods concurrently; without this lock two writers can truncate the same
+	// daily filename or retention can race a restore/delete.
+	autoBackupMu            sync.Mutex
+	autoBackupRemoveFile    = os.Remove
+	autoBackupOpenFile      = os.Open
+	autoBackupArchiveWriter = writeConfigArchive
+	autoBackupNow           = time.Now
+)
+
+func autoBackupFilename(now time.Time, attempt int) string {
+	if attempt == 0 {
+		return autoBackupFilenamePrefix + now.Format("2006-01-02") + ".tar.gz"
+	}
+	base := autoBackupFilenamePrefix + now.Format("2006-01-02-150405")
+	if attempt == 1 {
+		return base + ".tar.gz"
+	}
+	return fmt.Sprintf("%s-%d.tar.gz", base, attempt)
+}
+
+// publishAutoBackup atomically makes a fully-written temporary archive visible
+// without ever replacing an existing backup. publishNewFile has OS-native
+// create-if-absent semantics; both paths live in the same directory/filesystem.
+// The hidden source is removed by the caller's defer after successful publish.
+func publishAutoBackup(tempPath, backupDir string, now time.Time) (string, string, error) {
+	const maxAttempts = 128
+	for attempt := range maxAttempts {
+		filename := autoBackupFilename(now, attempt)
+		target := filepath.Join(backupDir, filename)
+		if err := publishNewFile(tempPath, target); err == nil {
+			return filename, target, nil
+		} else if os.IsExist(err) {
+			continue
+		} else {
+			return "", "", err
+		}
+	}
+	return "", "", fmt.Errorf("could not allocate a unique auto-backup name after %d attempts", maxAttempts)
+}
+
 // pruneOldAutoBackupsImpl is the inner implementation that supports dry-run.
 // When dryRun is true, returns the COUNTS that would be removed but does
 // not touch disk — used by iter 930+ CleanupOldData's preview path so
@@ -83,12 +131,30 @@ func pruneOldAutoBackups() (removed int, freed int64) {
 //
 // Sorts by mtime (newest first), keeps the first AutoBackupRetention,
 // reports the rest. Per-file errors during deletion don't abort the sweep;
-// in dry-run mode there's no deletion so no error path.
+// callers that need the details use pruneOldAutoBackupsDetailed.
 func pruneOldAutoBackupsImpl(dryRun bool) (removed int, freed int64) {
+	removed, freed, _ = pruneOldAutoBackupsDetailed(dryRun)
+	return removed, freed
+}
+
+// pruneOldAutoBackupsDetailed is the cleanup-facing form. The historical
+// two-result wrappers intentionally remain stable for the auto-backup writer,
+// while manual/background Cleanup can surface individual inspection/removal
+// failures instead of silently reporting "nothing to remove".
+func pruneOldAutoBackupsDetailed(dryRun bool) (removed int, freed int64, cleanupErrors []string) {
+	autoBackupMu.Lock()
+	defer autoBackupMu.Unlock()
+	return pruneOldAutoBackupsDetailedLocked(dryRun)
+}
+
+func pruneOldAutoBackupsDetailedLocked(dryRun bool) (removed int, freed int64, cleanupErrors []string) {
 	dir := autoBackupDir()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return 0, 0
+		if !os.IsNotExist(err) {
+			cleanupErrors = append(cleanupErrors, fmt.Sprintf("inspect auto-backups %s: %v", dir, err))
+		}
+		return 0, 0, cleanupErrors
 	}
 
 	type entry struct {
@@ -97,16 +163,55 @@ func pruneOldAutoBackupsImpl(dryRun bool) (removed int, freed int64) {
 		size  int64
 	}
 	var files []entry
+	tempCutoff := time.Now().Add(-autoBackupTempGrace)
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
+		if e.Type()&os.ModeSymlink != 0 {
+			continue
+		}
 		name := e.Name()
-		if !strings.HasPrefix(name, autoBackupFilenamePrefix) {
+		if strings.HasPrefix(name, autoBackupTempPrefix) && strings.HasSuffix(name, autoBackupTempSuffix) {
+			info, infoErr := e.Info()
+			if infoErr != nil {
+				cleanupErrors = append(cleanupErrors, fmt.Sprintf(
+					"inspect incomplete auto-backup %s: %v", filepath.Join(dir, name), infoErr))
+				continue
+			}
+			if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+				continue
+			}
+			// Another app process may still be finishing a temp file. The in-process
+			// mutex excludes our own writer; an hour grace avoids touching a live
+			// cross-process writer while still collecting crash leftovers.
+			if info.ModTime().After(tempCutoff) {
+				continue
+			}
+			if dryRun {
+				removed++
+				freed += info.Size()
+				continue
+			}
+			path := filepath.Join(dir, name)
+			if removeErr := autoBackupRemoveFile(path); removeErr != nil {
+				cleanupErrors = append(cleanupErrors, fmt.Sprintf("remove incomplete auto-backup %s: %v", path, removeErr))
+				continue
+			}
+			removed++
+			freed += info.Size()
+			continue
+		}
+		if validateAutoBackupFilename(name) != nil {
 			continue
 		}
 		info, err := e.Info()
 		if err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Sprintf(
+				"inspect auto-backup %s: %v", filepath.Join(dir, name), err))
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			continue
 		}
 		files = append(files, entry{
@@ -116,7 +221,7 @@ func pruneOldAutoBackupsImpl(dryRun bool) (removed int, freed int64) {
 		})
 	}
 	if len(files) <= AutoBackupRetention {
-		return 0, 0
+		return removed, freed, cleanupErrors
 	}
 	// Newest first.
 	sort.Slice(files, func(i, j int) bool {
@@ -128,12 +233,14 @@ func pruneOldAutoBackupsImpl(dryRun bool) (removed int, freed int64) {
 			freed += f.size
 			continue
 		}
-		if err := os.Remove(f.path); err == nil {
+		if err := autoBackupRemoveFile(f.path); err == nil {
 			removed++
 			freed += f.size
+		} else {
+			cleanupErrors = append(cleanupErrors, fmt.Sprintf("remove auto-backup %s: %v", f.path, err))
 		}
 	}
-	return removed, freed
+	return removed, freed, cleanupErrors
 }
 
 // AutoBackupResult summarises a single auto-backup pass for tests + logs.
@@ -158,6 +265,11 @@ type AutoBackupResult struct {
 // rather than propagated. Returns a structured AutoBackupResult so tests
 // can assert behaviour deterministically.
 func (s *Studio) RunAutoBackupIfDue() (*AutoBackupResult, error) {
+	configDataMu.RLock()
+	defer configDataMu.RUnlock()
+	autoBackupMu.Lock()
+	defer autoBackupMu.Unlock()
+
 	s.mu.RLock()
 	enabled := s.config != nil && s.config.Settings.AutoBackupEnabled
 	s.mu.RUnlock()
@@ -179,34 +291,45 @@ func (s *Studio) RunAutoBackupIfDue() (*AutoBackupResult, error) {
 		return nil, fmt.Errorf("create backup dir: %w", err)
 	}
 
-	stamp := time.Now().Format("2006-01-02")
-	fname := autoBackupFilenamePrefix + stamp + ".tar.gz"
-	// If the same day's backup already exists, add a HHMMSS suffix so we
-	// don't overwrite (catches the rare case where user manually touched
-	// the sentinel and we run twice in a day).
-	target := filepath.Join(backupDir, fname)
-	if _, err := os.Stat(target); err == nil {
-		fname = autoBackupFilenamePrefix + time.Now().Format("2006-01-02-150405") + ".tar.gz"
-		target = filepath.Join(backupDir, fname)
-	}
+	backupTime := autoBackupNow()
 
-	// Write directly to file (skips the base64 step iter 750+ Export uses).
-	f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	// Publish atomically. A hidden unique temp file is invisible to List,
+	// retention, Delete and Restore; only a fully written + fsynced tarball gets
+	// its final auto-backup-*.tar.gz name. This also leaves the previous backup
+	// intact on disk-full, walk, close, or process-interruption failures.
+	f, err := os.CreateTemp(backupDir, autoBackupTempPrefix+"*"+autoBackupTempSuffix)
 	if err != nil {
 		s.logf("warn", "backup", "auto-backup: cannot open target: %v", err)
 		return nil, fmt.Errorf("open backup target: %w", err)
 	}
-	filesCount, walkErr := writeConfigArchive(f, cfgDir)
+	tempPath := f.Name()
+	defer func() { _ = os.Remove(tempPath) }()
+	fileClosed := false
+	defer func() {
+		if !fileClosed {
+			_ = f.Close()
+		}
+	}()
+	filesCount, walkErr := autoBackupArchiveWriter(f, cfgDir)
+	syncErr := f.Sync()
 	closeErr := f.Close()
+	fileClosed = true
 	if walkErr != nil {
-		_ = os.Remove(target) // leave nothing half-written behind
 		s.logf("warn", "backup", "auto-backup: walk failed: %v", walkErr)
 		return nil, walkErr
 	}
+	if syncErr != nil {
+		s.logf("warn", "backup", "auto-backup: sync failed: %v", syncErr)
+		return nil, syncErr
+	}
 	if closeErr != nil {
-		_ = os.Remove(target)
 		s.logf("warn", "backup", "auto-backup: close failed: %v", closeErr)
 		return nil, closeErr
+	}
+	fname, target, err := publishAutoBackup(tempPath, backupDir, backupTime)
+	if err != nil {
+		s.logf("warn", "backup", "auto-backup: publish failed: %v", err)
+		return nil, fmt.Errorf("publish backup: %w", err)
 	}
 
 	stat, _ := os.Stat(target)
@@ -215,7 +338,10 @@ func (s *Studio) RunAutoBackupIfDue() (*AutoBackupResult, error) {
 		size = stat.Size()
 	}
 	touchAutoBackupSentinel()
-	pruned, freed := pruneOldAutoBackups()
+	pruned, freed, pruneErrors := pruneOldAutoBackupsDetailedLocked(false)
+	if len(pruneErrors) > 0 {
+		s.logf("warn", "backup", "auto-backup retention completed with %d warning(s): %s", len(pruneErrors), pruneErrors[0])
+	}
 
 	s.logf("info", "backup",
 		"auto-backup: wrote %s (%d files, %s); pruned %d old (freed %s)",
@@ -247,6 +373,9 @@ type AutoBackupFile struct {
 // sorted newest-first. Returns an empty list (no error) when the dir
 // doesn't exist yet — typical fresh-install state.
 func (s *Studio) ListAutoBackups() ([]AutoBackupFile, error) {
+	configDataMu.RLock()
+	defer configDataMu.RUnlock()
+
 	dir := autoBackupDir()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -260,12 +389,18 @@ func (s *Studio) ListAutoBackups() ([]AutoBackupFile, error) {
 		if e.IsDir() {
 			continue
 		}
+		if e.Type()&os.ModeSymlink != 0 {
+			continue
+		}
 		name := e.Name()
-		if !strings.HasPrefix(name, autoBackupFilenamePrefix) {
+		if validateAutoBackupFilename(name) != nil {
 			continue
 		}
 		info, err := e.Info()
 		if err != nil {
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			continue
 		}
 		out = append(out, AutoBackupFile{
@@ -311,6 +446,10 @@ func (s *Studio) DeleteAutoBackup(filename string) error {
 	if err := validateAutoBackupFilename(filename); err != nil {
 		return err
 	}
+	configDataMu.RLock()
+	defer configDataMu.RUnlock()
+	autoBackupMu.Lock()
+	defer autoBackupMu.Unlock()
 	full := filepath.Join(autoBackupDir(), filename)
 	info, err := os.Lstat(full)
 	if err != nil {
@@ -322,8 +461,8 @@ func (s *Studio) DeleteAutoBackup(filename string) error {
 	if info.Mode()&os.ModeSymlink != 0 {
 		return errors.New("refusing to follow symlink at backup path")
 	}
-	if info.IsDir() {
-		return errors.New("backup path is not a file")
+	if !info.Mode().IsRegular() {
+		return errors.New("backup path is not a regular file")
 	}
 	if err := os.Remove(full); err != nil {
 		return fmt.Errorf("could not remove backup: %w", err)
@@ -340,6 +479,10 @@ func (s *Studio) RestoreAutoBackup(filename string) (*ImportResult, error) {
 	if err := validateAutoBackupFilename(filename); err != nil {
 		return nil, err
 	}
+	configDataMu.Lock()
+	defer configDataMu.Unlock()
+	autoBackupMu.Lock()
+	defer autoBackupMu.Unlock()
 	full := filepath.Join(autoBackupDir(), filename)
 	info, err := os.Lstat(full)
 	if err != nil {
@@ -351,24 +494,38 @@ func (s *Studio) RestoreAutoBackup(filename string) (*ImportResult, error) {
 	if info.Mode()&os.ModeSymlink != 0 {
 		return nil, errors.New("refusing to follow symlink at backup path")
 	}
-	if info.IsDir() {
-		return nil, errors.New("backup path is not a file")
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("backup path is not a regular file")
 	}
 	if info.Size() > ImportArchiveMaxBytes {
 		return nil, fmt.Errorf("backup too large (%d bytes, max %d)", info.Size(), ImportArchiveMaxBytes)
 	}
-	f, err := os.Open(full)
+	f, err := autoBackupOpenFile(full)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open backup: %w", err)
 	}
 	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("cannot verify opened backup: %w", err)
+	}
+	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		return nil, errors.New("backup changed while opening")
+	}
+	if opened.Size() > ImportArchiveMaxBytes {
+		return nil, fmt.Errorf("backup too large (%d bytes, max %d)", opened.Size(), ImportArchiveMaxBytes)
+	}
 	// iter 860+: pass preRestorePrefix so the safety snapshot is named
 	// .gokin-studio.pre-restore-* (semantically correct — restore created
 	// it, not import) instead of mislabelled .gokin-studio.pre-import-*.
 	// Both prefixes register in snapshotPrefixes (iter 830+), so the safety
 	// snapshot still shows up in ListPreImportBackups + auto-cleanup either
 	// way; this just stops the audit log and listing tooltips from lying.
-	result, err := s.extractArchiveToConfigDir(f, "restore", preRestorePrefix)
+	// Pin the readable extent to the verified open-file size. A concurrent
+	// append to the same inode cannot turn a validated backup into an unbounded
+	// compressed input after the check above.
+	reader := io.NewSectionReader(f, 0, opened.Size())
+	result, err := s.extractArchiveToConfigDir(reader, "restore", preRestorePrefix)
 	if err != nil {
 		return nil, err
 	}

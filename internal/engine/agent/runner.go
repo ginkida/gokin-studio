@@ -37,8 +37,12 @@ type Runner struct {
 	workDir      string
 	agents       map[string]*Agent
 	results      map[string]*AgentResult
-	store        *AgentStore
-	permissions  *permission.Manager
+	// activeExecutions counts Run calls that have been published in agents but
+	// have not finished finalizing their result/output yet. Cancellation changes
+	// visible status immediately, so status alone is not a safe cleanup barrier.
+	activeExecutions map[string]uint32
+	store            *AgentStore
+	permissions      *permission.Manager
 
 	// Activity reporting
 	activityReporter ActivityReporter
@@ -124,9 +128,15 @@ func (r *Runner) GetActiveAgent(id string) *Agent {
 		return r.agents[id]
 	}
 
-	// Fallback: return the first agent (in plans, there is usually one active at a time)
-	for _, a := range r.agents {
-		return a
+	// Map iteration is randomized. Keep the legacy fallback while making it
+	// deterministic when more than one agent exists.
+	ids := make([]string, 0, len(r.agents))
+	for agentID := range r.agents {
+		ids = append(ids, agentID)
+	}
+	sort.Strings(ids)
+	if len(ids) > 0 {
+		return r.agents[ids[0]]
 	}
 
 	return nil
@@ -217,6 +227,9 @@ func (r *Runner) SetPredictor(p PredictorInterface) {
 
 // SetTypeRegistry sets the agent type registry for dynamic types.
 func (r *Runner) SetTypeRegistry(registry *AgentTypeRegistry) {
+	if registry == nil {
+		registry = NewAgentTypeRegistry()
+	}
 	r.mu.Lock()
 	r.typeRegistry = registry
 	r.mu.Unlock()
@@ -487,20 +500,125 @@ func (r *Runner) reportActivity() {
 
 // NewRunner creates a new agent runner.
 func NewRunner(ctx context.Context, c client.Client, registry tools.ToolRegistry, workDir string) *Runner {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	r := &Runner{
-		ctx:          ctx,
-		client:       c,
-		baseRegistry: registry,
-		workDir:      workDir,
-		agents:       make(map[string]*Agent),
-		results:      make(map[string]*AgentResult),
-		resultReady:  make(chan struct{}, 1),
+		ctx:              ctx,
+		client:           c,
+		baseRegistry:     registry,
+		workDir:          workDir,
+		agents:           make(map[string]*Agent),
+		results:          make(map[string]*AgentResult),
+		activeExecutions: make(map[string]uint32),
+		resultReady:      make(chan struct{}, 1),
+		typeRegistry:     NewAgentTypeRegistry(),
 	}
 	// Set up messenger factory
 	r.messengerFactory = func(agentID string) *AgentMessenger {
 		return NewAgentMessenger(ctx, r, agentID)
 	}
 	return r
+}
+
+func (r *Runner) executionContext(ctx context.Context) context.Context {
+	if ctx != nil {
+		return ctx
+	}
+	r.mu.RLock()
+	ctx = r.ctx
+	r.mu.RUnlock()
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+func normalizeAgentSpawnRequest(
+	deps runnerAgentDeps,
+	agentType string,
+	prompt string,
+	maxTurns int,
+	model string,
+) (string, string, error) {
+	if strings.TrimSpace(prompt) == "" {
+		return "", "", fmt.Errorf("agent prompt must not be blank")
+	}
+	if maxTurns < 0 || maxTurns > tools.MaxTaskTurns {
+		return "", "", fmt.Errorf("max turns must be between 0 (default) and %d", tools.MaxTaskTurns)
+	}
+
+	typeName := strings.TrimSpace(agentType)
+	if builtin := ParseAgentType(typeName); builtin != "" {
+		typeName = string(builtin)
+	} else {
+		if typeName == "" || deps.typeRegistry == nil {
+			return "", "", fmt.Errorf("unknown agent type %q", agentType)
+		}
+		dynamicType, exists := deps.typeRegistry.GetDynamic(typeName)
+		if !exists {
+			return "", "", fmt.Errorf("unknown agent type %q", agentType)
+		}
+		typeName = dynamicType.Name
+		for _, toolName := range dynamicType.AllowedTools {
+			if deps.baseRegistry == nil {
+				return "", "", fmt.Errorf("dynamic agent type %q requires unavailable tool %q", typeName, toolName)
+			}
+			if _, exists := deps.baseRegistry.Get(toolName); !exists {
+				return "", "", fmt.Errorf("dynamic agent type %q requires unavailable tool %q", typeName, toolName)
+			}
+		}
+	}
+
+	return typeName, strings.TrimSpace(model), nil
+}
+
+func validateRestoredAgentState(deps runnerAgentDeps, state *AgentState) error {
+	if state == nil {
+		return fmt.Errorf("agent state is missing")
+	}
+	if strings.TrimSpace(state.ID) == "" {
+		return fmt.Errorf("agent state ID must not be blank")
+	}
+	if _, _, err := normalizeAgentSpawnRequest(
+		deps,
+		string(state.Type),
+		"restored agent state",
+		state.MaxTurns,
+		state.Model,
+	); err != nil {
+		return fmt.Errorf("invalid agent state: %w", err)
+	}
+	return nil
+}
+
+// markExecutionStartedLocked publishes one live execution. The caller must
+// hold r.mu and should do this in the same critical section that exposes the
+// agent through r.agents.
+func (r *Runner) markExecutionStartedLocked(agentID string) {
+	r.activeExecutions[agentID]++
+}
+
+func (r *Runner) markExecutionFinished(agentID string) {
+	r.mu.Lock()
+	if count := r.activeExecutions[agentID]; count > 1 {
+		r.activeExecutions[agentID] = count - 1
+	} else {
+		delete(r.activeExecutions, agentID)
+	}
+	r.mu.Unlock()
+}
+
+func applyAgentRunError(agent *Agent, result *AgentResult, err error) {
+	if err == nil || result == nil {
+		return
+	}
+	result.Error = err.Error()
+	if agent.GetStatus() == AgentStatusCancelled {
+		result.Status = AgentStatusCancelled
+	} else {
+		result.Status = AgentStatusFailed
+	}
 }
 
 func (r *Runner) snapshotAgentDeps() runnerAgentDeps {
@@ -566,6 +684,7 @@ func (r *Runner) newConfiguredAgent(
 	model string,
 	perms *permission.Manager,
 ) *Agent {
+	ctx = r.executionContext(ctx)
 	agentBaseRegistry := deps.baseRegistry
 	agentWorkDir := strings.TrimSpace(deps.workDir)
 	var isolated *isolatedWorkspace
@@ -608,8 +727,9 @@ func (r *Runner) newConfiguredAgent(
 			deps.ctxCfg,
 		)
 	}
+	r.wireTaskRunner(agent, ctx)
 
-	agent.ApplyThoroughness(tools.ThoroughnessFromContext(ctx), maxTurns)
+	agent.ApplyThoroughness(tools.ThoroughnessFromContext(ctx))
 	agent.SetOutputStyle(tools.OutputStyleFromContext(ctx))
 	agent.LoadPinnedContext()
 
@@ -632,7 +752,6 @@ func (r *Runner) newConfiguredAgent(
 	if isolated != nil {
 		agent.workDir = isolated.Root
 		agent.isolatedWorkspace = isolated
-		agent.SetAllowedRequestedTools(allowedRequestedToolsForIsolationMode(isolationMode))
 		if bt, ok := agent.registry.Get("bash"); ok {
 			if bashTool, ok := bt.(*tools.BashTool); ok && isolated.ApplyBackOnSuccess {
 				bashTool.EnableManagedWorkspaceApplyBackMode(agent.workDir)
@@ -688,8 +807,27 @@ func (r *Runner) newConfiguredAgent(
 	if deps.onThinking != nil {
 		agent.SetOnThinking(deps.onThinking)
 	}
+	r.attachAgentOutputPublisher(agent)
 
 	return agent
+}
+
+func (r *Runner) attachAgentOutputPublisher(agent *Agent) {
+	agent.SetOnOutputFile(func(path string) {
+		r.mu.Lock()
+		result, exists := r.results[agent.ID]
+		if !exists {
+			result = &AgentResult{AgentID: agent.ID, Type: agent.Type, Status: AgentStatusRunning}
+			r.results[agent.ID] = result
+		}
+		if path != "" {
+			result.OutputFile = path
+		}
+		if result.Status == AgentStatusPending {
+			result.Status = AgentStatusRunning
+		}
+		r.mu.Unlock()
+	})
 }
 
 func (r *Runner) recordAgentExecutionLearning(
@@ -712,17 +850,20 @@ func (r *Runner) recordAgentExecutionLearning(
 
 	if success && deps.exampleStore != nil {
 		output := result.Output
+		resultAgentID := result.AgentID
 		go func() {
-			if err := deps.exampleStore.LearnFromSuccess(
-				agentType,
-				prompt,
-				agentType,
-				output,
-				duration,
-				0,
-			); err != nil {
-				logging.Debug("failed to learn from success", "error", err)
-			}
+			callAgentObserver(resultAgentID, "example_learning", func() {
+				if err := deps.exampleStore.LearnFromSuccess(
+					agentType,
+					prompt,
+					agentType,
+					output,
+					duration,
+					0,
+				); err != nil {
+					logging.Debug("failed to learn from success", "error", err)
+				}
+			})
 		}()
 	}
 
@@ -742,15 +883,26 @@ func (r *Runner) newRestoredAgent(
 	return agent
 }
 
-func attachMetaAgentMonitoring(agent *Agent, meta *MetaAgent) {
-	if meta == nil {
+func attachMetaAgentMonitoring(
+	agent *Agent,
+	meta *MetaAgent,
+	activityCallbacks ...func(agentID, agentType, toolName string, args map[string]any, status string),
+) {
+	var onSubAgentActivity func(agentID, agentType, toolName string, args map[string]any, status string)
+	if len(activityCallbacks) > 0 {
+		onSubAgentActivity = activityCallbacks[0]
+	}
+	if meta == nil && onSubAgentActivity == nil {
 		return
 	}
 
-	meta.RegisterAgent(agent.ID, agent.Type)
+	if meta != nil {
+		meta.RegisterAgent(agent.ID, agent.Type)
+	}
 	agentID := agent.ID
-	agent.SetOnToolActivity(func(_ string, toolName string, _ map[string]any, status string) {
-		if status == "start" {
+	agent.SetOnToolActivity(func(id string, toolName string, args map[string]any, status string) {
+		safeSubAgentActivityEvent(onSubAgentActivity, id, string(agent.Type), toolName, args, "tool_"+status)
+		if meta != nil && status == "start" {
 			meta.UpdateActivity(agentID, toolName, agent.GetTurnCount())
 		}
 	})
@@ -759,7 +911,7 @@ func attachMetaAgentMonitoring(agent *Agent, meta *MetaAgent) {
 var workspaceIsolationReadOnlyTools = toolNameSet(
 	"read", "glob", "grep", "tree", "list_dir", "diff", "todo", "env",
 	"web_fetch", "web_search", "ask_user",
-	"tools_list", "request_tool", "ask_agent",
+	"tools_list",
 	"enter_plan_mode", "update_plan_progress", "get_plan_status", "exit_plan_mode",
 	"undo_plan", "redo_plan",
 	"git_status", "git_diff", "git_log", "git_blame",
@@ -772,7 +924,7 @@ var workspaceIsolationReadOnlyTools = toolNameSet(
 var workspaceIsolationApplyBackTools = toolNameSet(
 	"read", "glob", "grep", "tree", "list_dir", "diff", "todo", "env",
 	"web_fetch", "web_search", "ask_user",
-	"tools_list", "request_tool", "ask_agent",
+	"tools_list",
 	"enter_plan_mode", "update_plan_progress", "get_plan_status", "exit_plan_mode",
 	"undo_plan", "redo_plan",
 	"git_status", "git_diff", "git_log", "git_blame",
@@ -790,17 +942,6 @@ func toolNameSet(names ...string) map[string]struct{} {
 		set[name] = struct{}{}
 	}
 	return set
-}
-
-func allowedRequestedToolsForIsolationMode(mode workspaceIsolationMode) []string {
-	switch mode {
-	case workspaceIsolationReadOnly:
-		return toolNameList(workspaceIsolationReadOnlyTools)
-	case workspaceIsolationApplyBack:
-		return toolNameList(workspaceIsolationApplyBackTools)
-	default:
-		return nil
-	}
 }
 
 func toolNameList(set map[string]struct{}) []string {
@@ -875,17 +1016,19 @@ func (r *Runner) finalizeAgentWorkspace(agent *Agent, result *AgentResult) error
 					result.Error = reviewErr.Error()
 					result.Metadata["isolated_workspace_review_error"] = reviewErr.Error()
 					result.Metadata["isolated_workspace_dir"] = agent.workDir
+					r.cleanupFinalizedAgentWorkspace(agent, result)
 					return reviewErr
 				}
 				if len(previews) > 0 {
 					result.Metadata["isolated_workspace_review_required"] = true
-					approved, err := reviewHandler(context.Background(), previews)
+					approved, err := callWorkspaceReviewCallback(agent.ID, reviewHandler, context.Background(), previews)
 					if err != nil {
 						reviewErr := fmt.Errorf("failed to review isolated workspace changes: %w", err)
 						result.Status = AgentStatusFailed
 						result.Error = reviewErr.Error()
 						result.Metadata["isolated_workspace_review_error"] = reviewErr.Error()
 						result.Metadata["isolated_workspace_dir"] = agent.workDir
+						r.cleanupFinalizedAgentWorkspace(agent, result)
 						return reviewErr
 					}
 					if !approved {
@@ -894,6 +1037,7 @@ func (r *Runner) finalizeAgentWorkspace(agent *Agent, result *AgentResult) error
 						result.Error = reviewErr.Error()
 						result.Metadata["isolated_workspace_review_rejected"] = true
 						result.Metadata["isolated_workspace_dir"] = agent.workDir
+						r.cleanupFinalizedAgentWorkspace(agent, result)
 						return reviewErr
 					}
 					result.Metadata["isolated_workspace_reviewed"] = true
@@ -908,6 +1052,7 @@ func (r *Runner) finalizeAgentWorkspace(agent *Agent, result *AgentResult) error
 				result.Error = applyErr.Error()
 				result.Metadata["isolated_workspace_apply_back_error"] = applyErr.Error()
 				result.Metadata["isolated_workspace_dir"] = agent.workDir
+				r.cleanupFinalizedAgentWorkspace(agent, result)
 				return applyErr
 			}
 			if applyResult != nil {
@@ -920,17 +1065,34 @@ func (r *Runner) finalizeAgentWorkspace(agent *Agent, result *AgentResult) error
 			}
 		}
 
-		if err := agent.isolatedWorkspace.Cleanup(); err != nil {
-			result.Metadata["isolated_workspace_cleanup_error"] = err.Error()
-			result.Metadata["isolated_workspace_dir"] = agent.workDir
-			return nil
-		}
-		result.Metadata["isolated_workspace_cleaned"] = true
+		r.cleanupFinalizedAgentWorkspace(agent, result)
 		return nil
 	}
 
-	result.Metadata["isolated_workspace_dir"] = agent.workDir
+	// Failed, cancelled and panicked runs never apply their workspace back.
+	// Retaining those temporary copies had no recovery consumer and leaked one
+	// directory/worktree per terminal run. Keep the path only when cleanup
+	// itself fails so diagnostics still identify the orphan.
+	r.cleanupFinalizedAgentWorkspace(agent, result)
 	return nil
+}
+
+func (r *Runner) cleanupFinalizedAgentWorkspace(agent *Agent, result *AgentResult) {
+	if agent == nil || agent.isolatedWorkspace == nil || result == nil {
+		return
+	}
+	if result.Metadata == nil {
+		result.Metadata = make(map[string]interface{})
+	}
+	if err := agent.isolatedWorkspace.Cleanup(); err != nil {
+		result.Metadata["isolated_workspace_cleanup_error"] = err.Error()
+		result.Metadata["isolated_workspace_dir"] = agent.workDir
+		return
+	}
+	delete(result.Metadata, "isolated_workspace_dir")
+	delete(result.Metadata, "isolated_workspace_cleanup_error")
+	result.Metadata["isolated_workspace_cleaned"] = true
+	agent.isolatedWorkspace = nil
 }
 
 // GetClient returns the underlying client.
@@ -961,6 +1123,9 @@ func (r *Runner) cleanupOldResults() {
 		}
 		var completed []agentEntry
 		for id, agent := range r.agents {
+			if r.activeExecutions[id] > 0 {
+				continue
+			}
 			if agent.GetStatus() == AgentStatusCompleted ||
 				agent.GetStatus() == AgentStatusFailed ||
 				agent.GetStatus() == AgentStatusCancelled {
@@ -974,10 +1139,15 @@ func (r *Runner) cleanupOldResults() {
 		// Remove oldest completed agents (keep MaxCompletedAgents/2)
 		removeCount := len(completed) - MaxCompletedAgents/2
 		if removeCount > 0 {
+			removed := 0
 			for i := 0; i < removeCount; i++ {
-				delete(r.agents, completed[i].id)
+				if r.removeAgentLocked(completed[i].id) {
+					removed++
+				}
 			}
-			logging.Debug("cleaned up old agents", "removed", removeCount)
+			if removed > 0 {
+				logging.Debug("cleaned up old agents", "removed", removed)
+			}
 		}
 	}
 
@@ -989,7 +1159,7 @@ func (r *Runner) cleanupOldResults() {
 		}
 		var completed []resultEntry
 		for id, result := range r.results {
-			if result.Completed {
+			if result.Completed && r.activeExecutions[id] == 0 {
 				endTime := time.Time{}
 				if agent, ok := r.agents[id]; ok {
 					endTime = agent.GetEndTime()
@@ -1003,13 +1173,19 @@ func (r *Runner) cleanupOldResults() {
 		})
 		removeCount := len(completed) - MaxAgentResults/2
 		if removeCount > 0 {
+			removed := 0
 			for i := 0; i < removeCount; i++ {
-				delete(r.results, completed[i].id)
+				if r.removeAgentLocked(completed[i].id) {
+					removed++
+				}
 			}
-			logging.Debug("cleaned up old results", "removed", removeCount)
+			if removed > 0 {
+				logging.Debug("cleaned up old results", "removed", removed)
+			}
 		}
 	}
 }
+
 // SetRateLimitCallback sets the rate limit callback for agents.
 func (r *Runner) SetRateLimitCallback(cb func(rl *client.RateLimitMetadata)) {
 	r.mu.Lock()

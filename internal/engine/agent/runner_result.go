@@ -4,9 +4,12 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"sync"
 	"time"
 )
+
+var removeAgentOutputFile = os.Remove
 
 // Wait waits for an agent to complete and returns its result.
 // Uses a default 10-minute timeout. For context-aware waiting, use WaitWithContext.
@@ -27,23 +30,32 @@ func (r *Runner) notifyResultReady() {
 
 // WaitWithContext waits for an agent to complete, respecting context cancellation.
 func (r *Runner) WaitWithContext(ctx context.Context, agentID string) (*AgentResult, error) {
-	// Fast path: check immediately
-	r.mu.RLock()
-	result, ok := r.results[agentID]
-	r.mu.RUnlock()
-	if ok && result.Completed {
+	completedResult := func() (*AgentResult, bool) {
+		r.mu.RLock()
+		result, ok := r.results[agentID]
+		result = cloneAgentResult(result)
+		r.mu.RUnlock()
+		return result, ok && result.Completed
+	}
+	if result, complete := completedResult(); complete {
 		return result, nil
 	}
 
+	// resultReady is intentionally coalesced and shared by all agents. A waiter
+	// for agent A can consume the notification for B, so retain a low-frequency
+	// safety check to guarantee progress with multiple concurrent waiters.
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-r.resultReady:
-			r.mu.RLock()
-			result, ok := r.results[agentID]
-			r.mu.RUnlock()
-			if ok && result.Completed {
+			if result, complete := completedResult(); complete {
+				return result, nil
+			}
+		case <-ticker.C:
+			if result, complete := completedResult(); complete {
 				return result, nil
 			}
 		}
@@ -99,7 +111,46 @@ func (r *Runner) GetResult(agentID string) (*AgentResult, bool) {
 	defer r.mu.RUnlock()
 
 	result, ok := r.results[agentID]
-	return result, ok
+	return cloneAgentResult(result), ok
+}
+
+func cloneAgentResult(result *AgentResult) *AgentResult {
+	if result == nil {
+		return nil
+	}
+	clone := *result
+	if result.Metadata != nil {
+		clone.Metadata = make(map[string]interface{}, len(result.Metadata))
+		for key, value := range result.Metadata {
+			clone.Metadata[key] = cloneJSONValue(value)
+		}
+	}
+	return &clone
+}
+
+// setResultLocked stores a runner-owned snapshot. Callbacks and synchronous
+// APIs may retain and mutate their result pointer after return; those changes
+// must not rewrite the registry behind r.mu.
+func (r *Runner) setResultLocked(agentID string, result *AgentResult) {
+	r.results[agentID] = cloneAgentResult(result)
+}
+
+// removeAgentLocked removes one finalized agent/result pair. The caller must
+// hold r.mu. Failed output cleanup retains the pair so a later pass can retry
+// instead of losing the only reference to an orphaned file.
+func (r *Runner) removeAgentLocked(agentID string) bool {
+	if r.activeExecutions[agentID] > 0 {
+		return false
+	}
+	if result, ok := r.results[agentID]; ok && result.OutputFile != "" {
+		if err := removeAgentOutputFile(result.OutputFile); err != nil && !os.IsNotExist(err) {
+			return false
+		}
+	}
+	delete(r.agents, agentID)
+	delete(r.results, agentID)
+	delete(r.activeExecutions, agentID)
+	return true
 }
 
 // GetAgent returns an agent by ID.
@@ -120,21 +171,20 @@ func (r *Runner) Cancel(agentID string) error {
 		r.mu.Unlock()
 		return fmt.Errorf("agent not found: %s", agentID)
 	}
+	status := agent.GetStatus()
+	if status != AgentStatusPending && status != AgentStatusRunning {
+		r.mu.Unlock()
+		return fmt.Errorf("agent is not running: %s", agentID)
+	}
 
 	agent.Cancel()
 
-	// Update result — must set Completed so WaitWithContext doesn't spin
-	completed := false
+	// Publish cancellation immediately, but keep Completed false until the Run
+	// goroutine has closed output and finalized its authoritative result.
 	if result, ok := r.results[agentID]; ok {
 		result.Status = AgentStatusCancelled
-		result.Completed = true
-		completed = true
 	}
 	r.mu.Unlock()
-
-	if completed {
-		r.notifyResultReady()
-	}
 
 	return nil
 }
@@ -148,6 +198,7 @@ func (r *Runner) ListAgents() []string {
 	for id := range r.agents {
 		ids = append(ids, id)
 	}
+	sort.Strings(ids)
 	return ids
 }
 
@@ -162,6 +213,7 @@ func (r *Runner) ListRunning() []string {
 			ids = append(ids, id)
 		}
 	}
+	sort.Strings(ids)
 	return ids
 }
 
@@ -175,17 +227,16 @@ func (r *Runner) Cleanup(maxAge time.Duration) int {
 	cleaned := 0
 
 	for id, agent := range r.agents {
+		if r.activeExecutions[id] > 0 {
+			continue
+		}
 		status := agent.GetStatus()
 		if status == AgentStatusCompleted || status == AgentStatusFailed || status == AgentStatusCancelled {
 			endTime := agent.GetEndTime()
 			if !endTime.IsZero() && endTime.Before(cutoff) {
-				// Clean up agent output file if it exists
-				if result, ok := r.results[id]; ok && result.OutputFile != "" {
-					os.Remove(result.OutputFile)
+				if r.removeAgentLocked(id) {
+					cleaned++
 				}
-				delete(r.agents, id)
-				delete(r.results, id)
-				cleaned++
 			}
 		}
 	}

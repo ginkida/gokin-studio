@@ -136,7 +136,7 @@ func (s *Studio) StartCodeReview(projectID, sessionID, fingerprint string) error
 	if review.Fingerprint == "" || review.Fingerprint != strings.TrimSpace(fingerprint) || len(review.Files) == 0 {
 		return fmt.Errorf("the diff changed or is empty; refresh Review changes and try again")
 	}
-	return s.startMessageWithQueueEventPermission(projectID, codeReviewRequestPrompt(sessionID, review.Fingerprint), nil, sessionID, nil, "plan")
+	return s.startMessageWithQueueEventPermission(projectID, codeReviewRequestPrompt(sessionID, review.Fingerprint), nil, sessionID, nil, "plan", nil)
 }
 
 func (s *Studio) registerCodeReviewTool(reg *tools.Registry, projectID string) {

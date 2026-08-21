@@ -52,3 +52,6 @@ GOKIN.local.md
 
 # Gokin runtime artifacts (local paths, prompt previews, agent output)
 .gokin/
+
+# Stray Windows binaries from cross-compilation probes
+*.exe

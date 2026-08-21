@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ginkida/gokin-studio/internal/engine/fileutil"
 	"github.com/ginkida/gokin-studio/internal/engine/logging"
 )
 
@@ -44,7 +45,10 @@ type ExampleStore struct {
 	examples  map[string]*TaskExample
 	byType    map[string][]string // TaskType -> list of example IDs
 	mu        sync.RWMutex
+	writer    fileutil.LatestFileWriter
 }
+
+const maxLearningStoreFileBytes int64 = 64 << 20
 
 // NewExampleStore creates a new example store.
 func NewExampleStore(configDir string) (*ExampleStore, error) {
@@ -69,7 +73,7 @@ func (es *ExampleStore) storagePath() string {
 
 // load loads examples from disk.
 func (es *ExampleStore) load() error {
-	data, err := os.ReadFile(es.storagePath())
+	data, err := fileutil.ReadRegularFileLimited(es.storagePath(), maxLearningStoreFileBytes)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -81,12 +85,19 @@ func (es *ExampleStore) load() error {
 	if err := json.Unmarshal(data, &examples); err != nil {
 		return err
 	}
+	if examples == nil {
+		examples = make(map[string]*TaskExample)
+	}
 
 	es.examples = examples
 
 	// Rebuild type index
 	es.byType = make(map[string][]string)
 	for id, ex := range es.examples {
+		if ex == nil {
+			delete(es.examples, id)
+			continue
+		}
 		es.byType[ex.TaskType] = append(es.byType[ex.TaskType], id)
 	}
 
@@ -96,7 +107,7 @@ func (es *ExampleStore) load() error {
 // save persists examples to disk.
 func (es *ExampleStore) save() error {
 	dir := filepath.Dir(es.storagePath())
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 
@@ -105,7 +116,7 @@ func (es *ExampleStore) save() error {
 		return err
 	}
 
-	return os.WriteFile(es.storagePath(), data, 0644)
+	return es.writer.Write(es.storagePath(), data, 0o600)
 }
 
 // Flush forces an immediate save to disk. Call on graceful shutdown.
@@ -113,6 +124,19 @@ func (es *ExampleStore) Flush() error {
 	es.mu.RLock()
 	defer es.mu.RUnlock()
 	return es.save()
+}
+
+func (es *ExampleStore) scheduleSnapshot(path string, data []byte) {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		logging.Debug("failed to create example store dir", "error", err)
+		return
+	}
+	es.writer.Schedule(path, data, 0o600, func(err error) {
+		if err != nil {
+			logging.Debug("failed to save example store", "error", err)
+		}
+	})
 }
 
 // generateExampleID creates a unique ID for an example.
@@ -187,17 +211,7 @@ func (es *ExampleStore) LearnFromSuccessWithTools(taskType, prompt, agentType, o
 	}
 	path := es.storagePath()
 
-	// Save asynchronously — write pre-marshalled data outside lock
-	go func() {
-		dir := filepath.Dir(path)
-		if mkErr := os.MkdirAll(dir, 0755); mkErr != nil {
-			logging.Debug("failed to create example store dir", "error", mkErr)
-			return
-		}
-		if wErr := os.WriteFile(path, data, 0644); wErr != nil {
-			logging.Debug("failed to save example store", "error", wErr)
-		}
-	}()
+	es.scheduleSnapshot(path, data)
 
 	return nil
 }
@@ -422,16 +436,7 @@ func (es *ExampleStore) RecordFeedback(exampleID string, positive bool) {
 	}
 	path := es.storagePath()
 
-	// Save asynchronously — write pre-marshalled data outside lock
-	go func() {
-		dir := filepath.Dir(path)
-		if mkErr := os.MkdirAll(dir, 0755); mkErr != nil {
-			return
-		}
-		if wErr := os.WriteFile(path, data, 0644); wErr != nil {
-			logging.Debug("failed to save example store", "error", wErr)
-		}
-	}()
+	es.scheduleSnapshot(path, data)
 }
 
 // GetStats returns statistics about the example store.

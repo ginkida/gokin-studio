@@ -2,13 +2,25 @@ package agent
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
+	"github.com/ginkida/gokin-studio/internal/engine/fileutil"
 	"github.com/ginkida/gokin-studio/internal/engine/logging"
+)
+
+const (
+	MaxStrategyMetrics          = 500
+	maxStrategyTaskTypes        = 256
+	maxStrategyNameBytes        = 128
+	maxStrategyTaskTypeBytes    = 256
+	defaultStrategyTaskTypeName = "general"
 )
 
 // StrategyMetrics tracks performance metrics for a strategy.
@@ -24,15 +36,23 @@ type StrategyMetrics struct {
 
 // SuccessRate returns the success rate as a percentage.
 func (sm *StrategyMetrics) SuccessRate() float64 {
-	total := sm.SuccessCount + sm.FailureCount
+	if sm == nil {
+		return 0.5
+	}
+	successes := nonNegativeInt(sm.SuccessCount)
+	failures := nonNegativeInt(sm.FailureCount)
+	total := float64(successes) + float64(failures)
 	if total == 0 {
 		return 0.5 // Unknown, return neutral
 	}
-	return float64(sm.SuccessCount) / float64(total)
+	return float64(successes) / total
 }
 
 // clone returns a deep copy of the metrics.
 func (sm *StrategyMetrics) clone() *StrategyMetrics {
+	if sm == nil {
+		return nil
+	}
 	c := *sm
 	if sm.TaskTypes != nil {
 		c.TaskTypes = make(map[string]int, len(sm.TaskTypes))
@@ -48,6 +68,7 @@ type StrategyOptimizer struct {
 	metrics   map[string]*StrategyMetrics // strategy name -> metrics
 	configDir string
 	mu        sync.RWMutex
+	writer    fileutil.LatestFileWriter
 }
 
 // NewStrategyOptimizer creates a new strategy optimizer.
@@ -72,7 +93,7 @@ func (so *StrategyOptimizer) storagePath() string {
 
 // load loads metrics from disk.
 func (so *StrategyOptimizer) load() error {
-	data, err := os.ReadFile(so.storagePath())
+	data, err := fileutil.ReadRegularFileLimited(so.storagePath(), maxOptimizerStoreFileBytes)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -84,8 +105,30 @@ func (so *StrategyOptimizer) load() error {
 	if err := json.Unmarshal(data, &metrics); err != nil {
 		return err
 	}
-
-	so.metrics = metrics
+	if metrics == nil {
+		metrics = make(map[string]*StrategyMetrics)
+	}
+	normalized := make(map[string]*StrategyMetrics, minInt(len(metrics), MaxStrategyMetrics))
+	names := make([]string, 0, len(metrics))
+	for name := range metrics {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		canonicalName, ok := normalizeStrategyLabel(name, maxStrategyNameBytes, false)
+		if !ok || canonicalName == "" {
+			continue
+		}
+		metric := normalizeStrategyMetrics(canonicalName, metrics[name])
+		if metric == nil {
+			continue
+		}
+		if existing := normalized[canonicalName]; existing == nil || metric.LastUsed.After(existing.LastUsed) {
+			normalized[canonicalName] = metric
+		}
+	}
+	so.metrics = normalized
+	so.evictOldest(MaxStrategyMetrics)
 	return nil
 }
 
@@ -102,37 +145,74 @@ func (so *StrategyOptimizer) save() ([]byte, error) {
 // writeSnapshot writes pre-serialized data to disk without holding any locks.
 func (so *StrategyOptimizer) writeSnapshot(data []byte) error {
 	dir := filepath.Dir(so.storagePath())
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(so.storagePath(), data, 0644)
+	return so.writer.Write(so.storagePath(), data, 0o600)
+}
+
+func (so *StrategyOptimizer) scheduleSnapshot(data []byte) {
+	dir := filepath.Dir(so.storagePath())
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		logging.Debug("failed to create strategy metrics directory", "error", err)
+		return
+	}
+	so.writer.Schedule(so.storagePath(), data, 0o600, func(err error) {
+		if err != nil {
+			logging.Debug("failed to save strategy metrics", "error", err)
+		}
+	})
 }
 
 // RecordExecution records the outcome of a strategy execution.
 func (so *StrategyOptimizer) RecordExecution(strategyName string, taskType string, success bool, duration time.Duration) {
+	strategyName, ok := normalizeStrategyLabel(strategyName, maxStrategyNameBytes, false)
+	if !ok || strategyName == "" {
+		return
+	}
+	taskType, ok = normalizeStrategyLabel(taskType, maxStrategyTaskTypeBytes, true)
+	if !ok {
+		return
+	}
+	if duration < 0 {
+		duration = 0
+	}
+
 	so.mu.Lock()
 	defer so.mu.Unlock()
+	if so.metrics == nil {
+		so.metrics = make(map[string]*StrategyMetrics)
+	}
 
 	metrics, ok := so.metrics[strategyName]
-	if !ok {
+	if !ok || metrics == nil {
+		if !ok && len(so.metrics) >= MaxStrategyMetrics {
+			so.evictOldest(MaxStrategyMetrics - 1)
+		}
 		metrics = &StrategyMetrics{
 			StrategyName: strategyName,
 			TaskTypes:    make(map[string]int),
 		}
 		so.metrics[strategyName] = metrics
 	}
-
-	if success {
-		metrics.SuccessCount++
-	} else {
-		metrics.FailureCount++
+	if metrics.TaskTypes == nil {
+		metrics.TaskTypes = make(map[string]int)
 	}
 
-	metrics.TotalTime += duration
-	total := metrics.SuccessCount + metrics.FailureCount
-	metrics.AvgDuration = metrics.TotalTime / time.Duration(total)
+	if success {
+		metrics.SuccessCount = saturatingIncrement(metrics.SuccessCount)
+	} else {
+		metrics.FailureCount = saturatingIncrement(metrics.FailureCount)
+	}
+
+	metrics.TotalTime = saturatingDurationAdd(metrics.TotalTime, duration)
+	total := saturatingCountSum(metrics.SuccessCount, metrics.FailureCount)
+	if total > 0 {
+		metrics.AvgDuration = metrics.TotalTime / time.Duration(total)
+	}
 	metrics.LastUsed = time.Now()
-	metrics.TaskTypes[taskType]++
+	metrics.TaskTypes[taskType] = saturatingIncrement(metrics.TaskTypes[taskType])
+	trimStrategyTaskTypes(metrics.TaskTypes, maxStrategyTaskTypes)
 
 	// Snapshot data under lock, write to disk asynchronously
 	snapshot, err := so.save()
@@ -140,20 +220,20 @@ func (so *StrategyOptimizer) RecordExecution(strategyName string, taskType strin
 		logging.Debug("failed to serialize strategy metrics", "error", err)
 		return
 	}
-	go func() {
-		if err := so.writeSnapshot(snapshot); err != nil {
-			logging.Debug("failed to save strategy metrics", "error", err)
-		}
-	}()
+	so.scheduleSnapshot(snapshot)
 }
 
 // GetSuccessRate returns the success rate for a strategy.
 func (so *StrategyOptimizer) GetSuccessRate(strategyName string) float64 {
+	strategyName, ok := normalizeStrategyLabel(strategyName, maxStrategyNameBytes, false)
+	if !ok || strategyName == "" {
+		return 0.5
+	}
 	so.mu.RLock()
 	defer so.mu.RUnlock()
 
 	metrics, ok := so.metrics[strategyName]
-	if !ok {
+	if !ok || metrics == nil {
 		return 0.5 // Unknown strategy, return neutral
 	}
 
@@ -162,11 +242,15 @@ func (so *StrategyOptimizer) GetSuccessRate(strategyName string) float64 {
 
 // GetMetrics returns a copy of the metrics for a strategy.
 func (so *StrategyOptimizer) GetMetrics(strategyName string) (*StrategyMetrics, bool) {
+	strategyName, ok := normalizeStrategyLabel(strategyName, maxStrategyNameBytes, false)
+	if !ok || strategyName == "" {
+		return nil, false
+	}
 	so.mu.RLock()
 	defer so.mu.RUnlock()
 
 	metrics, ok := so.metrics[strategyName]
-	if !ok {
+	if !ok || metrics == nil {
 		return nil, false
 	}
 	return metrics.clone(), true
@@ -174,6 +258,10 @@ func (so *StrategyOptimizer) GetMetrics(strategyName string) (*StrategyMetrics, 
 
 // RecommendStrategy recommends the best strategy for a task type.
 func (so *StrategyOptimizer) RecommendStrategy(taskType string) string {
+	taskType, ok := normalizeStrategyLabel(taskType, maxStrategyTaskTypeBytes, true)
+	if !ok {
+		taskType = defaultStrategyTaskTypeName
+	}
 	so.mu.RLock()
 	defer so.mu.RUnlock()
 
@@ -185,6 +273,9 @@ func (so *StrategyOptimizer) RecommendStrategy(taskType string) string {
 	var scores []strategyScore
 
 	for name, metrics := range so.metrics {
+		if metrics == nil {
+			continue
+		}
 		// Calculate a score based on:
 		// 1. Success rate (most important)
 		// 2. Experience with this task type
@@ -194,9 +285,13 @@ func (so *StrategyOptimizer) RecommendStrategy(taskType string) string {
 
 		// Boost score if this strategy has been used for this task type
 		taskTypeCount := metrics.TaskTypes[taskType]
-		if taskTypeCount > 0 {
+		total := float64(nonNegativeInt(metrics.SuccessCount)) + float64(nonNegativeInt(metrics.FailureCount))
+		if taskTypeCount > 0 && total > 0 {
 			// More experience = higher confidence in the score
-			experienceBoost := float64(taskTypeCount) / float64(metrics.SuccessCount+metrics.FailureCount)
+			experienceBoost := float64(taskTypeCount) / total
+			if experienceBoost > 1 {
+				experienceBoost = 1
+			}
 			baseScore += experienceBoost * 0.2 // Up to 20% boost
 		}
 
@@ -215,7 +310,10 @@ func (so *StrategyOptimizer) RecommendStrategy(taskType string) string {
 
 	// Sort by score (highest first)
 	sort.Slice(scores, func(i, j int) bool {
-		return scores[i].score > scores[j].score
+		if scores[i].score != scores[j].score {
+			return scores[i].score > scores[j].score
+		}
+		return scores[i].name < scores[j].name
 	})
 
 	return scores[0].name
@@ -228,23 +326,34 @@ func (so *StrategyOptimizer) GetAllMetrics() map[string]*StrategyMetrics {
 
 	result := make(map[string]*StrategyMetrics, len(so.metrics))
 	for k, v := range so.metrics {
-		result[k] = v.clone()
+		if clone := v.clone(); clone != nil {
+			result[k] = clone
+		}
 	}
 	return result
 }
 
 // GetTopStrategies returns deep copies of the top N strategies by success rate.
 func (so *StrategyOptimizer) GetTopStrategies(n int) []*StrategyMetrics {
+	if n <= 0 {
+		return nil
+	}
 	so.mu.RLock()
 	defer so.mu.RUnlock()
 
 	metrics := make([]*StrategyMetrics, 0, len(so.metrics))
 	for _, m := range so.metrics {
-		metrics = append(metrics, m.clone())
+		if clone := m.clone(); clone != nil {
+			metrics = append(metrics, clone)
+		}
 	}
 
 	sort.Slice(metrics, func(i, j int) bool {
-		return metrics[i].SuccessRate() > metrics[j].SuccessRate()
+		left, right := metrics[i].SuccessRate(), metrics[j].SuccessRate()
+		if left != right {
+			return left > right
+		}
+		return metrics[i].StrategyName < metrics[j].StrategyName
 	})
 
 	if n > len(metrics) {
@@ -252,6 +361,146 @@ func (so *StrategyOptimizer) GetTopStrategies(n int) []*StrategyMetrics {
 	}
 
 	return metrics[:n]
+}
+
+func (so *StrategyOptimizer) evictOldest(maxSize int) {
+	if maxSize < 0 {
+		maxSize = 0
+	}
+	if len(so.metrics) <= maxSize {
+		return
+	}
+	type entry struct {
+		name     string
+		lastUsed time.Time
+	}
+	entries := make([]entry, 0, len(so.metrics))
+	for name, metrics := range so.metrics {
+		var lastUsed time.Time
+		if metrics != nil {
+			lastUsed = metrics.LastUsed
+		}
+		entries = append(entries, entry{name: name, lastUsed: lastUsed})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if !entries[i].lastUsed.Equal(entries[j].lastUsed) {
+			return entries[i].lastUsed.Before(entries[j].lastUsed)
+		}
+		return entries[i].name < entries[j].name
+	})
+	for i := 0; i < len(so.metrics)-maxSize; i++ {
+		delete(so.metrics, entries[i].name)
+	}
+}
+
+func normalizeStrategyMetrics(name string, metrics *StrategyMetrics) *StrategyMetrics {
+	if metrics == nil {
+		return nil
+	}
+	normalized := metrics.clone()
+	normalized.StrategyName = name
+	normalized.SuccessCount = nonNegativeInt(normalized.SuccessCount)
+	normalized.FailureCount = nonNegativeInt(normalized.FailureCount)
+	if normalized.TotalTime < 0 {
+		normalized.TotalTime = 0
+	}
+	total := saturatingCountSum(normalized.SuccessCount, normalized.FailureCount)
+	if total > 0 {
+		normalized.AvgDuration = normalized.TotalTime / time.Duration(total)
+	} else {
+		normalized.AvgDuration = 0
+	}
+	taskTypes := make(map[string]int)
+	for taskType, count := range normalized.TaskTypes {
+		canonical, ok := normalizeStrategyLabel(taskType, maxStrategyTaskTypeBytes, true)
+		if !ok || count <= 0 {
+			continue
+		}
+		taskTypes[canonical] = saturatingCountSum(taskTypes[canonical], count)
+	}
+	trimStrategyTaskTypes(taskTypes, maxStrategyTaskTypes)
+	normalized.TaskTypes = taskTypes
+	return normalized
+}
+
+func normalizeStrategyLabel(value string, maxBytes int, blankAsGeneral bool) (string, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" && blankAsGeneral {
+		return defaultStrategyTaskTypeName, true
+	}
+	if !utf8.ValidString(value) || strings.ContainsRune(value, 0) || len(value) > maxBytes {
+		return "", false
+	}
+	return value, true
+}
+
+func trimStrategyTaskTypes(taskTypes map[string]int, maxSize int) {
+	if len(taskTypes) <= maxSize {
+		return
+	}
+	type entry struct {
+		name  string
+		count int
+	}
+	entries := make([]entry, 0, len(taskTypes))
+	for name, count := range taskTypes {
+		entries = append(entries, entry{name: name, count: count})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].count != entries[j].count {
+			return entries[i].count < entries[j].count
+		}
+		return entries[i].name < entries[j].name
+	})
+	for i := 0; i < len(taskTypes)-maxSize; i++ {
+		delete(taskTypes, entries[i].name)
+	}
+}
+
+func nonNegativeInt(value int) int {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
+func saturatingIncrement(value int) int {
+	value = nonNegativeInt(value)
+	maxInt := int(^uint(0) >> 1)
+	if value == maxInt {
+		return maxInt
+	}
+	return value + 1
+}
+
+func saturatingCountSum(left, right int) int {
+	left = nonNegativeInt(left)
+	right = nonNegativeInt(right)
+	maxInt := int(^uint(0) >> 1)
+	if left > maxInt-right {
+		return maxInt
+	}
+	return left + right
+}
+
+func saturatingDurationAdd(current, delta time.Duration) time.Duration {
+	if current < 0 {
+		current = 0
+	}
+	if delta <= 0 {
+		return current
+	}
+	if current > time.Duration(math.MaxInt64)-delta {
+		return time.Duration(math.MaxInt64)
+	}
+	return current + delta
+}
+
+func minInt(left, right int) int {
+	if left < right {
+		return left
+	}
+	return right
 }
 
 // Clear removes all metrics.

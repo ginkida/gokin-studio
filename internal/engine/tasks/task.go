@@ -3,7 +3,9 @@ package tasks
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,7 +13,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ginkida/gokin-studio/internal/engine/fileutil"
 	"github.com/ginkida/gokin-studio/internal/engine/security"
+	"github.com/ginkida/gokin-studio/internal/engine/wsl"
 )
 
 // SafeEnvVars is the whitelist of environment variables passed to task commands.
@@ -118,7 +122,6 @@ func (s Status) String() string {
 // When OutputFile is set, writes go to both the in-memory buffer and a file.
 // The in-memory buffer is capped at maxMemoryOutputBytes; beyond that, only
 // the file contains the full output. String() returns in-memory content.
-// FullString() reads from file if available and in-memory buffer was truncated.
 type safeBuffer struct {
 	mu         sync.Mutex
 	buf        bytes.Buffer
@@ -126,6 +129,7 @@ type safeBuffer struct {
 	filePath   string
 	totalBytes int64
 	truncated  bool
+	fileFailed bool
 }
 
 const maxMemoryOutputBytes = 10 * 1024 * 1024 // 10 MB cap for in-memory output
@@ -135,59 +139,87 @@ func (b *safeBuffer) Write(p []byte) (int, error) {
 	defer b.mu.Unlock()
 
 	// Always write to file if available
+	var writeErr error
 	if b.file != nil {
-		b.file.Write(p)
+		n, err := b.file.Write(p)
+		if err != nil {
+			writeErr = err
+		} else if n != len(p) {
+			writeErr = io.ErrShortWrite
+		}
+		if writeErr != nil {
+			b.fileFailed = true
+		}
 	}
 
 	b.totalBytes += int64(len(p))
 
 	// Write to in-memory buffer only if under cap
 	if !b.truncated && b.buf.Len()+len(p) <= maxMemoryOutputBytes {
-		return b.buf.Write(p)
+		_, err := b.buf.Write(p)
+		return len(p), errors.Join(writeErr, err)
 	}
 
 	if !b.truncated {
 		b.truncated = true
 	}
-	return len(p), nil // Accept write but don't store in memory
+	return len(p), writeErr // Accept write but don't store in memory
 }
 
 func (b *safeBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	return b.stringLocked()
+}
+
+func (b *safeBuffer) stringLocked() string {
 	s := b.buf.String()
 	if b.truncated {
-		s += fmt.Sprintf("\n\n[Output truncated in memory: %d bytes total. Full output in: %s]",
-			b.totalBytes, b.filePath)
+		if b.filePath != "" && !b.fileFailed {
+			s += fmt.Sprintf("\n\n[Output truncated in memory: %d bytes total. Full output in: %s]",
+				b.totalBytes, b.filePath)
+		} else {
+			s += fmt.Sprintf("\n\n[Output truncated in memory: %d bytes total. Full file output is unavailable.]", b.totalBytes)
+		}
 	}
 	return s
+}
+
+func (b *safeBuffer) snapshot() (output, filePath string, totalBytes int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.stringLocked(), b.filePath, b.totalBytes
 }
 
 // SetOutputFile configures file-backed output streaming.
 func (b *safeBuffer) SetOutputFile(path string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0750); err != nil {
-		return err
+	if b.file != nil {
+		return fmt.Errorf("output file already configured")
 	}
-	f, err := os.Create(path)
+	f, actualPath, err := fileutil.CreatePrivateOutputFile(path)
 	if err != nil {
 		return err
 	}
 	b.file = f
-	b.filePath = path
+	b.filePath = actualPath
 	return nil
 }
 
 // Close closes the output file if open.
-func (b *safeBuffer) Close() {
+func (b *safeBuffer) Close() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.file != nil {
-		b.file.Close()
+		err := errors.Join(b.file.Sync(), b.file.Close())
+		if err != nil {
+			b.fileFailed = true
+		}
 		b.file = nil
+		return err
 	}
+	return nil
 }
 
 // FilePath returns the path to the output file, or empty string if none.
@@ -252,7 +284,7 @@ func NewTaskWithArgs(id, program string, args []string, workDir string) *Task {
 		ID:      id,
 		Command: program + " " + fmt.Sprintf("%v", args),
 		Program: program,
-		Args:    args,
+		Args:    append([]string(nil), args...),
 		Status:  StatusPending,
 		WorkDir: workDir,
 		done:    make(chan struct{}),
@@ -261,10 +293,17 @@ func NewTaskWithArgs(id, program string, args []string, workDir string) *Task {
 
 // Start starts the task execution.
 func (t *Task) Start(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	t.mu.Lock()
 	if t.Status != StatusPending {
 		t.mu.Unlock()
 		return fmt.Errorf("task already started")
+	}
+	if !fileutil.SafeFilenameComponent(t.ID) {
+		t.mu.Unlock()
+		return fmt.Errorf("invalid task ID")
 	}
 
 	// Create cancellable context
@@ -298,13 +337,6 @@ func (t *Task) Start(ctx context.Context) error {
 	t.cmd.Stdout = &t.Output
 	t.cmd.Stderr = &t.Output
 
-	// Set up file-backed output streaming for long-running tasks
-	outputDir := filepath.Join(t.WorkDir, ".gokin", "task-output")
-	if err := t.Output.SetOutputFile(filepath.Join(outputDir, t.ID+".log")); err != nil {
-		// Non-fatal: continue without file output
-		_ = err
-	}
-
 	// Use sanitized environment to prevent leaking sensitive env vars
 	if !t.Sandboxed {
 		env, err := security.WorkspaceSafeEnvironment(t.WorkDir)
@@ -316,30 +348,64 @@ func (t *Task) Start(ctx context.Context) error {
 		t.cmd.Env = env
 	}
 
+	// A background task in a WSL project belongs inside the distro, exactly like
+	// a foreground bash command. This MUST come after cmd.Env above: ApplyExec/
+	// ApplyShell own Env as well as Dir, and assigning Env afterwards would drop
+	// the WSLENV overlay — the only channel by which injected variables reach
+	// the distro. It must also precede setProcAttr, which would otherwise
+	// overwrite the console-hiding attributes. Inert for non-WSL directories.
+	if target := wsl.DetectFor(t.WorkDir); target.IsWSL() {
+		inject := security.WorkspaceEnvironmentSnapshot()
+		if t.Program != "" {
+			wsl.ApplyExec(t.cmd, target, append([]string{t.Program}, t.Args...), inject)
+		} else {
+			wsl.ApplyShell(t.cmd, target, t.Command, inject)
+		}
+	}
+
+	// Set up file-backed output only after every fallible command-preparation
+	// step. Otherwise a setup error would leave an open, unreachable log file.
+	outputDir := filepath.Join(t.WorkDir, ".gokin", "task-output")
+	if err := t.Output.SetOutputFile(filepath.Join(outputDir, t.ID+".log")); err != nil {
+		// Non-fatal: the bounded in-memory output remains available.
+		_ = err
+	}
+
 	// Set up process group for proper cleanup of child processes
 	setProcAttr(t.cmd)
+	// exec.CommandContext kills only the direct process by default. Background
+	// tasks may spawn children which inherit the output descriptors, so leaving
+	// those children alive can make Cmd.Wait (and therefore Done) hang long after
+	// the context was cancelled. Route context cancellation through the same
+	// process-group cleanup used by Task.Cancel.
+	cmd := t.cmd
+	t.cmd.Cancel = func() error {
+		return killProcessGroup(cmd)
+	}
 
 	t.Status = StatusRunning
 	t.StartTime = time.Now()
 	t.mu.Unlock()
 
 	// Run in background
-	go t.run()
+	go t.run(execCtx)
 
 	return nil
 }
 
 // run executes the command and updates status.
-func (t *Task) run() {
-	defer t.Output.Close() // Close output file when task finishes
-
+func (t *Task) run(execCtx context.Context) {
 	err := t.cmd.Start()
+	if err != nil {
+		err = errors.Join(err, t.Output.Close())
+	}
 
 	t.mu.Lock()
 	if err != nil {
 		defer t.mu.Unlock()
 		defer t.doneOnce.Do(func() { close(t.done) }) // Guarantees done is closed on any exit path
 
+		contextErr := execCtx.Err()
 		// Release context resources regardless of how the command finished.
 		if t.cancelFunc != nil {
 			t.cancelFunc()
@@ -347,7 +413,9 @@ func (t *Task) run() {
 
 		t.EndTime = time.Now()
 
-		if t.Status == StatusCancelled {
+		if t.Status == StatusCancelled || contextErr != nil {
+			t.Status = StatusCancelled
+			t.ExitCode = -1
 			return
 		}
 
@@ -362,15 +430,18 @@ func (t *Task) run() {
 	t.mu.Unlock()
 
 	if cancelled {
-		killProcessGroup(t.cmd)
+		_ = killProcessGroup(t.cmd)
 	}
 
-	err = t.cmd.Wait()
+	waitErr := t.cmd.Wait()
+	outputErr := t.Output.Close()
+	err = errors.Join(waitErr, outputErr)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	defer t.doneOnce.Do(func() { close(t.done) }) // Guarantees done is closed on any exit path
 
+	contextErr := execCtx.Err()
 	// Release context resources regardless of how the command finished.
 	if t.cancelFunc != nil {
 		t.cancelFunc()
@@ -378,10 +449,15 @@ func (t *Task) run() {
 
 	t.EndTime = time.Now()
 
-	if t.Status == StatusCancelled {
-		if err == nil {
+	// A context can be cancelled without going through Task.Cancel (for
+	// example, when the owning chat or request stops). If cancellation actually
+	// interrupted Wait, report the same terminal state as an explicit stop. A
+	// successful Wait still wins a boundary race with a late context cancel.
+	if t.Status == StatusCancelled || (waitErr != nil && contextErr != nil) {
+		t.Status = StatusCancelled
+		if waitErr == nil {
 			t.ExitCode = 0
-		} else if exitErr, ok := err.(*exec.ExitError); ok {
+		} else if exitErr, ok := waitErr.(*exec.ExitError); ok {
 			t.ExitCode = exitErr.ExitCode()
 		} else {
 			t.ExitCode = -1
@@ -392,7 +468,7 @@ func (t *Task) run() {
 	if err != nil {
 		t.Status = StatusFailed
 		t.Error = err.Error()
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr, ok := waitErr.(*exec.ExitError); ok {
 			t.ExitCode = exitErr.ExitCode()
 		} else {
 			t.ExitCode = -1
@@ -403,12 +479,13 @@ func (t *Task) run() {
 	}
 }
 
-// Cancel cancels the task.
-func (t *Task) Cancel() {
+// Cancel transitions a running task to cancelled. It returns false when
+// another terminal transition already owns the task.
+func (t *Task) Cancel() bool {
 	t.mu.Lock()
 	if t.Status != StatusRunning || t.cancelFunc == nil {
 		t.mu.Unlock()
-		return
+		return false
 	}
 
 	cancel := t.cancelFunc
@@ -423,8 +500,9 @@ func (t *Task) Cancel() {
 
 	if processStarted {
 		// Kill entire process group for proper cleanup once Start() has published cmd.Process.
-		killProcessGroup(cmd)
+		_ = killProcessGroup(cmd)
 	}
+	return true
 }
 
 // Done returns a channel that is closed when the task reaches a terminal state.
@@ -468,6 +546,13 @@ func (t *Task) IsComplete() bool {
 // IsCompleteAndBefore returns true if the task is complete and ended before cutoff.
 // Reads both Status and EndTime atomically under one lock.
 func (t *Task) IsCompleteAndBefore(cutoff time.Time) bool {
+	select {
+	case <-t.done:
+		// A cancelled task becomes terminal before cmd.Wait returns. Requiring
+		// Done prevents cleanup from unlinking a log that is still being written.
+	default:
+		return false
+	}
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return (t.Status == StatusCompleted || t.Status == StatusFailed || t.Status == StatusCancelled) &&
@@ -494,31 +579,36 @@ func (t *Task) Duration() time.Duration {
 
 // Info returns a summary of the task.
 type Info struct {
-	ID        string
-	Command   string
-	Status    string
-	Output    string
-	Error     string
-	ExitCode  int
-	Duration  time.Duration
-	StartTime time.Time
-	EndTime   time.Time
+	ID         string
+	Command    string
+	Status     string
+	Output     string
+	OutputFile string
+	TotalBytes int64
+	Error      string
+	ExitCode   int
+	Duration   time.Duration
+	StartTime  time.Time
+	EndTime    time.Time
 }
 
 // GetInfo returns task information.
 func (t *Task) GetInfo() Info {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
+	output, outputFile, totalBytes := t.Output.snapshot()
 
 	return Info{
-		ID:        t.ID,
-		Command:   t.Command,
-		Status:    t.Status.String(),
-		Output:    t.Output.String(),
-		Error:     t.Error,
-		ExitCode:  t.ExitCode,
-		Duration:  t.durationLocked(),
-		StartTime: t.StartTime,
-		EndTime:   t.EndTime,
+		ID:         t.ID,
+		Command:    t.Command,
+		Status:     t.Status.String(),
+		Output:     output,
+		OutputFile: outputFile,
+		TotalBytes: totalBytes,
+		Error:      t.Error,
+		ExitCode:   t.ExitCode,
+		Duration:   t.durationLocked(),
+		StartTime:  t.StartTime,
+		EndTime:    t.EndTime,
 	}
 }

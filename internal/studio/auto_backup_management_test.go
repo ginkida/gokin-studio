@@ -68,6 +68,15 @@ func TestListAutoBackups_DiscoversAndSorts(t *testing.T) {
 	if err := os.WriteFile(stray, []byte("stray"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// A matching prefix without the accepted archive suffix is not actionable
+	// through Delete/Restore and therefore must not leak into discovery.
+	invalidPrefixed := filepath.Join(autoBackupDir(), "auto-backup-not-an-archive.txt")
+	if err := os.WriteFile(invalidPrefixed, []byte("notes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Nor should a backup-shaped symlink be advertised as a restorable archive.
+	symlink := filepath.Join(autoBackupDir(), "auto-backup-link.tar.gz")
+	symlinkCreated := os.Symlink(stray, symlink) == nil
 	// And a subdirectory — also must be ignored.
 	if err := os.MkdirAll(filepath.Join(autoBackupDir(), "subdir"), 0o755); err != nil {
 		t.Fatal(err)
@@ -80,6 +89,14 @@ func TestListAutoBackups_DiscoversAndSorts(t *testing.T) {
 	}
 	if len(list) != 3 {
 		t.Fatalf("got %d entries, want 3 (valid auto-backups only); list=%+v", len(list), list)
+	}
+	if _, err := os.Stat(invalidPrefixed); err != nil {
+		t.Fatalf("invalid prefixed file was unexpectedly touched: %v", err)
+	}
+	if symlinkCreated {
+		if _, err := os.Lstat(symlink); err != nil {
+			t.Fatalf("backup-shaped symlink was unexpectedly touched: %v", err)
+		}
 	}
 	// Newest first.
 	if !strings.Contains(list[0].Filename, "2025-05-16") {
@@ -288,6 +305,28 @@ func TestRestoreAutoBackup_RejectsCorruptArchive(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "gzip") {
 		t.Errorf("error=%q, want 'gzip' (not-a-gzip-stream)", err.Error())
+	}
+}
+
+func TestRestoreAutoBackup_RejectsFileSwappedWhileOpening(t *testing.T) {
+	_ = withTempHistoryDir(t)
+	full := seedAutoBackupFile(t, "swap", time.Hour, []byte("original"))
+	name := filepath.Base(full)
+	previousOpen := autoBackupOpenFile
+	autoBackupOpenFile = func(path string) (*os.File, error) {
+		if err := os.Remove(path); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(path, []byte("replacement"), 0o600); err != nil {
+			return nil, err
+		}
+		return previousOpen(path)
+	}
+	t.Cleanup(func() { autoBackupOpenFile = previousOpen })
+
+	_, err := NewStudio().RestoreAutoBackup(name)
+	if err == nil || !strings.Contains(err.Error(), "changed while opening") {
+		t.Fatalf("swapped backup error=%v", err)
 	}
 }
 

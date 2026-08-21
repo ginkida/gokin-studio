@@ -226,6 +226,13 @@ func (m *Manager) executeHook(ctx context.Context, hook *Hook, hctx *Context, ti
 	// Execute command
 	cmd := exec.CommandContext(execCtx, "sh", "-c", command)
 	cmd.Dir = hctx.WorkDir
+	// NOT routed into the WSL distro, deliberately — see the entry for this
+	// function in internal/engine/wsl/exec_sites_guard_test.go. ExpandCommand
+	// splices the HOST environment into the script before it gets here, so
+	// running it in a distro would feed a Linux login shell a Windows $PATH
+	// (unquoted, so `C:\Program Files (x86)\…` is a bash syntax error) and an
+	// empty $HOME. Fixing that means expanding distro-side, not adding a call
+	// here. This package is also unreachable from the app today.
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

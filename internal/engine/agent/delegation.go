@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,15 +18,31 @@ type delegationDepthKey struct{}
 
 // WithDelegationDepth returns a context carrying the delegation depth value.
 func WithDelegationDepth(ctx context.Context, depth int) context.Context {
-	return context.WithValue(ctx, delegationDepthKey{}, depth)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, delegationDepthKey{}, normalizeDelegationDepth(depth))
 }
 
 // DelegationDepthFromContext extracts delegation depth from context, returns 0 if not set.
 func DelegationDepthFromContext(ctx context.Context) int {
+	if ctx == nil {
+		return 0
+	}
 	if v, ok := ctx.Value(delegationDepthKey{}).(int); ok {
-		return v
+		return normalizeDelegationDepth(v)
 	}
 	return 0
+}
+
+func normalizeDelegationDepth(depth int) int {
+	if depth < 0 {
+		return 0
+	}
+	if depth > MaxDelegationDepth {
+		return MaxDelegationDepth
+	}
+	return depth
 }
 
 // DelegationStrategy determines when and how an agent should delegate to sub-agents.
@@ -128,7 +146,7 @@ func (d *DelegationStrategy) ApplyThoroughness(t tools.Thoroughness) {
 		d.maxDelegationTurns = 10
 	case tools.ThoroughnessThorough:
 		d.stuckThreshold = 7
-		d.maxDepth = 6
+		d.maxDepth = MaxDelegationDepth
 		d.depthPenalty = 2
 		d.maxDelegationTurns = 20
 	default:
@@ -183,15 +201,23 @@ func (d *DelegationStrategy) SetMessenger(m *AgentMessenger) {
 func (d *DelegationStrategy) SuppressRule(targetType string, duration time.Duration) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	targetType = normalizeDynamicAgentTypeName(targetType)
+	if targetType == "" {
+		return
+	}
 	if d.failedRules == nil {
 		d.failedRules = make(map[string]time.Time)
 	}
 	key := string(d.agentType) + ":" + targetType
+	if duration <= 0 {
+		delete(d.failedRules, key)
+		return
+	}
 	d.failedRules[key] = time.Now().Add(duration)
 }
 
 // isRuleSuppressed checks if a delegation rule is currently suppressed.
-// Caller must hold d.mu (read or write lock).
+// Caller must hold d.mu for writing so expired entries can be reclaimed.
 func (d *DelegationStrategy) isRuleSuppressed(targetType string) bool {
 	if d.failedRules == nil {
 		return false
@@ -202,8 +228,7 @@ func (d *DelegationStrategy) isRuleSuppressed(targetType string) bool {
 		return false
 	}
 	if time.Now().After(expiry) {
-		// Expired — not suppressed. Lazy cleanup skipped to avoid
-		// map write under RLock; entry will be overwritten by SuppressRule.
+		delete(d.failedRules, key)
 		return false
 	}
 	return true
@@ -213,6 +238,9 @@ func (d *DelegationStrategy) isRuleSuppressed(targetType string) bool {
 func (d *DelegationStrategy) SetActiveAgents(count int) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if count < 0 {
+		count = 0
+	}
 	d.activeAgents = count
 }
 
@@ -222,10 +250,28 @@ func (d *DelegationStrategy) AdaptiveMaxTurns(baseTurns int) int {
 	d.mu.RLock()
 	depth := d.currentDepth
 	penalty := d.depthPenalty
+	configuredTurns := d.maxDelegationTurns
 	d.mu.RUnlock()
+	if baseTurns <= 0 {
+		baseTurns = configuredTurns
+	}
+	return adaptiveDelegationMaxTurns(baseTurns, depth, penalty)
+}
+
+func adaptiveDelegationMaxTurns(baseTurns, depth, penalty int) int {
+	if baseTurns <= 0 {
+		baseTurns = 1
+	}
+	if baseTurns > MaxTurnLimit {
+		baseTurns = MaxTurnLimit
+	}
+	if penalty < 0 {
+		penalty = 0
+	}
+	depth = normalizeDelegationDepth(depth)
 	adapted := baseTurns - (depth * penalty)
-	if adapted < 5 {
-		adapted = 5
+	if adapted < 1 {
+		adapted = 1
 	}
 	return adapted
 }
@@ -233,6 +279,9 @@ func (d *DelegationStrategy) AdaptiveMaxTurns(baseTurns int) int {
 // Evaluate checks if delegation should occur based on current state.
 // Uses StrategyOptimizer to prefer agents with higher historical success rates.
 func (d *DelegationStrategy) Evaluate(ctx *DelegationContext) *DelegationDecision {
+	if ctx == nil {
+		return &DelegationDecision{ShouldDelegate: false}
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -241,9 +290,10 @@ func (d *DelegationStrategy) Evaluate(ctx *DelegationContext) *DelegationDecisio
 	if maxDepth <= 0 {
 		maxDepth = MaxDelegationDepth
 	}
-	if ctx.DelegationDepth >= maxDepth {
+	delegationDepth := normalizeDelegationDepth(ctx.DelegationDepth)
+	if delegationDepth >= maxDepth {
 		logging.Debug("delegation depth limit reached",
-			"depth", ctx.DelegationDepth,
+			"depth", delegationDepth,
 			"max", maxDepth)
 		return &DelegationDecision{ShouldDelegate: false}
 	}
@@ -308,10 +358,6 @@ func (d *DelegationStrategy) Evaluate(ctx *DelegationContext) *DelegationDecisio
 		chosen = d.selectBestDelegation(matchingDecisions)
 	}
 
-	// Track the chosen delegation pair
-	pairKey := string(d.agentType) + ":" + chosen.TargetType
-	d.delegationHistory[pairKey]++
-
 	return chosen
 }
 
@@ -352,25 +398,25 @@ func (d *DelegationStrategy) calculateDelegationScore(targetType string) float64
 		}
 
 		// Get historical success rate from delegation metrics
-		historicalRate := d.delegationMetrics.GetSuccessRate(
+		historicalRate := boundedDelegationFloat(d.delegationMetrics.GetSuccessRate(
 			string(d.agentType),
 			targetType,
 			contextType,
-		)
+		), 0, 1, 0.5)
 
 		// Get rule weight
-		weight := d.delegationMetrics.GetRuleWeight(
+		weight := boundedDelegationFloat(d.delegationMetrics.GetRuleWeight(
 			string(d.agentType),
 			targetType,
 			contextType,
-		)
+		), 0.5, 2, 1)
 
 		// Get trend
-		trend := d.delegationMetrics.GetRecentTrend(
+		trend := boundedDelegationFloat(d.delegationMetrics.GetRecentTrend(
 			string(d.agentType),
 			targetType,
 			contextType,
-		)
+		), -1, 1, 0)
 
 		// Combined score: weighted average of base rate and historical rate, plus trend bonus
 		combinedRate := (baseRate*0.4 + historicalRate*0.6) * weight
@@ -399,18 +445,29 @@ func (d *DelegationStrategy) getAgentSuccessRate(agentType string) float64 {
 
 	// Look up by delegation strategy key
 	key := "delegate:" + agentType
-	rate := d.strategyOpt.GetSuccessRate(key)
-	if rate > 0 && rate < 1 {
-		return rate
+	if metrics, ok := d.strategyOpt.GetMetrics(key); ok {
+		return boundedDelegationFloat(metrics.SuccessRate(), 0, 1, 0.5)
 	}
 
 	// Also try agent type directly
-	rate = d.strategyOpt.GetSuccessRate(agentType)
-	if rate > 0 && rate < 1 {
-		return rate
+	if metrics, ok := d.strategyOpt.GetMetrics(agentType); ok {
+		return boundedDelegationFloat(metrics.SuccessRate(), 0, 1, 0.5)
 	}
 
 	return 0.5 // Default neutral
+}
+
+func boundedDelegationFloat(value, minimum, maximum, fallback float64) float64 {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return fallback
+	}
+	if value < minimum {
+		return minimum
+	}
+	if value > maximum {
+		return maximum
+	}
+	return value
 }
 
 // TrackProgress tracks progress to detect stuck agents.
@@ -418,6 +475,11 @@ func (d *DelegationStrategy) TrackProgress(progress string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.turnCount++
+	if d.turnCount == 1 {
+		d.lastProgress = progress
+		d.sameProgressCount = 0
+		return
+	}
 
 	if progress == d.lastProgress {
 		d.sameProgressCount++
@@ -445,7 +507,7 @@ func (d *DelegationStrategy) GetStuckCount() int {
 func (d *DelegationStrategy) SetDepth(depth int) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.currentDepth = depth
+	d.currentDepth = normalizeDelegationDepth(depth)
 }
 
 // GetDepth returns the current delegation depth.
@@ -457,15 +519,30 @@ func (d *DelegationStrategy) GetDepth() int {
 
 // ExecuteDelegation sends a delegation request to another agent.
 func (d *DelegationStrategy) ExecuteDelegation(ctx context.Context, decision *DelegationDecision) (string, error) {
+	if decision == nil {
+		return "", fmt.Errorf("delegation decision must not be nil")
+	}
+	if !decision.ShouldDelegate {
+		return "", fmt.Errorf("delegation decision does not authorize delegation")
+	}
 	d.mu.RLock()
 	messenger := d.messenger
 	agentType := d.agentType
 	depth := d.currentDepth
-	delegationTurns := d.maxDelegationTurns
+	delegationTurns := adaptiveDelegationMaxTurns(d.maxDelegationTurns, depth, d.depthPenalty)
 	d.mu.RUnlock()
 
 	if messenger == nil {
-		return "", nil
+		return "", fmt.Errorf("delegation messenger is not configured")
+	}
+	if ctx == nil {
+		ctx = messenger.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 
 	logging.Info("delegating to sub-agent",
@@ -483,6 +560,13 @@ func (d *DelegationStrategy) ExecuteDelegation(ctx context.Context, decision *De
 	if err != nil {
 		return "", err
 	}
+	d.mu.Lock()
+	if d.delegationHistory == nil {
+		d.delegationHistory = make(map[string]int)
+	}
+	pairKey := string(agentType) + ":" + normalizeDynamicAgentTypeName(decision.TargetType)
+	d.delegationHistory[pairKey]++
+	d.mu.Unlock()
 
 	// Wait for response with timeout, respecting parent deadline
 	timeout := 3 * time.Minute

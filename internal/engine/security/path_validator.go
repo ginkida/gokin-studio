@@ -2,6 +2,7 @@ package security
 
 import (
 	"fmt"
+	"github.com/ginkida/gokin-studio/internal/engine/wsl"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -12,6 +13,12 @@ import (
 type PathValidator struct {
 	allowedDirs   []string
 	allowSymlinks bool
+	// fromPrefix/toPrefix translate a Linux path the model read out of its own
+	// tool output back to the Windows spelling the file tools need. Empty
+	// fromPrefix disables translation entirely, which is the default and the
+	// only state reachable off Windows.
+	fromPrefix string
+	toPrefix   string
 }
 
 // NewPathValidator creates a new path validator.
@@ -21,10 +28,68 @@ func NewPathValidator(allowedDirs []string, allowSymlinks bool) *PathValidator {
 	for i, dir := range allowedDirs {
 		normalized[i] = filepath.Clean(dir)
 	}
-	return &PathValidator{
+	validator := &PathValidator{
 		allowedDirs:   normalized,
 		allowSymlinks: allowSymlinks,
 	}
+	// Once commands run inside a distro, every compiler error, stack trace and
+	// `git status` line the model reads names /home/me/... while every file
+	// tool still takes the UNC spelling. Translating here covers all 16 tools
+	// that share this validator instead of wiring each one.
+	//
+	// wsl.Available() is a constant false off Windows, so this costs one
+	// boolean there and the validator is byte-identical to before.
+	if wsl.Available() {
+		if from, to, ok := WSLPathTranslation(allowedDirs); ok {
+			validator.fromPrefix, validator.toPrefix = from, to
+		}
+	}
+	return validator
+}
+
+// SetPathTranslation configures the Linux-to-Windows rewrite explicitly. Tests
+// use it to exercise the Windows behaviour on any platform.
+func (v *PathValidator) SetPathTranslation(fromPrefix, toPrefix string) {
+	v.fromPrefix, v.toPrefix = fromPrefix, toPrefix
+}
+
+// WSLPathTranslation derives the rewrite from the allowed directories, which
+// already carry the target. The first directory that parses as a WSL UNC path
+// wins; its Linux form is what the model will see in tool output.
+func WSLPathTranslation(allowedDirs []string) (string, string, bool) {
+	for _, dir := range allowedDirs {
+		if location, ok := wsl.ParseWindowsPath(dir); ok {
+			return location.LinuxPath, dir, true
+		}
+	}
+	return "", "", false
+}
+
+// TranslatePrefixPath rewrites p from one prefix to another, matching only on a
+// path-segment boundary so /home/me/api2 is never treated as living under
+// /home/me/api.
+func TranslatePrefixPath(p, fromPrefix, toPrefix string) (string, bool) {
+	if fromPrefix == "" || p == "" || !strings.HasPrefix(p, "/") {
+		return p, false
+	}
+	if p == fromPrefix {
+		return toPrefix, true
+	}
+	if !strings.HasPrefix(p, fromPrefix) {
+		return p, false
+	}
+	rest := p[len(fromPrefix):]
+	// A prefix of "/" — a project registered at the distro root — already ends
+	// in the separator, so the boundary test below would reject every path.
+	if fromPrefix == "/" {
+		return filepath.Join(toPrefix, filepath.FromSlash(rest)), true
+	}
+	// A boundary is required: without it "/home/me/api" would also match
+	// "/home/me/apiary".
+	if !strings.HasPrefix(rest, "/") {
+		return p, false
+	}
+	return filepath.Join(toPrefix, filepath.FromSlash(strings.TrimPrefix(rest, "/"))), true
 }
 
 // Validate validates that a path is safe and within allowed directories.
@@ -38,6 +103,11 @@ func (v *PathValidator) Validate(path string) (string, error) {
 	if strings.Contains(path, "\x00") {
 		return "", fmt.Errorf("null byte in path")
 	}
+
+	// A Linux path the model copied out of its own tool output becomes the
+	// Windows spelling the filesystem needs. Inert when translation is off,
+	// which is always the case off Windows.
+	path, _ = TranslatePrefixPath(path, v.fromPrefix, v.toPrefix)
 
 	// Clean the path
 	cleanPath := filepath.Clean(path)
@@ -76,6 +146,12 @@ func (v *PathValidator) Validate(path string) (string, error) {
 			} else {
 				resolvedPath = absPath
 			}
+		} else if tolerateUnresolvedPath(absPath) {
+			// The unresolved path is used as-is, so the containment check below
+			// is purely lexical for it. That is only safe because the scan
+			// above proved no component is a link of any kind — see
+			// tolerateUnresolvedPath.
+			resolvedPath = absPath
 		} else {
 			return "", fmt.Errorf("failed to resolve symlinks: %w", err)
 		}
@@ -168,42 +244,103 @@ func (v *PathValidator) isPathWithin(target, base string) bool {
 }
 
 // checkSymlink checks if any component of the path is a symlink.
-func (v *PathValidator) checkSymlink(path string) error {
-	// Check each path component
-	// Handle cross-platform paths
-	sep := string(filepath.Separator)
-	components := strings.Split(filepath.Clean(path), sep)
-
-	current := ""
-	if filepath.IsAbs(path) {
-		if runtime.GOOS == "windows" {
-			current = filepath.VolumeName(path) + sep
-		} else {
-			current = sep
-		}
+// tolerateUnresolvedPath reports whether a non-ENOENT EvalSymlinks failure is
+// expected rather than suspicious, in which case the caller proceeds with the
+// UNRESOLVED path and containment becomes a lexical check.
+//
+// Being WSL is not enough to make that safe. Go maps only
+// IO_REPARSE_TAG_SYMLINK to ModeSymlink; a Linux symlink over the 9P share
+// arrives as IO_REPARSE_TAG_LX_SYMLINK, lands in the default arm of
+// os.fileStat.mode and becomes ModeIrregular, and since it is a name surrogate
+// Go also withholds ModeDir. That is EXACTLY the shape that makes EvalSymlinks
+// return ENOTDIR. So the failure this hatch exists for and a symlink escape are
+// the same error value, and tolerating on the error alone would let
+// `proj\escape -> /` resolve to \\wsl.localhost\Ubuntu\proj\escape\etc\shadow and
+// pass a lexical containment check.
+//
+// The two are distinguishable one level down: an ordinary directory has no
+// reparse point on any component, a link has one. Scan for that and fail closed
+// when anything is found, or when the scan itself cannot answer.
+func tolerateUnresolvedPath(absPath string) bool {
+	if !wsl.IsWSLPath(absPath) {
+		return false
 	}
+	scan, err := scanPathLinks(absPath)
+	return unresolvedPathIsTolerable(scan, err)
+}
 
-	for _, comp := range components {
-		if comp == "" {
-			continue
-		}
-		current = filepath.Join(current, comp)
+// unresolvedPathIsTolerable is the decision itself, split out because
+// wsl.IsWSLPath is false for every path that exists on the machine this code is
+// developed on, so the branch above cannot otherwise be exercised. Fail closed
+// on a scan error: not knowing is not the same as knowing there is no link.
+func unresolvedPathIsTolerable(scan linkScan, scanErr error) bool {
+	return scanErr == nil && !scan.found()
+}
 
+// linkScan is what an upward walk saw. reparse covers the non-symlink reparse
+// points Go cannot classify — WSL's LX symlinks, mount points, junctions.
+type linkScan struct {
+	symlink string
+	reparse string
+}
+
+func (s linkScan) found() bool { return s.symlink != "" || s.reparse != "" }
+
+// scanPathLinks walks a path upward with filepath.Dir instead of splitting on
+// the separator and rejoining. Splitting needs the volume ("C:", "\\\\host\\share")
+// peeled off first, and the previous implementation did not do that: it
+// prepended the volume and then joined the volume's own segments back on, so on
+// Windows every Lstat hit a path like \\host\share\host\share\..., got ENOENT
+// and was skipped — allowSymlinks=false was silently unenforced there. Dir stops
+// at the volume root on its own, on every platform, with no such arithmetic.
+//
+// A component that does not exist yet is not an error: files are created
+// through this validator too.
+func scanPathLinks(path string) (linkScan, error) {
+	var scan linkScan
+	for current := filepath.Clean(path); ; {
 		info, err := os.Lstat(current)
-		if err != nil {
-			// Path doesn't exist yet, that's ok for new files
-			if os.IsNotExist(err) {
-				continue
+		switch {
+		case err != nil && !os.IsNotExist(err):
+			return scan, err
+		case err != nil:
+			// missing component; keep walking toward the root
+		case info.Mode()&os.ModeSymlink != 0:
+			if scan.symlink == "" {
+				scan.symlink = current
 			}
-			return err
+		case info.Mode()&os.ModeIrregular != 0:
+			if scan.reparse == "" {
+				scan.reparse = current
+			}
 		}
 
-		// Check if it's a symlink
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("symlinks not allowed: %s", current)
+		parent := filepath.Dir(current)
+		if parent == current {
+			// Reached the root ("/", "C:\\", "\\\\host\\share\\"); Dir is a fixed
+			// point from here.
+			return scan, nil
 		}
+		current = parent
 	}
+}
 
+func (v *PathValidator) checkSymlink(path string) error {
+	scan, err := scanPathLinks(path)
+	if err != nil {
+		return err
+	}
+	if scan.symlink != "" {
+		return fmt.Errorf("symlinks not allowed: %s", scan.symlink)
+	}
+	// A reparse point Go could not classify is only treated as a link on a WSL
+	// path, where it is how a Linux symlink actually presents. Applying it
+	// everywhere would start rejecting Windows junctions and OneDrive
+	// placeholders that this validator has always accepted, and every non-WSL
+	// project must stay byte-identical.
+	if scan.reparse != "" && wsl.IsWSLPath(path) {
+		return fmt.Errorf("symlinks not allowed: %s", scan.reparse)
+	}
 	return nil
 }
 

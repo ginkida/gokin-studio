@@ -14,6 +14,7 @@ import { formatProviderModelLabel, getProviderAccountURL } from '../../lib/provi
 import { formatContextWindow } from '../../lib/modelCapabilities'
 import { useProjectStore, ProjectInfo } from '../../stores/projectStore'
 import { useConfirmDialog } from '../common/AppDialog'
+import { ONBOARDING_DISMISSED_KEY } from '../../lib/onboarding'
 
 // Provider options shown in step 1. Order matters — first one is the default
 // recommended for new users (GLM has the lowest barrier to entry since users
@@ -27,8 +28,6 @@ const PROVIDER_FALLBACK_MODELS: Record<string, string> = {
   glm: 'glm-5.2',
   kimi: 'k3',
 }
-
-const ONBOARDING_DISMISSED_KEY = 'gokin:onboarding-dismissed'
 
 const STARTER_PROMPTS = [
   {
@@ -675,16 +674,4 @@ export function OnboardingWizard({ onComplete, onSkip }: Props) {
     {confirmationDialog}
     </>
   )
-}
-
-// shouldShowOnboarding returns true if no projects are configured AND the
-// user hasn't dismissed the wizard before. Pure function — call from the
-// caller's useEffect to decide whether to mount the wizard.
-export function shouldShowOnboarding(projectCount: number): boolean {
-  if (projectCount > 0) return false
-  try {
-    return localStorage.getItem(ONBOARDING_DISMISSED_KEY) !== '1'
-  } catch {
-    return true // when localStorage is blocked, default to showing — gentlest for fresh installs
-  }
 }
