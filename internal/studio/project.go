@@ -3208,6 +3208,22 @@ func compactHistory(history []*genai.Content, maxTokens int) []*genai.Content {
 	if len(history) == 0 {
 		return history
 	}
+	// A non-positive window means "unknown", not "a budget of zero". Read as a
+	// budget it makes the fits-already check below unsatisfiable, so the trim
+	// loop runs to its floor and drops every middle exchange on every turn —
+	// silently deleting the user's conversation while the request still goes
+	// out. emergencyCompactHistory already returns the history untouched for
+	// this input; the two entry points must not disagree. An over-long request
+	// surfaces as a provider error the emergency path can recover from, whereas
+	// silently discarded history is unrecoverable.
+	//
+	// Unreachable today: every provider/model pair whose window resolves to 0
+	// is refused by validateStudioProviderModelRuntime before a turn starts.
+	// This keeps it that way if a new call site or a validation change ever
+	// lets one through.
+	if maxTokens <= 0 {
+		return history
+	}
 
 	budget := maxTokens * 3 / 4 // 75% of context
 	charBudget := budget * 4    // ~4 chars per token
