@@ -27,6 +27,7 @@ import { composeDictationDraft } from '../../lib/dictation'
 import type { PendingQuickEntryComposerAction } from '../../lib/quickEntry'
 import { ProjectFolderRecovery } from '../project/ProjectFolderRecovery'
 import { scrollIntoViewWithMotion } from '../../lib/motion'
+import { estimateTokens, estimateTokensFromBytes, utf8Length } from '../../lib/tokenEstimate'
 import { nextTranscriptMode, parseTranscriptMode, transcriptModeLabel, TRANSCRIPT_MODE_OPTIONS, type TranscriptMode } from '../../lib/transcriptMode'
 import { isInlineArtifactPath, isPreviewableFilePath, normalizeMarkdownDirectoryPath, normalizeMarkdownProjectPath } from '../../lib/previewFiles'
 import { WELCOME_METADATA_TIMEOUT_MS, welcomeMetadataReady } from '../../lib/welcomeLayout'
@@ -3763,20 +3764,26 @@ function ChatPanelBody({
   })()
 
   // Prefer real token counts from the provider (input_tokens from the most recent
-  // LLM round) over the char/4 estimate. This is what the model actually saw in
+  // LLM round) over the byte-based estimate. This is what the model actually saw in
   // its context window — NOT the per-turn total (that'd double-count history
   // across multiple tool-use rounds).
   const contextWindow = activeProject.contextWindow || 128000
   const providerInputTokens = (liveUsage?.lastInputTokens ?? 0) || (lastTurnUsage?.lastInputTokens ?? 0)
+  // Byte total of the settled transcript. Kept in its own memo because a
+  // streaming delta changes streamingText on every chunk, and rescanning the
+  // whole history per chunk would be O(transcript) work many times a second.
+  const historyBytes = useMemo(() => {
+    let bytes = 0
+    for (const m of messages) {
+      bytes += utf8Length(m.content || '')
+    }
+    return bytes
+  }, [messages])
   const estimatedTokens = useMemo(() => {
     if (providerInputTokens > 0) return providerInputTokens
-    // Pre-first-response fallback: estimate from visible history chars.
-    let chars = streamingText.length
-    for (const m of messages) {
-      chars += (m.content || '').length
-    }
-    return Math.round(chars / 4)
-  }, [messages, streamingText, providerInputTokens])
+    // Pre-first-response fallback: estimate from the visible history.
+    return estimateTokensFromBytes(historyBytes + utf8Length(streamingText))
+  }, [historyBytes, streamingText, providerInputTokens])
   const usingProviderTokens = providerInputTokens > 0
   const contextPct = Math.min(100, (estimatedTokens / contextWindow) * 100)
   const showContextWarning = contextPct > 75
@@ -4275,7 +4282,7 @@ function ChatPanelBody({
               title={
                 usingProviderTokens
                   ? `Context: ${estimatedTokens.toLocaleString()} / ${contextWindow.toLocaleString()} tokens (${contextPct.toFixed(0)}%) — reported by provider`
-                  : `Context: ~${estimatedTokens.toLocaleString()} / ${contextWindow.toLocaleString()} tokens (${contextPct.toFixed(0)}%) — estimated (chars÷4), real count appears after first response`
+                  : `Context: ~${estimatedTokens.toLocaleString()} / ${contextWindow.toLocaleString()} tokens (${contextPct.toFixed(0)}%) — estimated (UTF-8 bytes÷4), real count appears after first response`
               }
             >
               {usingProviderTokens ? '' : '~'}
@@ -4311,16 +4318,16 @@ function ChatPanelBody({
               </span>
               {(() => {
                 // Live output-so-far uses per-turn total (accumulated across
-                // every LLM round in this turn), falling back to char/4 of the
-                // streaming buffer before the first round finishes reporting.
+                // every LLM round in this turn), falling back to an estimate
+                // over the streaming buffer before the first round reports.
                 const realOut = liveUsage?.totalOutputTokens ?? 0
-                const streamEst = Math.round(streamingText.length / 4)
+                const streamEst = estimateTokens(streamingText)
                 const outTok = realOut > 0 ? realOut : (streamEst > 50 ? streamEst : 0)
                 if (outTok === 0) return null
                 return (
                   <span
                     className="chat-elapsed chat-live-tokens"
-                    title={realOut > 0 ? 'output tokens reported by provider (this turn total)' : 'output tokens estimated (chars÷4)'}
+                    title={realOut > 0 ? 'output tokens reported by provider (this turn total)' : 'output tokens estimated (UTF-8 bytes÷4)'}
                   >
                     {realOut > 0 ? '' : '~'}{formatTokens(outTok)} out
                   </span>
@@ -7523,7 +7530,7 @@ function ChatPanelBody({
               if (input.length === 0) {
                 return <span className="chat-char-count"></span>
               }
-              const tokens = Math.ceil(input.length / 4)
+              const tokens = estimateTokens(input)
               const cost = inputRateUSDPerMTok > 0 ? (tokens / 1_000_000) * inputRateUSDPerMTok : 0
               return (
                 <span className="chat-char-count">
@@ -9780,8 +9787,8 @@ function MessageBubbleInner({ message, projectID, sessionID, onRerun, onRetryErr
                 )}
               </>
             ) : (!isUser && message.content && message.content.length > 200 && (
-              <span className="msg-duration" title={`≈${Math.round(message.content.length / 4).toLocaleString()} tokens (estimated from chars÷4; provider didn't report usage)`}>
-                ≈{formatTokens(Math.round(message.content.length / 4))} tok
+              <span className="msg-duration" title={`≈${estimateTokens(message.content).toLocaleString()} tokens (estimated from UTF-8 bytes÷4; provider didn't report usage)`}>
+                ≈{formatTokens(estimateTokens(message.content))} tok
               </span>
             ))}
             {message.timestamp > 0 && (
