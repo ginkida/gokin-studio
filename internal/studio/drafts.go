@@ -46,6 +46,35 @@ func truncateUTF8(s string, maxBytes int) string {
 	return s[:cut]
 }
 
+// DisplayNameMaxRunes bounds user-visible names — projects and chat sessions.
+// It is counted in CHARACTERS because that is the unit the composer inputs
+// enforce (maxLength={60}, which the browser applies to UTF-16 code units, not
+// bytes). Bounding the same field in bytes on this side let the UI accept a
+// name the backend then halved: Cyrillic is 2 bytes per character and CJK 3, so
+// a 60-character Russian project name came back cut to 30 characters, mid-word,
+// with nothing to indicate it had happened.
+const DisplayNameMaxRunes = 60
+
+// truncateRunes cuts s to at most maxRunes characters. Like truncateUTF8 it
+// never splits a multibyte rune; unlike it, the limit is expressed in the same
+// unit the user and the UI see. Use it for anything with a visible character
+// budget, and keep truncateUTF8 for genuinely storage-bounded payloads (system
+// prompts, log lines, tool answers) where the byte ceiling is the real
+// constraint.
+func truncateRunes(s string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	count := 0
+	for i := range s {
+		if count == maxRunes {
+			return s[:i]
+		}
+		count++
+	}
+	return s
+}
+
 // draftPath returns the on-disk path for a given (project, session) pair.
 // Sanitises the IDs against directory traversal: AddProject + CreateChatSession
 // only generate alphanumeric IDs, but we sanitise anyway so a future change

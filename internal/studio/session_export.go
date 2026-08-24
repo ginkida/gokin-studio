@@ -146,7 +146,7 @@ func (s *Studio) ImportSessionJSON(projectID, jsonBlob string) (*ChatSessionInfo
 		name = name + " (imported)"
 	}
 	if len(name) > 60 {
-		name = truncateUTF8(name, 60)
+		name = truncateRunes(name, DisplayNameMaxRunes)
 	}
 
 	// Generate a fresh session ID — never collide with the source's.

@@ -257,7 +257,7 @@ func LoadConfig() *StudioConfig {
 	// empty or removed providers get the current default.
 	for i := range cfg.Projects {
 		p := &cfg.Projects[i]
-		p.Name = truncateUTF8(strings.TrimSpace(p.Name), 60)
+		p.Name = truncateRunes(strings.TrimSpace(p.Name), DisplayNameMaxRunes)
 		p.Directory = strings.TrimSpace(p.Directory)
 		p.SystemPrompt = truncateUTF8(p.SystemPrompt, 64<<10)
 		if p.Temperature < 0 || p.Temperature > 2 || math.IsNaN(float64(p.Temperature)) || math.IsInf(float64(p.Temperature), 0) {

@@ -31,8 +31,11 @@ func TestProjectName_RuneSafeTruncationPersistsValidUTF8(t *testing.T) {
 	if !utf8.ValidString(info.Name) {
 		t.Errorf("AddProject persisted invalid UTF-8 name: %q", info.Name)
 	}
-	if len(info.Name) > 60 {
-		t.Errorf("name not capped to 60 bytes: got %d", len(info.Name))
+	// The cap moved from bytes to characters so it matches the maxLength={60}
+	// the name inputs enforce; the rune-safety property this test exists for is
+	// unchanged, and a rune cap cannot split a rune by construction.
+	if n := utf8.RuneCountInString(info.Name); n > DisplayNameMaxRunes {
+		t.Errorf("name not capped to %d characters: got %d", DisplayNameMaxRunes, n)
 	}
 
 	// The raw config.yaml must NOT contain a !!binary node (that's the symptom
@@ -88,12 +91,20 @@ func TestRenameProject_RuneSafeTruncation(t *testing.T) {
 // TestImportProjectJSON_RuneSafeTruncation covers the attacker-supplied-name
 // import surface (project_export.go / session_export.go).
 func TestImportSession_RuneSafeName(t *testing.T) {
-	// A rune-crossing name truncated by the import path must stay valid UTF-8.
-	got := truncateUTF8(crossByte60Name(), 60)
-	if !utf8.ValidString(got) {
-		t.Errorf("truncateUTF8 produced invalid UTF-8: %q", got)
-	}
 	if utf8.ValidString(crossByte60Name()[:60]) {
 		t.Skip("test premise invalid: byte slice unexpectedly valid at this boundary")
+	}
+	// The import paths cap display names by character now, so assert the helper
+	// they actually call.
+	got := truncateRunes(crossByte60Name(), DisplayNameMaxRunes)
+	if !utf8.ValidString(got) {
+		t.Errorf("truncateRunes produced invalid UTF-8: %q", got)
+	}
+	if n := utf8.RuneCountInString(got); n > DisplayNameMaxRunes {
+		t.Errorf("truncateRunes returned %d characters, want at most %d", n, DisplayNameMaxRunes)
+	}
+	// truncateUTF8 still guards byte-bounded payloads; keep its rune safety pinned.
+	if !utf8.ValidString(truncateUTF8(crossByte60Name(), 60)) {
+		t.Error("truncateUTF8 produced invalid UTF-8")
 	}
 }

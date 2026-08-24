@@ -163,7 +163,7 @@ func (s *Studio) ImportProjectJSON(jsonBlob, directory string) (*ProjectInfo, er
 		name = name + " (imported)"
 	}
 	if len(name) > 60 {
-		name = truncateUTF8(name, 60)
+		name = truncateRunes(name, DisplayNameMaxRunes)
 	}
 
 	// Reuse AddProject for the heavy lifting (id gen, default-session

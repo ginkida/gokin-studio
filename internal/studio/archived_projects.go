@@ -63,7 +63,7 @@ func loadArchivedProjectsRaw() (map[string]ArchivedProjectRecord, error) {
 		if record.Project.ID == "" || record.Project.Directory == "" || record.ArchivedAt <= 0 {
 			continue
 		}
-		record.Project.Name = truncateUTF8(record.Project.Name, 60)
+		record.Project.Name = truncateRunes(record.Project.Name, DisplayNameMaxRunes)
 		if record.Project.Name == "" {
 			record.Project.Name = filepath.Base(record.Project.Directory)
 		}
