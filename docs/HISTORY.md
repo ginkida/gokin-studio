@@ -7,6 +7,57 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## Release v2.1.2 (2026-08-24)
+
+Two user-reported bugs. The first made the Kimi provider unusable.
+
+### Kimi projects asked for a Gemini API key
+
+Selecting Kimi and sending a message failed with:
+
+```
+init client (kimi/k3): Gemini API key required.
+Get your free API key at: https://aistudio.google.com/apikey
+```
+
+`initClient` published the chosen provider to `cfg.API.ActiveProvider`, but the
+client factory resolves the provider from `cfg.Model.Provider`, falling back to
+`cfg.API.Backend` — it never reads `ActiveProvider`. Both of those were empty, so
+the factory treated the provider as unknown and fell through to
+`autoDetectClient`, which guesses from the model name and returns `"gemini"` when
+no prefix matches. Kimi's registered prefixes are `kimi` and `moonshot`, and the
+current flagship ids are **`k3`** and **`k3-256k`** — no vendor name in them at
+all. GLM was unaffected only by coincidence: `glm-5.2` happens to match the
+`glm` prefix. `kimi-for-coding*` worked for the same accidental reason.
+
+The user's explicit provider choice is now passed where the factory actually
+reads it (`cfg.Model.Provider`), at both construction sites — the chat client and
+the scheduled-task client. Name-based detection is no longer load-bearing for
+studio. As defense in depth for engine-level callers, `k3` joins Kimi's
+`ModelPrefixes` so detection also resolves the current ids.
+
+`TestInitClientRoutesEveryCatalogModelToItsOwnProvider` walks the whole product
+catalog and asserts each model reaches its own provider, using the missing-key
+error to make the routing observable. That is the test that would have caught
+this the moment `k3` entered the catalog, and it fails on exactly `k3` and
+`k3-256k` when the fix is reverted.
+
+### Composer char/token/cost readout jittered while typing
+
+`.input-bar-meta` shrink-wrapped its content inside a `space-between` footer, so
+it sat flush right and the counter grew *leftward* out of the send hint. Because
+the run is left-aligned in an auto-width box whose right edge is pinned, every
+keystroke that changed the string length shifted all of its glyphs — the row
+visibly jumped on each character, and popped in from zero width on the first one.
+
+The row now claims the remaining footer width and separates its two children, so
+both edges are pinned: the counter is anchored left and grows into empty space,
+the send hint stays flush right, and nothing moves while typing. Digits use
+`tabular-nums` so 1 → 2 → 3 does not resize the run either. `composerMeta.test.ts`
+pins the contract the same way the existing welcome-layout test does.
+
+---
+
 ## Release v2.1.1 (2026-08-21)
 
 Patch release. Fixes a file-substitution check that was weaker on Linux than on

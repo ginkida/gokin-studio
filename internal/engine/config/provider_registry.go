@@ -128,7 +128,10 @@ var Providers = []ProviderDef{
 		UsesLegacyKey: true,
 		GetKey:        func(api *APIConfig) string { return api.KimiKey },
 		SetKey:        func(api *APIConfig, key string) { api.KimiKey = key },
-		ModelPrefixes: []string{"kimi", "moonshot"},
+		// "k3" covers the current flagship ids (k3, k3-256k), which carry no
+		// vendor name at all. Without it DetectProviderFromModel falls through
+		// to its Gemini default.
+		ModelPrefixes: []string{"kimi", "moonshot", "k3"},
 		SetupKeyURL:   "https://platform.kimi.com",
 		KeyValidation: KeyValidationDef{
 			URL:             "https://api.kimi.com/coding/v1/models",

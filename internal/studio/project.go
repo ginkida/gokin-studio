@@ -797,6 +797,15 @@ func (p *Project) initClient(settings Settings) error {
 	}
 
 	cfg := &config.Config{}
+	// Both fields, deliberately. The client factory resolves the provider from
+	// cfg.Model.Provider (falling back to cfg.API.Backend) and never reads
+	// ActiveProvider, so setting ActiveProvider alone left the factory with an
+	// empty provider and sent it to autoDetectClient, which guesses from the
+	// model name and defaults to Gemini when nothing matches. That is how a
+	// Kimi project asked for a Gemini API key: "k3" matches neither the "kimi"
+	// nor the "moonshot" prefix. The user already picked a provider here — it
+	// must be passed explicitly rather than re-derived from the model string.
+	cfg.Model.Provider = provider
 	cfg.API.ActiveProvider = provider
 	cfg.Model.Name = model
 	cfg.Model.Temperature = p.Temperature
@@ -955,6 +964,8 @@ func (p *Project) newExecutionClient(
 	}
 
 	cfg := &config.Config{}
+	// See initClient: the factory reads Model.Provider, not API.ActiveProvider.
+	cfg.Model.Provider = provider
 	cfg.API.ActiveProvider = provider
 	cfg.Model.Name = model
 	cfg.Model.Temperature = temperature

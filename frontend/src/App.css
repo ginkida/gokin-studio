@@ -6347,8 +6347,27 @@
   font-size: 8.5px;
 }
 .composer-spinner { color: var(--accent); flex-shrink: 0; }
-.input-bar-meta { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.input-bar-meta .chat-char-count { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* The char/token/cost readout changes length on every keystroke. While this
+   row shrink-wrapped its content it sat flush right, so the counter grew
+   LEFTWARD out of the send hint and every character re-laid out the whole
+   string — the row visibly jittered as you typed. Taking the remaining footer
+   width instead pins both edges: the counter is anchored left and grows into
+   empty space, the hint stays flush right, and no glyph moves while typing. */
+.input-bar-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+}
+.input-bar-meta .chat-char-count {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* Equal-width digits, so 1→2→3 does not resize the run either. */
+  font-variant-numeric: tabular-nums;
+}
 
 .input-bar-chip {
   display: inline-flex;

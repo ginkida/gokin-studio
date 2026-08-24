@@ -4,7 +4,7 @@ Desktop IDE for running LLM coding agents against multiple project directories a
 
 Built with [Wails v2](https://wails.io) — Go backend + React/TypeScript frontend.
 
-**Status:** v2.1.1 · GLM/Kimi-only desktop runtime.
+**Status:** v2.1.2 · GLM/Kimi-only desktop runtime.
 
 The current Claude Desktop/Cowork comparison, including the deliberate
 local-vs-cloud boundary, is tracked in [docs/CLAUDE_DESKTOP_PARITY.md](docs/CLAUDE_DESKTOP_PARITY.md).
