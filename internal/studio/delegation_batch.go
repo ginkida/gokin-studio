@@ -344,8 +344,10 @@ func (s *Studio) preflightDelegationBatch(fromProjectID string, targets []Delega
 	}
 	s.mu.RUnlock()
 
+	// Read outside the s.mu region above: its read locks are not reentrant.
+	batchDefaults := s.settingsSnapshot()
 	for _, project := range resolved {
-		if err := delegationBudgetAllows(project); err != nil {
+		if err := delegationBudgetAllows(project, batchDefaults); err != nil {
 			return err
 		}
 	}

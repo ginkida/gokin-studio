@@ -75,6 +75,12 @@ func (s *Studio) StartSideQuestion(projectID, sessionID, requestID, question str
 		return err
 	}
 	if enforce && budget > 0 {
+		// An unpriced model contributes $0, so the comparison below could never
+		// trip and the cap would silently do nothing. Same refusal as the main
+		// agent loop.
+		if !hasPricing(provider, model) {
+			return fmt.Errorf("%s", unenforceableBudgetMessage(provider, model, budget))
+		}
 		spent := p.totalCostUSD()
 		if spent >= budget {
 			return fmt.Errorf("budget reached: spent $%.4f of $%.2f limit", spent, budget)

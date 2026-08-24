@@ -3551,6 +3551,18 @@ func (s *Studio) GetProviders() []*ProviderInfo {
 // the live pointer) avoids a data race: Wails serializes the return value
 // after the function returns, by which point the lock has already been
 // released, so any concurrent UpdateSettings could race on the same struct.
+// settingsSnapshot copies the current global settings. Callers must NOT already
+// hold s.mu — its read locks are not reentrant, so a nested acquisition parks
+// behind any queued writer and wedges the studio.
+func (s *Studio) settingsSnapshot() Settings {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.config == nil {
+		return Settings{}
+	}
+	return s.config.Settings
+}
+
 func (s *Studio) GetSettings() *StudioConfig {
 	s.mu.RLock()
 	c := *s.config

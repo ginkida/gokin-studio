@@ -209,12 +209,16 @@ func (s *Studio) startDelegation(req delegationRequest) (DelegationRun, error) {
 	// lock and freeze the whole studio, Shutdown included.
 	s.mu.RLock()
 	budgetTarget := s.projects[req.ToProjectID]
+	budgetDefaults := Settings{}
+	if s.config != nil {
+		budgetDefaults = s.config.Settings
+	}
 	s.mu.RUnlock()
 	if budgetTarget == nil {
 		return DelegationRun{}, newDelegationError(DelegationErrorUnknownTarget,
 			"target project not found: %s", req.ToProjectID)
 	}
-	if err := delegationBudgetAllows(budgetTarget); err != nil {
+	if err := delegationBudgetAllows(budgetTarget, budgetDefaults); err != nil {
 		return DelegationRun{}, err
 	}
 
@@ -418,13 +422,18 @@ func (s *Studio) startDelegation(req delegationRequest) (DelegationRun, error) {
 
 // delegationBudgetAllows mirrors the agent loop's own preflight so a delegation
 // cannot start work the target would immediately refuse.
-func delegationBudgetAllows(to *Project) error {
+func delegationBudgetAllows(to *Project, defaults Settings) error {
 	to.mu.RLock()
 	enforce := to.EnforceBudget
 	budget := to.BudgetUSD
 	to.mu.RUnlock()
 	if !enforce || budget <= 0 {
 		return nil
+	}
+	// Settings arrive as a value because this runs on paths that hold s.mu.
+	provider, model := to.billedProviderModel(defaults, "", "")
+	if !hasPricing(provider, model) {
+		return newDelegationError(DelegationErrorBudget, "%s", unenforceableBudgetMessage(provider, model, budget))
 	}
 	if spent := to.totalCostUSD(); spent >= budget {
 		return newDelegationError(DelegationErrorBudget,

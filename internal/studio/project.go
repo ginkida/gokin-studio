@@ -1155,6 +1155,20 @@ func (p *Project) sendMessage(wailsCtx context.Context, message string, attachme
 	budget := p.BudgetUSD
 	p.mu.RUnlock()
 	if enforce && budget > 0 {
+		budgetProvider, budgetModel := p.billedProviderModel(settings, executionProvider, executionModel)
+		// A model with no pricing row contributes $0 to the cumulative total,
+		// so the check below can never trip and the cap silently does nothing
+		// while the UI still presents it as enforced. Refusing is the whole
+		// point of strict enforcement: a hard block is what stops a runaway
+		// the user is not awake to watch. Fail closed and name the reason.
+		if !hasPricing(budgetProvider, budgetModel) {
+			p.emitEvent(wailsCtx, EventChatError, ChatTextEvent{
+				ProjectID: p.ID,
+				SessionID: sid,
+				Text:      unenforceableBudgetMessage(budgetProvider, budgetModel, budget),
+			})
+			return
+		}
 		spent := p.totalCostUSD()
 		if spent >= budget {
 			p.emitEvent(wailsCtx, EventChatError, ChatTextEvent{
@@ -2716,6 +2730,31 @@ func (p *Project) pruneAbandonedEmptySessions() {
 		DeleteHistory(projectSessionStorageKey(p.ID, id))
 		DiscardReplay(p.ID, id)
 	}
+}
+
+// billedProviderModel resolves the provider/model a turn in this project bills
+// against: a scheduled execution override when both halves are present,
+// otherwise the project's own selection falling back to the global defaults —
+// the same order initClient uses to pick the client.
+//
+// It takes p.mu and deliberately never s.mu: delegation callers reach the
+// budget pre-flight from paths that already hold the studio read lock, and
+// those read locks are not reentrant (a queued writer parks new readers and
+// wedges the process). Settings therefore arrive as a value from the caller.
+func (p *Project) billedProviderModel(defaults Settings, overrideProvider, overrideModel string) (string, string) {
+	provider, model := overrideProvider, overrideModel
+	if strings.TrimSpace(provider) == "" || strings.TrimSpace(model) == "" {
+		p.mu.RLock()
+		provider, model = p.Provider, p.Model
+		p.mu.RUnlock()
+	}
+	if strings.TrimSpace(provider) == "" {
+		provider = defaults.DefaultProvider
+	}
+	if strings.TrimSpace(model) == "" {
+		model = defaults.DefaultModel
+	}
+	return strings.ToLower(strings.TrimSpace(provider)), strings.TrimSpace(model)
 }
 
 // totalCostUSD returns the cached cumulative cost across every session in

@@ -1,6 +1,9 @@
 package studio
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // ModelPricing is the per-million-token cost in USD for a given model.
 // Cache-read pricing is typically 75–90% off the input rate; cache-write is
@@ -84,6 +87,24 @@ func LookupPricing(provider, model string) ModelPricing {
 		}
 	}
 	return best
+}
+
+// hasPricing reports whether a dollar figure can be computed for this pair.
+// Studio accepts forward-compatible model ids (isFutureStudioModelID) so a
+// model discovered on the account can be selected before the catalog ships an
+// entry for it — those have no pricing row, and callers that treat $0 as a real
+// cost rather than as "unknown" will draw the wrong conclusion.
+func hasPricing(provider, model string) bool {
+	return LookupPricing(provider, model) != (ModelPricing{})
+}
+
+// unenforceableBudgetMessage is the single wording every budget pre-flight uses
+// when the selected model cannot be priced, so chat, side chat, and delegation
+// all explain the same refusal the same way.
+func unenforceableBudgetMessage(provider, model string, budget float64) string {
+	return fmt.Sprintf(
+		"Strict budget enforcement is on, but there is no published pricing for %s/%s, so spend cannot be measured against the $%.2f limit. Switch to a model with known pricing, or turn off strict enforcement in the project's budget editor.",
+		provider, model, budget)
 }
 
 // EstimateCost computes a USD figure for one turn given the token counts
