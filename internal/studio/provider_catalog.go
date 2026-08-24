@@ -156,6 +156,50 @@ func modelDefinition(provider, model string) *ProviderModelInfo {
 	return nil
 }
 
+// modelSupportsImageInput reports whether the catalog advertises image input
+// for this exact model. The catalog is the single product contract, and it
+// answers per MODEL — including account-advertised future ids, which inherit
+// their family flagship's modalities. Callers must not re-derive the answer
+// from the provider name: the frontend composer already reads
+// inputModalities, and a second, provider-shaped copy of the same rule is a
+// divergence waiting to happen the moment one family ships a model that
+// differs from its siblings.
+func modelSupportsImageInput(provider, model string) bool {
+	definition := modelDefinition(provider, model)
+	if definition == nil {
+		return false
+	}
+	for _, modality := range definition.InputModalities {
+		if strings.EqualFold(strings.TrimSpace(modality), "image") {
+			return true
+		}
+	}
+	return false
+}
+
+// imageCapableModelsHint names the catalog models that do accept image input,
+// so a refusal can tell the user where to go. Derived rather than written out:
+// the previous refusal hardcoded "Kimi Code models", which is a second copy of
+// the modality table and goes stale the moment the lineup changes.
+func imageCapableModelsHint() string {
+	var groups []string
+	for _, provider := range studioProviderCatalog {
+		var capable []string
+		for _, model := range provider.Models {
+			if modelSupportsImageInput(provider.ID, model) {
+				capable = append(capable, model)
+			}
+		}
+		if len(capable) > 0 {
+			groups = append(groups, fmt.Sprintf("%s (%s)", provider.Name, strings.Join(capable, ", ")))
+		}
+	}
+	if len(groups) == 0 {
+		return ""
+	}
+	return " — models that do: " + strings.Join(groups, "; ")
+}
+
 func isStudioModelID(provider, model string) bool {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	model = strings.TrimSpace(model)

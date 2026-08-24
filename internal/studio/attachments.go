@@ -76,8 +76,11 @@ func decodeMessageAttachments(provider, model string, attachments []MessageAttac
 		if !isImage && !isDocument {
 			return nil, fmt.Errorf("attachment %d has unsupported type %q", i+1, attachment.MIMEType)
 		}
-		if isImage && strings.ToLower(strings.TrimSpace(provider)) != "kimi" {
-			return nil, fmt.Errorf("image attachments are currently supported only by Kimi Code models")
+		// Ask the catalog, not the provider name. The composer decides whether
+		// to offer an image picker from the same per-model inputModalities, so
+		// deriving it differently here is how the two sides drift apart.
+		if isImage && !modelSupportsImageInput(provider, model) {
+			return nil, fmt.Errorf("attachment %d is an image, but %s/%s does not accept image input%s", i+1, provider, model, imageCapableModelsHint())
 		}
 		name, err := validateAttachmentName(attachment.Name, i, imageExt, documentExt)
 		if err != nil {
