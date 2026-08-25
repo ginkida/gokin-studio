@@ -7,6 +7,78 @@ verify against the code before relying on any specific file/function/flag name.
 
 ---
 
+## Release v2.1.3 (2026-08-25)
+
+Patch release. Three user-facing fixes, all of which bit non-Latin text
+specifically, plus four guards against the classes they came from. Every one was
+found by a focused bug hunt over the paths a user touches daily.
+
+### Token estimates counted characters, not bytes
+
+The composer readout, the per-message chip, the live output figure, and the
+pre-first-response context gauge all used `text.length / 4`. Four characters per
+token is an English rule of thumb, and character count is the wrong unit anyway —
+BPE tokenizers work on UTF-8 bytes. Cyrillic is 2 bytes per character and CJK 3,
+so a Russian draft was reported at roughly half its real token count and a
+Chinese one at a third.
+
+Understated cost is the visible half. The consequential half is the context
+gauge: it drives the 75% / 90% warnings, so a session in a non-Latin script
+could sit near its window while the gauge still read comfortable, and no warning
+appeared before the model began losing history. `estimateTokens()` now counts
+UTF-8 bytes — byte-identical to the old numbers for ASCII, and erring slightly
+high for Cyrillic, which is the safe direction for a gauge.
+
+### Strict budget enforcement silently did nothing for unpriced models
+
+Studio accepts forward-compatible model ids so a model discovered on the account
+can be selected before the catalog ships an entry for it. Those have no pricing
+row, and every consequence was silent: `LookupPricing` returns empty,
+`EstimateCost` returns 0, `bumpTotalCostUSD` short-circuits, the cumulative total
+never grows, and `spent >= budget` never trips. A project showed a budget in the
+UI and enforced nothing — the exact runaway a hard cap exists to stop, and
+invisible because no cost was displayed either.
+
+All three budget pre-flights — the agent loop, side chat, and delegation — now
+refuse with one shared message naming the model and the missing pricing.
+Delegation matters on its own: without it a project would block its own chat
+while still accepting paid work pushed in from another project.
+
+### Project and chat names were cut in half
+
+Every name input carries `maxLength={60}`, which the browser counts in
+characters; the backend capped the same fields at 60 **bytes**. A 60-character
+Russian project name was stored as 30, cut mid-word, with nothing to indicate it.
+A CJK name kept 20. All eight display-name sites now cap by character under one
+constant — including config-load normalization, which would otherwise have eaten
+a correctly stored name on the next app start.
+
+### Guards
+
+- `compactHistory` treated a non-positive context window as a budget of zero and
+  dropped every middle exchange on every turn. Its sibling
+  `emergencyCompactHistory` already returned the history untouched for that
+  input; the two now agree. Not reachable today — validation refuses every pair
+  whose window resolves to zero — so this protects against a future call site.
+- A cross-language test pins the name limit: the browser number and the Go
+  number must match, and no display-name site may return to a byte cap. Neither
+  side's tests could see the other, which is why the halving survived.
+- The frontend suite now fails on a hook declared after an early return. That
+  class shipped here once as a React #310 blank screen, caught only by a person
+  launching the app. The detector is tested on a fixture in the same file, since
+  a silently broken scan reporting "clean" is this class's known failure mode.
+- Image-attachment support is decided by the catalog's per-model
+  `inputModalities` rather than a hardcoded provider name, matching what the
+  composer already reads. The refusal now names the model and lists the models
+  that do accept images, built from the same catalog.
+
+### Testing
+
+1464 studio and 112 frontend test functions. Full suite race-clean; `go vet`,
+`gofmt`, `tsc --noEmit`, and `GOOS=windows` / `GOOS=linux` build+vet all clean.
+
+---
+
 ## Release v2.1.2 (2026-08-24)
 
 Two user-reported bugs. The first made the Kimi provider unusable.
